@@ -7,9 +7,9 @@ import pandas as pd
 import polars as pl
 from numpy.typing import NDArray
 from pdex import pdex
-from scipy.sparse import issparse
 
 from ._evaluator import _build_pdex_kwargs, _convert_to_normlog
+from ._types._anndata import aggregate_group_means
 
 logger = logging.getLogger(__name__)
 
@@ -166,18 +166,9 @@ def _build_pert_baseline(
         )
 
     logger.info("Building perturbation-level means")
-    pert_means = (
-        pl.DataFrame(
-            adata.X if not issparse(adata.X) else adata.X.toarray()  # type: ignore
-        )
-        .with_columns(pl.Series(pert_col, adata.obs[pert_col]))
-        .group_by(pert_col)
-        .mean()
-    )
+    names, pert_matrix = aggregate_group_means(adata, pert_col)
 
-    names = pert_means.drop_in_place(pert_col).to_numpy()
     pert_mask = names != control_pert
-    pert_matrix = pert_means.to_numpy()
 
     if as_delta:
         logger.info("Calculating delta from control means")

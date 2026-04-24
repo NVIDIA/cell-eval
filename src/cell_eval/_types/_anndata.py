@@ -5,12 +5,34 @@ from typing import Iterator, Literal, cast
 import anndata as ad
 import numpy as np
 import pandas as pd
-import polars as pl
+import scanpy as sc
 from numpy.typing import NDArray
-from scipy.sparse import issparse
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
+
+
+def aggregate_group_means(
+    adata: ad.AnnData,
+    groupby_key: str,
+    embed_key: str | None = None,
+) -> tuple[NDArray[np.str_], NDArray[np.float64]]:
+    """Aggregate mean values by group using Scanpy's grouped aggregation.
+
+    Returns sorted group labels plus a dense grouped-mean matrix. When
+    ``embed_key`` is provided, aggregation is performed over ``adata.obsm``.
+    Otherwise ``adata.X`` is used.
+    """
+    agg_kwargs: dict[str, str] = {"by": groupby_key, "func": "mean"}
+    if embed_key is not None:
+        agg_kwargs["obsm"] = embed_key
+
+    agg = sc.get.aggregate(adata, **agg_kwargs)
+    keys = agg.obs[groupby_key].to_numpy(str)
+    values = np.asarray(agg.layers["mean"], dtype=np.float64)
+
+    sort_idx = np.argsort(keys)
+    return keys[sort_idx], values[sort_idx]
 
 
 @dataclass(frozen=True)
@@ -115,31 +137,8 @@ class PerturbationAnndataPair:
         groupby_key: str,
         embed_key: str | None = None,
     ) -> tuple[NDArray[np.str_], NDArray[np.float64]]:
-        """Get bulk anndata for a groupby key."""
-
-        matrix = adata.X if not embed_key else adata.obsm[embed_key]
-        if issparse(matrix):
-            # Convert sparse matrix to dense array
-            logger.info("Converting sparse matrix to dense array for bulk calculation")
-            matrix = matrix.toarray()  # type: ignore
-
-        # Create a polars dataframe with the groupby key
-        frame = pl.DataFrame(
-            matrix,  # ty: ignore[invalid-argument-type]
-        ).with_columns(
-            groupby_key=adata.obs[groupby_key].to_numpy(str),
-        )
-
-        # Pseudobulk (mean) the dataframe by the groupby key
-        bulked = frame.group_by("groupby_key").mean().sort("groupby_key")
-
-        # identify the key column
-        keys = bulked["groupby_key"].to_numpy()
-
-        # identify the pseudobulks
-        values = bulked.drop("groupby_key").to_numpy()
-
-        return (keys, values)
+        """Pseudobulk (mean) an AnnData by groupby_key."""
+        return aggregate_group_means(adata, groupby_key, embed_key=embed_key)
 
     @staticmethod
     def pert_mask(perts: NDArray[np.str_]) -> dict[str, NDArray[np.int_]]:
