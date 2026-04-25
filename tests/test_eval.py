@@ -10,6 +10,7 @@ from scipy.sparse import csr_matrix
 
 from cell_eval import MetricsEvaluator
 from cell_eval._baseline import _build_pert_baseline
+from cell_eval.metrics._anndata import ClusteringAgreement
 from cell_eval._types._anndata import PerturbationAnndataPair
 from cell_eval.data import (
     CONTROL_VAR,
@@ -369,6 +370,85 @@ def test_build_pert_baseline_matches_reference_for_dense_and_sparse():
             rtol=1e-12,
             atol=1e-12,
         )
+
+
+def test_centroid_ann_matches_reference_for_dense_and_sparse():
+    matrix = np.array(
+        [
+            [1.0, 2.0, 0.0],
+            [3.0, 4.0, 1.0],
+            [0.0, 1.0, 5.0],
+            [2.0, 3.0, 7.0],
+            [4.0, 5.0, 9.0],
+        ],
+        dtype=np.float64,
+    )
+    labels = np.array(["pert_b", "control", "pert_b", "pert_a", "control"])
+    obs = pd.DataFrame({PERT_COL: labels}, index=np.arange(len(labels)).astype(str))
+    var = pd.DataFrame(index=["gene_0", "gene_1", "gene_2"])
+
+    expected_keys, expected_values = _reference_group_means(matrix, labels)
+    keep = expected_keys != "control"
+
+    dense = ad.AnnData(X=matrix.copy(), obs=obs.copy(), var=var.copy())
+    sparse = ad.AnnData(X=csr_matrix(matrix), obs=obs.copy(), var=var.copy())
+
+    for adata in (dense, sparse):
+        centroid = ClusteringAgreement._centroid_ann(
+            adata,
+            category_key=PERT_COL,
+            control_pert="control",
+        )
+        np.testing.assert_array_equal(
+            centroid.obs[PERT_COL].to_numpy(str),
+            expected_keys[keep],
+        )
+        np.testing.assert_allclose(
+            np.asarray(centroid.X),
+            expected_values[keep],
+            rtol=1e-12,
+            atol=1e-12,
+        )
+
+
+def test_centroid_ann_embed_key_matches_reference():
+    obs = pd.DataFrame(
+        {PERT_COL: np.array(["control", "pert_a", "pert_a", "pert_b"])},
+        index=np.arange(4).astype(str),
+    )
+    adata = ad.AnnData(X=np.zeros((4, 2), dtype=np.float64), obs=obs)
+    adata.obsm["X_test"] = np.array(
+        [
+            [1.0, 0.0, 2.0],
+            [3.0, 1.0, 4.0],
+            [5.0, 3.0, 6.0],
+            [7.0, 5.0, 8.0],
+        ],
+        dtype=np.float64,
+    )
+
+    expected_keys, expected_values = _reference_group_means(
+        adata.obsm["X_test"], obs[PERT_COL].to_numpy(str)
+    )
+    keep = expected_keys != "control"
+
+    centroid = ClusteringAgreement._centroid_ann(
+        adata,
+        category_key=PERT_COL,
+        control_pert="control",
+        embed_key="X_test",
+    )
+
+    np.testing.assert_array_equal(
+        centroid.obs[PERT_COL].to_numpy(str),
+        expected_keys[keep],
+    )
+    np.testing.assert_allclose(
+        np.asarray(centroid.X),
+        expected_values[keep],
+        rtol=1e-12,
+        atol=1e-12,
+    )
 
 
 def test_eval_pdex_kwargs():
