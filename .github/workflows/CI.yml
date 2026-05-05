@@ -1,17 +1,41 @@
 name: "CI"
 
-on: [push, pull_request]
+on:
+  push:
+    branches:
+      - main
+      - dev
+      - "pull-request/[0-9]+"
 
 jobs:
+  pr-info:
+    if: startsWith(github.ref_name, 'pull-request/')
+    runs-on: linux-amd64-cpu8
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      pr-info: ${{ steps.get-pr-info.outputs.pr-info }}
+    steps:
+      - name: Get PR info
+        id: get-pr-info
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Show PR context
+        run: |
+          echo "PR number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info).number }}"
+          echo "Base ref: ${{ fromJSON(steps.get-pr-info.outputs.pr-info).base.ref }}"
+          echo "Head ref: ${{ fromJSON(steps.get-pr-info.outputs.pr-info).head.ref }}"
+
   all_jobs:
-    runs-on: ubuntu-latest
+    runs-on: linux-amd64-cpu8
     needs: [formatting, typing, pytest, cli-test]
     steps:
       - name: Complete
         run: echo "Complete"
 
   install-job:
-    runs-on: ubuntu-latest
+    runs-on: linux-amd64-cpu8
 
     steps:
       - uses: actions/checkout@v4
@@ -28,7 +52,7 @@ jobs:
           uv sync --all-extras --dev
 
   formatting:
-    runs-on: ubuntu-latest
+    runs-on: linux-amd64-cpu8
 
     needs: [install-job]
 
@@ -51,7 +75,7 @@ jobs:
           uv run ruff format --check
 
   typing:
-    runs-on: ubuntu-latest
+    runs-on: linux-amd64-cpu8
 
     needs: [install-job]
 
@@ -74,7 +98,7 @@ jobs:
           uv run ty check
 
   pytest:
-    runs-on: ubuntu-latest
+    runs-on: linux-amd64-cpu8
 
     needs: [install-job]
 
@@ -101,7 +125,7 @@ jobs:
           uv run pytest -v
 
   cli-test:
-    runs-on: ubuntu-latest
+    runs-on: linux-amd64-cpu8
 
     needs: [install-job]
 
