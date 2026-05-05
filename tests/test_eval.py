@@ -285,7 +285,7 @@ def test_bulk_anndata_matches_reference_for_dense_and_sparse():
     )
     labels = np.array(["pert_b", "control", "pert_b", "pert_a", "control"])
     obs = pd.DataFrame({PERT_COL: labels}, index=np.arange(len(labels)).astype(str))
-    var = pd.DataFrame(index=["gene_0", "gene_1", "gene_2"])
+    var = pd.DataFrame(index=pd.Index(["gene_0", "gene_1", "gene_2"]))
 
     expected_keys, expected_values = _reference_group_means(matrix, labels)
 
@@ -294,9 +294,7 @@ def test_bulk_anndata_matches_reference_for_dense_and_sparse():
         adata_dense, PERT_COL
     )
 
-    adata_sparse = ad.AnnData(
-        X=csr_matrix(matrix), obs=obs.copy(), var=var.copy()
-    )
+    adata_sparse = ad.AnnData(X=csr_matrix(matrix), obs=obs.copy(), var=var.copy())
     sparse_keys, sparse_values = PerturbationAnndataPair._bulk_anndata(
         adata_sparse, PERT_COL
     )
@@ -347,12 +345,16 @@ def test_build_pert_baseline_matches_reference_for_dense_and_sparse():
         dtype=np.float64,
     )
     labels = np.array(["non-targeting", "pert_b", "pert_b", "pert_a", "non-targeting"])
-    obs = pd.DataFrame({"target_gene": labels}, index=np.arange(len(labels)).astype(str))
+    obs = pd.DataFrame(
+        {"target_gene": labels}, index=np.arange(len(labels)).astype(str)
+    )
 
     expected_keys, expected_matrix = _reference_group_means(matrix, labels)
     pert_mask = expected_keys != "non-targeting"
     expected_mean = expected_matrix.mean(axis=0)
-    expected_delta = (expected_matrix[pert_mask] - expected_matrix[~pert_mask]).mean(axis=0)
+    expected_delta = (expected_matrix[pert_mask] - expected_matrix[~pert_mask]).mean(
+        axis=0
+    )
 
     dense = ad.AnnData(X=matrix.copy(), obs=obs.copy())
     sparse = ad.AnnData(X=csr_matrix(matrix), obs=obs.copy())
@@ -385,7 +387,7 @@ def test_centroid_ann_matches_reference_for_dense_and_sparse():
     )
     labels = np.array(["pert_b", "control", "pert_b", "pert_a", "control"])
     obs = pd.DataFrame({PERT_COL: labels}, index=np.arange(len(labels)).astype(str))
-    var = pd.DataFrame(index=["gene_0", "gene_1", "gene_2"])
+    var = pd.DataFrame(index=pd.Index(["gene_0", "gene_1", "gene_2"]))
 
     expected_keys, expected_values = _reference_group_means(matrix, labels)
     keep = expected_keys != "control"
@@ -400,7 +402,7 @@ def test_centroid_ann_matches_reference_for_dense_and_sparse():
             control_pert="control",
         )
         np.testing.assert_array_equal(
-            centroid.obs[PERT_COL].to_numpy(str),
+            cast(pd.Series, centroid.obs[PERT_COL]).to_numpy(str),
             expected_keys[keep],
         )
         np.testing.assert_allclose(
@@ -440,7 +442,7 @@ def test_centroid_ann_embed_key_matches_reference():
     )
 
     np.testing.assert_array_equal(
-        centroid.obs[PERT_COL].to_numpy(str),
+        cast(pd.Series, centroid.obs[PERT_COL]).to_numpy(str),
         expected_keys[keep],
     )
     np.testing.assert_allclose(

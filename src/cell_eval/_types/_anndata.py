@@ -23,12 +23,16 @@ def aggregate_group_means(
     ``embed_key`` is provided, aggregation is performed over ``adata.obsm``.
     Otherwise ``adata.X`` is used.
     """
-    agg_kwargs: dict[str, str] = {"by": groupby_key, "func": "mean"}
-    if embed_key is not None:
-        agg_kwargs["obsm"] = embed_key
-
-    agg = sc.get.aggregate(adata, **agg_kwargs)
-    keys = agg.obs[groupby_key].to_numpy(str)
+    if embed_key is None:
+        agg = sc.get.aggregate(adata, by=groupby_key, func="mean")
+    else:
+        agg = sc.get.aggregate(
+            adata,
+            by=groupby_key,
+            func="mean",
+            obsm=embed_key,
+        )
+    keys = cast(pd.Series, agg.obs[groupby_key]).to_numpy(str)
     values = np.asarray(agg.layers["mean"], dtype=np.float64)
 
     sort_idx = np.argsort(keys)
