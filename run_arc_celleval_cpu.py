@@ -1,14 +1,17 @@
-"""Full Arc dataset (8.59M × 2000 per side) through cell-eval's gpu pipeline.
+"""Full Arc dataset (8.59M × 2000 per side) through cell-eval's cpu (illico) pipeline.
 
-Sets CELL_EVAL_BACKEND=gpu before importing cell_eval so all dispatchers
-(pdex, anndata metrics) route to the rsc/cupy/cuml implementations.
+Mirrors ``run_arc_celleval_gpu.py`` but sets ``CELL_EVAL_BACKEND=cpu`` so both
+pdex and the metric backends use the cpu (numba) implementations.
 
 Two wall times are reported:
-  * ``bench_wall_clock`` — MetricsEvaluator init + compute_all_metrics. This
-    is the cell-eval pipeline cost and the one to compare across runs.
+  * ``bench_wall_clock`` — MetricsEvaluator init + compute_all_metrics. The
+    cell-eval pipeline cost.
   * ``wall_clock_total`` — includes the h5ad dense reads + numba sparsify
-    that happen before MetricsEvaluator. Disk I/O is a function of how the
-    Arc files are stored (dense, 65 GB each) and is not cell-eval's problem.
+    that happen before MetricsEvaluator. Excluded from the bench because disk
+    I/O is a function of how the Arc files are stored, not cell-eval.
+
+Expect this to be substantially slower than the gpu run — last full pass was
+~30 m bench wall on Arc.
 """
 from __future__ import annotations
 
@@ -18,10 +21,9 @@ import os
 import sys
 import time
 
-os.environ.setdefault("CELL_EVAL_BACKEND", "gpu")
+os.environ["CELL_EVAL_BACKEND"] = "cpu"
 
 import anndata as ad
-import cupy as cp
 import numba as nb
 import numpy as np
 import polars as pl
@@ -31,7 +33,7 @@ from cell_eval import MetricsEvaluator
 
 REAL = "/home/sdicks/git/rapids-singlecell-notebooks/arc/adata_real.h5ad"
 PRED = "/home/sdicks/git/rapids-singlecell-notebooks/arc/adata_pred.h5ad"
-OUTDIR = "/home/sdicks/git/cell-eval/cell-eval-arc-celleval-gpu"
+OUTDIR = "/home/sdicks/git/cell-eval/cell-eval-arc-celleval-cpu"
 PERT_COL = "drugname_drugconc"
 CONTROL = "[('DMSO_TF', 0.0, 'uM')]"
 
@@ -92,11 +94,6 @@ def fmt(seconds: float) -> str:
     return f"{seconds:.2f}s"
 
 
-def gpu_free_gb() -> float:
-    free, _ = cp.cuda.runtime.memGetInfo()
-    return free / 1e9
-
-
 def load_and_sparsify(path: str, label: str, timings: dict[str, float]) -> ad.AnnData:
     t = time.perf_counter()
     adata = ad.read_h5ad(path)
@@ -114,7 +111,6 @@ def load_and_sparsify(path: str, label: str, timings: dict[str, float]) -> ad.An
 
 def main() -> None:
     print(f"CELL_EVAL_BACKEND={os.environ['CELL_EVAL_BACKEND']}", flush=True)
-    print(f"GPU free at start: {gpu_free_gb():.1f} GB", flush=True)
     setup_t0 = time.perf_counter()
     timings: dict[str, float] = {}
 
@@ -135,7 +131,6 @@ def main() -> None:
     )
     timings["metrics_evaluator_init_inc_de"] = time.perf_counter() - t
     print(f"MetricsEvaluator (incl. DE): {fmt(timings['metrics_evaluator_init_inc_de'])}", flush=True)
-    print(f"GPU free after init: {gpu_free_gb():.1f} GB", flush=True)
 
     metric_configs = {
         "discrimination_score_l1": {"exclude_target_gene": False},
@@ -158,7 +153,7 @@ def main() -> None:
     timings["bench_wall_clock"] = bench_wall
     timings["wall_clock_total"] = total_wall
 
-    with open(os.path.join(OUTDIR, "celleval_gpu_timings.json"), "w") as f:
+    with open(os.path.join(OUTDIR, "celleval_cpu_timings.json"), "w") as f:
         json.dump(timings, f, indent=2)
 
     print("\n=== aggregated metrics (mean row) ===", flush=True)
@@ -170,12 +165,12 @@ def main() -> None:
             print(f"  {k:35s} {v}", flush=True)
 
     lines = [
-        "# cell-eval (gpu backend) — Arc benchmark\n",
+        "# cell-eval (cpu / illico backend) — Arc benchmark\n",
         f"- Generated: `{time.strftime('%Y-%m-%d %H:%M:%S %Z')}`",
         f"- Inputs: `{REAL}` + `{PRED}`",
         f"- `pert_col`: `{PERT_COL}` · `control`: `{CONTROL}`",
         f"- Backend: `{os.environ['CELL_EVAL_BACKEND']}` "
-        f"(pdex via `cell_eval.pdex._rsc`, metrics via `cell_eval.metrics._anndata._gpu`)",
+        f"(pdex via `cell_eval.pdex._illico`, metrics via `cell_eval.metrics._anndata._cpu`)",
         f"- **Bench wall (cell-eval only)**: **{fmt(bench_wall)}**",
         f"- Total wall incl. h5ad load + sparsify: {fmt(total_wall)}\n",
         "## Stages\n",
@@ -201,9 +196,10 @@ def main() -> None:
             lines.append(f"| `{k}` | {float(v):.6f} |")
         except (TypeError, ValueError):
             lines.append(f"| `{k}` | {v} |")
-    with open(os.path.join(OUTDIR, "celleval_gpu_report.md"), "w") as f:
+    with open(os.path.join(OUTDIR, "celleval_cpu_report.md"), "w") as f:
         f.write("\n".join(lines) + "\n")
-    print(f"\nReport: {OUTDIR}/celleval_gpu_report.md", flush=True)
+
+    print(f"\nReport: {OUTDIR}/celleval_cpu_report.md", flush=True)
     print(f"Bench wall: {fmt(bench_wall)}  ·  Total: {fmt(total_wall)}", flush=True)
 
 
