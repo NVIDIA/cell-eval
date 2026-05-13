@@ -16,120 +16,151 @@ from sklearn.metrics import (
     normalized_mutual_info_score,
 )
 
-from .._types import PerturbationAnndataPair
+from ..._types import PerturbationAnndataPair
 
 logger = getLogger(__name__)
 
 
-def pearson_delta(
-    data: PerturbationAnndataPair, embed_key: str | None = None
-) -> dict[str, float]:
+def pearson_delta(data: PerturbationAnndataPair) -> dict[str, float]:
     """Compute Pearson correlation between mean differences from control."""
-    return _generic_evaluation(
-        data,
-        pearsonr,
-        use_delta=True,
-        embed_key=embed_key,
-    )
+    return _generic_evaluation(data, pearsonr, use_delta=True)
 
 
-def mse(
-    data: PerturbationAnndataPair, embed_key: str | None = None
-) -> dict[str, float]:
+def mse(data: PerturbationAnndataPair) -> dict[str, float]:
     """Compute mean squared error of each perturbation from control."""
-    return _generic_evaluation(
-        data, skm.mean_squared_error, use_delta=False, embed_key=embed_key
-    )
+    return _generic_evaluation(data, skm.mean_squared_error, use_delta=False)
 
 
-def mae(
-    data: PerturbationAnndataPair, embed_key: str | None = None
-) -> dict[str, float]:
+def mae(data: PerturbationAnndataPair) -> dict[str, float]:
     """Compute mean absolute error of each perturbation from control."""
-    return _generic_evaluation(
-        data, skm.mean_absolute_error, use_delta=False, embed_key=embed_key
-    )
+    return _generic_evaluation(data, skm.mean_absolute_error, use_delta=False)
 
 
-def mse_delta(
-    data: PerturbationAnndataPair, embed_key: str | None = None
-) -> dict[str, float]:
+def mse_delta(data: PerturbationAnndataPair) -> dict[str, float]:
     """Compute mean squared error of each perturbation-control delta."""
-    return _generic_evaluation(
-        data, skm.mean_squared_error, use_delta=True, embed_key=embed_key
-    )
+    return _generic_evaluation(data, skm.mean_squared_error, use_delta=True)
 
 
-def mae_delta(
-    data: PerturbationAnndataPair, embed_key: str | None = None
-) -> dict[str, float]:
+def mae_delta(data: PerturbationAnndataPair) -> dict[str, float]:
     """Compute mean absolute error of each perturbation-control delta."""
-    return _generic_evaluation(
-        data, skm.mean_absolute_error, use_delta=True, embed_key=embed_key
-    )
+    return _generic_evaluation(data, skm.mean_absolute_error, use_delta=True)
 
 
 def edistance(
     data: PerturbationAnndataPair,
     embed_key: str | None = None,
     metric: str = "euclidean",
+    n_comps: int = 50,
     **kwargs,
 ) -> float:
-    """Compute Euclidean distance of each perturbation-control delta."""
+    """Pearson correlation of per-pert E-distances on a shared PCA basis.
 
-    def _edistance(
-        x: np.ndarray,
-        y: np.ndarray,
-        metric: str = "euclidean",
-        precomp_sigma_y: float | None = None,
-        **kwargs,
-    ) -> float:
-        sigma_x = skm.pairwise_distances(x, metric=metric, **kwargs).mean()
-        sigma_y = (
-            precomp_sigma_y
-            if precomp_sigma_y is not None
-            else skm.pairwise_distances(y, metric=metric, **kwargs).mean()
+    The cpu and gpu paths both follow the pertpy convention: concat real+pred,
+    fit one PCA, split, and compute E-distance per side in that shared space.
+    Matches ``rsc.ptg.Distance(metric='edistance', obsm_key='X_pca')``.
+
+    Parameters
+    ----------
+    embed_key:
+        If provided, PCA is skipped and ``data.real.obsm[embed_key]`` /
+        ``data.pred.obsm[embed_key]`` are used directly as the shared basis.
+        Caller is responsible for ensuring the embedding is comparable across
+        sides (e.g. produced by a single PCA fit on the concat).
+    metric:
+        Pairwise distance metric (passed to sklearn).
+    n_comps:
+        Number of PCA components when ``embed_key is None``.
+    """
+    from sklearn.decomposition import PCA
+
+    real_X, pred_X = _shared_features(data, embed_key=embed_key, n_comps=n_comps)
+
+    real_perts = np.asarray(data.real.obs[data.pert_col].values)
+    pred_perts = np.asarray(data.pred.obs[data.pert_col].values)
+    pert_order = np.asarray(data.perts)
+
+    e_real = _edistances_to_control_cpu(
+        real_X, real_perts, data.control_pert, pert_order, metric=metric, **kwargs
+    )
+    e_pred = _edistances_to_control_cpu(
+        pred_X, pred_perts, data.control_pert, pert_order, metric=metric, **kwargs
+    )
+
+    return float(pearsonr(e_real, e_pred).statistic)
+
+
+def _shared_features(
+    data: PerturbationAnndataPair,
+    embed_key: str | None,
+    n_comps: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (real_X, pred_X) on a shared feature basis.
+
+    If ``embed_key`` is set, returns ``adata.obsm[embed_key]`` per side as-is.
+    Otherwise concatenates real and pred X as sparse on host, fits scanpy's
+    ``sc.pp.pca`` (which handles sparse natively via the arpack solver), and
+    splits the resulting embedding. Mirrors the gpu path's sparse handling.
+    """
+    if embed_key is not None:
+        return (
+            np.asarray(data.real.obsm[embed_key]),
+            np.asarray(data.pred.obsm[embed_key]),
         )
-        delta = skm.pairwise_distances(x, y, metric=metric, **kwargs).mean()
-        return 2 * delta - sigma_x - sigma_y
 
-    d_real = np.zeros(data.perts.size)
-    d_pred = np.zeros(data.perts.size)
+    from ._sparse import stack_real_pred_sparse
 
-    # Precompute sigma for control data (reused by all perturbations)
-    logger.info("Precomputing sigma for control data (real)")
-    precomp_sigma_real = skm.pairwise_distances(
-        data.ctrl_matrix(which="real", embed_key=embed_key), metric=metric, **kwargs
-    ).mean()
+    merged, n_real = stack_real_pred_sparse(data.real.X, data.pred.X)
+    n_components = min(n_comps, *merged.shape)
+    logger.info(
+        "edistance: fitting shared sparse PCA on concat(real, pred): "
+        f"shape={merged.shape}, nnz={getattr(merged, 'nnz', '-')}, "
+        f"n_components={n_components}"
+    )
+    merged_adata = ad.AnnData(X=merged)
+    sc.pp.pca(merged_adata, n_comps=n_components)
+    X_pca = np.asarray(merged_adata.obsm["X_pca"])
+    return X_pca[:n_real], X_pca[n_real:]
 
-    logger.info("Precomputing sigma for control data (pred)")
-    precomp_sigma_pred = skm.pairwise_distances(
-        data.ctrl_matrix(which="pred", embed_key=embed_key), metric=metric, **kwargs
-    ).mean()
 
-    for idx, delta in enumerate(data.iter_cell_arrays(embed_key=embed_key)):
-        d_real[idx] = _edistance(
-            delta.pert_real,
-            delta.ctrl_real,
-            precomp_sigma_y=precomp_sigma_real,
-            metric=metric,
-            **kwargs,
+def _edistances_to_control_cpu(
+    X: np.ndarray,
+    perts: np.ndarray,
+    control_pert: str,
+    pert_order: np.ndarray,
+    metric: str = "euclidean",
+    **kwargs,
+) -> np.ndarray:
+    """E-distance from each non-control perturbation to control, in feature space.
+
+    Uses the **unbiased** Székely within-group estimator (upper triangle only,
+    denominator ``n*(n-1)/2``) to match the pertpy / rsc convention. For
+    ``metric='euclidean'`` the numba kernels vendored from pertpy never
+    materialise the full pairwise matrix; other metrics fall back to sklearn.
+    """
+    from ._pertpy_pairwise import pairwise_distance_mean
+
+    ctrl_mask = perts == control_pert
+    if not ctrl_mask.any():
+        raise ValueError(
+            f"control perturbation {control_pert!r} not found in obs[pert_col]"
         )
-        d_pred[idx] = _edistance(
-            delta.pert_pred,
-            delta.ctrl_pred,
-            precomp_sigma_y=precomp_sigma_pred,
-            metric=metric,
-            **kwargs,
-        )
+    ctrl_X = X[ctrl_mask]
+    sigma_ctrl = pairwise_distance_mean(ctrl_X, metric=metric, **kwargs)
 
-    return pearsonr(d_real, d_pred).correlation
+    out = np.zeros(pert_order.size, dtype=np.float64)
+    for i, p in enumerate(pert_order):
+        if p == control_pert:
+            continue
+        pert_X = X[perts == p]
+        sigma_pert = pairwise_distance_mean(pert_X, metric=metric, **kwargs)
+        delta = pairwise_distance_mean(pert_X, ctrl_X, metric=metric, **kwargs)
+        out[i] = 2.0 * delta - sigma_pert - sigma_ctrl
+    return out
 
 
 def discrimination_score(
     data: PerturbationAnndataPair,
     metric: str = "l1",
-    embed_key: str | None = None,
     exclude_target_gene: bool = True,
 ) -> dict[str, float]:
     """Base implementation for discrimination score computation.
@@ -138,36 +169,30 @@ def discrimination_score(
 
     Args:
         data: PerturbationAnndataPair containing real and predicted data
-        embed_key: Key for embedding data in obsm, None for expression data
         metric: Metric for distance calculation (e.g., "l1", "l2", see `scipy.metrics.pairwise.distance_metrics`)
         exclude_target_gene: Whether to exclude target gene from calculation
 
     Returns:
         Dictionary mapping perturbation names to normalized ranks
     """
-    if metric == "l1" or metric == "manhattan" or metric == "cityblock":
-        # Ignore the embedding key for L1
-        embed_key = None
-
     # Compute perturbation effects for all perturbations
     real_effects = np.vstack(
         [
             d.perturbation_effect(which="real", abs=False)
-            for d in data.iter_bulk_arrays(embed_key=embed_key)
+            for d in data.iter_bulk_arrays()
         ]
     )
     pred_effects = np.vstack(
         [
             d.perturbation_effect(which="pred", abs=False)
-            for d in data.iter_bulk_arrays(embed_key=embed_key)
+            for d in data.iter_bulk_arrays()
         ]
     )
 
     norm_ranks = {}
     for p_idx, p in enumerate(data.perts):
         # Determine which features to include in the comparison
-        if exclude_target_gene and not embed_key:
-            # For expression data, exclude the target gene
+        if exclude_target_gene:
             include_mask = np.flatnonzero(data.genes != p)
         else:
             # For embedding data or when not excluding target gene, use all features
@@ -202,11 +227,10 @@ def _generic_evaluation(
     data: PerturbationAnndataPair,
     func: Callable[[np.ndarray, np.ndarray], float],
     use_delta: bool = False,
-    embed_key: str | None = None,
 ) -> dict[str, float]:
     """Generic evaluation function for anndata pair."""
     res = {}
-    for bulk_array in data.iter_bulk_arrays(embed_key=embed_key):
+    for bulk_array in data.iter_bulk_arrays():
         if use_delta:
             x = bulk_array.perturbation_effect(which="pred", abs=False)
             y = bulk_array.perturbation_effect(which="real", abs=False)
@@ -229,13 +253,11 @@ class ClusteringAgreement:
 
     def __init__(
         self,
-        embed_key: str | None = None,
         real_resolution: float = 1.0,
         pred_resolutions: tuple[float, ...] = (0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0),
         metric: Literal["ami", "nmi", "ari"] = "ami",
         n_neighbors: int = 15,
     ) -> None:
-        self.embed_key = embed_key
         self.real_resolution = real_resolution
         self.pred_resolutions = pred_resolutions
         self.metric = metric
@@ -262,6 +284,17 @@ class ClusteringAgreement:
         key_added: str,
         n_neighbors: int = 15,
     ) -> None:
+        # scanpy's flavor='igraph' path requires the python-igraph package.
+        # Check upfront so the user gets an actionable error instead of a
+        # cryptic ImportError from deep inside scanpy.
+        try:
+            import igraph  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                "ClusteringAgreement (cpu backend) requires `igraph` for the "
+                "scanpy leiden path. Install with `pip install cell-eval[igraph]`."
+            ) from e
+
         if key_added in adata.obs:
             return
         if "neighbors" not in adata.uns:
@@ -281,30 +314,26 @@ class ClusteringAgreement:
         adata: ad.AnnData,
         category_key: str,
         control_pert: str,
-        embed_key: str | None = None,
     ) -> ad.AnnData:
-        # Isolate the features
-        feats = adata.obsm.get(embed_key, adata.X)  # type: ignore
+        """Per-category mean centroid AnnData via ``scanpy.get.aggregate``.
 
-        # Convert to float if not already
-        if feats.dtype != np.dtype("float64"):
-            feats = feats.astype(np.float64)
+        Mirrors the gpu path (`rsc.get.aggregate`) — same API, same semantics.
+        The aggregate handles sparse natively; we only pull the small
+        ``(n_groups, n_features)`` mean matrix into a fresh AnnData and drop
+        the control row.
+        """
+        if not isinstance(adata.obs[category_key].dtype, pd.CategoricalDtype):
+            adata = adata.copy()
+            adata.obs[category_key] = adata.obs[category_key].astype("category")
 
-        # Densify if required
-        if issparse(feats):
-            feats = feats.toarray()
+        bulk = sc.get.aggregate(adata, by=category_key, func="mean")
+        mean_mat = bulk.X if bulk.X is not None else bulk.layers["mean"]
+        if issparse(mean_mat):
+            mean_mat = mean_mat.toarray()  # type: ignore
+        mean_mat = np.asarray(mean_mat, dtype=np.float64)
 
-        cats = cast(pd.Series, adata.obs[category_key]).values
-        uniq, inv = np.unique(cats, return_inverse=True)
-        centroids = np.zeros((uniq.size, feats.shape[1]), dtype=feats.dtype)
-
-        for i, cat in enumerate(uniq):
-            mask = cats == cat
-            if np.any(mask):
-                centroids[i] = feats[mask].mean(axis=0)
-
-        adc = ad.AnnData(X=centroids)
-        adc.obs[category_key] = uniq
+        adc = ad.AnnData(X=mean_mat)
+        adc.obs[category_key] = np.asarray(bulk.obs_names)
         return adc[adc.obs[category_key] != control_pert]
 
     def __call__(self, data: PerturbationAnndataPair) -> float:
@@ -315,13 +344,11 @@ class ClusteringAgreement:
             adata=data.real,
             category_key=data.pert_col,
             control_pert=data.control_pert,
-            embed_key=self.embed_key,
         )
         ad_pred_cent = self._centroid_ann(
             adata=data.pred,
             category_key=data.pert_col,
             control_pert=data.control_pert,
-            embed_key=self.embed_key,
         )
 
         # 3. cluster real once

@@ -37,17 +37,22 @@ def guess_is_lognorm(
     if adata.X is None:
         raise ValueError("adata.X is None")
 
-    # Check for fractional values
+    # Subsample the data array (or a chunk of dense X) for the fractional
+    # check — log1p data is decimal-everywhere, so a 1M-value sample is
+    # plenty to distinguish from integer counts. Avoids np.modf-ing a
+    # 1.5B-element data buffer (~10 s on Arc) and allocating its 2×
+    # frac/int output arrays.
+    SAMPLE_SIZE = 1_000_000
     if isinstance(adata.X, csr_matrix) or isinstance(adata.X, csc_matrix):
-        frac, _ = np.modf(adata.X.data)
+        data = adata.X.data
+        sample = data[:SAMPLE_SIZE] if data.size > SAMPLE_SIZE else data
     elif adata.is_view:
-        frac, _ = np.modf(adata.X.toarray())  # type: ignore[unresolved-attribute]
-    elif adata.X is None:
-        raise ValueError("adata.X is None")
+        sample = adata.X[:1, :].toarray().ravel()  # type: ignore[unresolved-attribute]
     else:
-        frac, _ = np.modf(adata.X)  # type: ignore
+        flat = np.asarray(adata.X).ravel()  # type: ignore
+        sample = flat[:SAMPLE_SIZE] if flat.size > SAMPLE_SIZE else flat
 
-    has_decimals = bool(np.any(frac > epsilon))
+    has_decimals = bool(np.any(np.abs(sample - np.rint(sample)) > epsilon))
 
     if not has_decimals:
         # All integer values - assume raw counts

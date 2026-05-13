@@ -1,0 +1,107 @@
+CELL_EVAL_BACKEND=gpu
+GPU free at start: 101.4 GB
+real: dense X dtype=float32 shape=(8589830, 2000), converting to CSR
+real: CSR nnz=924,028,027 (5.38% density)
+pred: dense X dtype=float32 shape=(8589830, 2000), converting to CSR
+pred: CSR nnz=1,536,652,743 (8.94% density)
+Output directory /home/sdicks/git/cell-eval/cell-eval-arc-celleval-gpu already exists, potential overwrite occurring
+/home/sdicks/git/rapids_singlecell/src/rapids_singlecell/tools/_rank_genes_groups/_core.py:510: RuntimeWarning: Small groups detected: 1 test group(s) have size <= 25 (first few: [('Encorafenib', 0.5, 'uM')]). normal approximation of the Wilcoxon statistic may be inaccurate.
+  test_results = self.wilcoxon(
+2026-05-13 17:25:46 | [INFO] Writing real DE results to: real_de.csv
+2026-05-13 17:25:46 | [INFO] Computing DE for pred data
+2026-05-13 17:25:46 | [INFO] Using the following pdex kwargs: {'reference': "[('DMSO_TF', 0.0, 'uM')]", 'groupby': 'drugname_drugconc', 'threads': 64, 'is_log1p': True}
+/home/sdicks/git/rapids_singlecell/src/rapids_singlecell/tools/_rank_genes_groups/_core.py:510: RuntimeWarning: Small groups detected: 1 test group(s) have size <= 25 (first few: [('Encorafenib', 0.5, 'uM')]). normal approximation of the Wilcoxon statistic may be inaccurate.
+  test_results = self.wilcoxon(
+2026-05-13 17:25:54 | [INFO] Writing pred DE results to: pred_de.csv
+2026-05-13 17:25:54 | [INFO] Checking DE data integrity... (real)
+2026-05-13 17:25:54 | [WARNING] Identified 13510 missing fold change values (real)
+2026-05-13 17:25:54 | [WARNING] Identified 78247 infinite fold change values (real)
+2026-05-13 17:25:54 | [INFO] DE data integrity check complete. (real)
+2026-05-13 17:25:54 | [INFO] Checking DE data integrity... (pred)
+2026-05-13 17:25:54 | [WARNING] Identified 98248 missing fold change values (pred)
+2026-05-13 17:25:54 | [WARNING] Identified 75226 infinite fold change values (pred)
+2026-05-13 17:25:54 | [INFO] DE data integrity check complete. (pred)
+MetricsEvaluator (incl. DE): 16.40s
+GPU free after init: 81.6 GB
+2026-05-13 17:25:54 | [INFO] Computing metric 'overlap_at_N'
+2026-05-13 17:25:54 | [INFO] Computing metric 'overlap_at_50'
+2026-05-13 17:25:55 | [INFO] Computing metric 'overlap_at_100'
+2026-05-13 17:25:55 | [INFO] Computing metric 'overlap_at_200'
+2026-05-13 17:25:55 | [INFO] Computing metric 'overlap_at_500'
+2026-05-13 17:25:55 | [INFO] Computing metric 'precision_at_N'
+2026-05-13 17:25:56 | [INFO] Computing metric 'precision_at_50'
+2026-05-13 17:25:56 | [INFO] Computing metric 'precision_at_100'
+2026-05-13 17:25:57 | [INFO] Computing metric 'precision_at_200'
+2026-05-13 17:25:57 | [INFO] Computing metric 'precision_at_500'
+2026-05-13 17:25:57 | [INFO] Computing metric 'de_spearman_sig'
+2026-05-13 17:25:57 | [INFO] Computing metric 'de_direction_match'
+2026-05-13 17:25:57 | [INFO] Computing metric 'de_spearman_lfc_sig'
+2026-05-13 17:25:57 | [INFO] Computing metric 'de_sig_genes_recall'
+2026-05-13 17:25:57 | [INFO] Computing metric 'de_nsig_counts'
+2026-05-13 17:25:58 | [INFO] Computing metric 'pr_auc'
+2026-05-13 17:25:58 | [INFO] Computing metric 'roc_auc'
+2026-05-13 17:25:59 | [INFO] Computing metric 'pearson_delta'
+2026-05-13 17:25:59 | [INFO] Building pseudobulk embeddings for real anndata on: .X
+2026-05-13 17:25:59 | [INFO] Building pseudobulk embeddings for predicted anndata on: .X
+Iterating over perturbations...:   0%|          | 0/735 [00:00<?, ?it/s]Iterating over perturbations...: 100%|██████████| 735/735 [00:00<00:00, 84372.80it/s]
+Iterating over perturbations...:   0%|          | 0/735 [00:00<?, ?it/s]Iterating over perturbations...: 100%|██████████| 735/735 [00:00<00:00, 85645.60it/s]
+2026-05-13 17:26:00 | [INFO] Computing metric 'mse'
+Iterating over perturbations...:   0%|          | 0/735 [00:00<?, ?it/s]Iterating over perturbations...: 100%|██████████| 735/735 [00:00<00:00, 84718.28it/s]
+Iterating over perturbations...:   0%|          | 0/735 [00:00<?, ?it/s]Iterating over perturbations...: 100%|██████████| 735/735 [00:00<00:00, 85862.67it/s]
+2026-05-13 17:26:00 | [INFO] Computing metric 'mae'
+Iterating over perturbations...:   0%|          | 0/735 [00:00<?, ?it/s]Iterating over perturbations...: 100%|██████████| 735/735 [00:00<00:00, 86131.35it/s]
+Iterating over perturbations...:   0%|          | 0/735 [00:00<?, ?it/s]Iterating over perturbations...: 100%|██████████| 735/735 [00:00<00:00, 86825.14it/s]
+2026-05-13 17:26:00 | [INFO] Computing metric 'mse_delta'
+Iterating over perturbations...:   0%|          | 0/735 [00:00<?, ?it/s]Iterating over perturbations...: 100%|██████████| 735/735 [00:00<00:00, 84349.72it/s]
+Iterating over perturbations...:   0%|          | 0/735 [00:00<?, ?it/s]Iterating over perturbations...: 100%|██████████| 735/735 [00:00<00:00, 86664.05it/s]
+2026-05-13 17:26:00 | [INFO] Computing metric 'mae_delta'
+Iterating over perturbations...:   0%|          | 0/735 [00:00<?, ?it/s]Iterating over perturbations...: 100%|██████████| 735/735 [00:00<00:00, 86382.35it/s]
+Iterating over perturbations...:   0%|          | 0/735 [00:00<?, ?it/s]Iterating over perturbations...: 100%|██████████| 735/735 [00:00<00:00, 84243.69it/s]
+2026-05-13 17:26:00 | [INFO] Computing metric 'discrimination_score_l1'
+Iterating over perturbations...:   0%|          | 0/735 [00:00<?, ?it/s]Iterating over perturbations...: 100%|██████████| 735/735 [00:00<00:00, 85368.12it/s]
+Iterating over perturbations...:   0%|          | 0/735 [00:00<?, ?it/s]Iterating over perturbations...: 100%|██████████| 735/735 [00:00<00:00, 85054.86it/s]
+2026-05-13 17:26:00 | [INFO] Computing metric 'discrimination_score_l2'
+Iterating over perturbations...:   0%|          | 0/735 [00:00<?, ?it/s]Iterating over perturbations...: 100%|██████████| 735/735 [00:00<00:00, 83908.91it/s]
+Iterating over perturbations...:   0%|          | 0/735 [00:00<?, ?it/s]Iterating over perturbations...: 100%|██████████| 735/735 [00:00<00:00, 86061.62it/s]
+2026-05-13 17:26:00 | [INFO] Computing metric 'discrimination_score_cosine'
+Iterating over perturbations...:   0%|          | 0/735 [00:00<?, ?it/s]Iterating over perturbations...: 100%|██████████| 735/735 [00:00<00:00, 84848.85it/s]
+Iterating over perturbations...:   0%|          | 0/735 [00:00<?, ?it/s]Iterating over perturbations...: 100%|██████████| 735/735 [00:00<00:00, 83638.01it/s]
+2026-05-13 17:26:00 | [INFO] Computing metric 'pearson_edistance'
+2026-05-13 17:26:00 | [INFO] edistance(gpu): fitting shared sparse PCA on 2-chunk dask (real (8589830, 2000)/924028027 nnz + pred (8589830, 2000)/1536652743 nnz) — skipping host round trip
+2026-05-13 17:26:49 | [INFO] Computing metric 'clustering_agreement'
+2026-05-13 17:26:51 | [INFO] Writing perturbation level metrics to /home/sdicks/git/cell-eval/cell-eval-arc-celleval-gpu/results.csv
+2026-05-13 17:26:51 | [INFO] Writing aggregate metrics to /home/sdicks/git/cell-eval/cell-eval-arc-celleval-gpu/agg_results.csv
+Pipeline compute(): 56.89s
+
+=== aggregated metrics (mean row) ===
+  overlap_at_N                        0.743499
+  overlap_at_50                       0.266748
+  overlap_at_100                      0.395265
+  overlap_at_200                      0.519864
+  overlap_at_500                      0.664353
+  precision_at_N                      0.749101
+  precision_at_50                     0.266460
+  precision_at_100                    0.394951
+  precision_at_200                    0.519549
+  precision_at_500                    0.664039
+  de_spearman_sig                     0.931832
+  de_direction_match                  0.910207
+  de_spearman_lfc_sig                 0.822859
+  de_sig_genes_recall                 0.850969
+  de_nsig_counts_real                 1004.138776
+  de_nsig_counts_pred                 1131.949660
+  pr_auc                              0.886796
+  roc_auc                             0.880728
+  pearson_delta                       0.976591
+  mse                                 0.000101
+  mae                                 0.003981
+  mse_delta                           0.000091
+  mae_delta                           0.003554
+  discrimination_score_l1             0.999354
+  discrimination_score_l2             0.999930
+  discrimination_score_cosine         0.999978
+  pearson_edistance                   0.955619
+  clustering_agreement                0.711679
+
+Report: /home/sdicks/git/cell-eval/cell-eval-arc-celleval-gpu/celleval_gpu_report.md
+Bench wall: 1m 13.3s  ·  Total: 1m 52.4s

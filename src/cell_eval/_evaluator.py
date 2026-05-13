@@ -7,7 +7,7 @@ import anndata as ad
 import pandas as pd
 import polars as pl
 import scanpy as sc
-from pdex import pdex
+from .pdex import pdex
 
 from cell_eval.utils import guess_is_lognorm
 

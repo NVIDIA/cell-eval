@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 from numpy.typing import NDArray
-from pdex import pdex
+from .pdex import pdex
 from scipy.sparse import issparse
 
 from ._evaluator import _build_pdex_kwargs, _convert_to_normlog

@@ -13,6 +13,43 @@ from tqdm import tqdm
 logger = logging.getLogger(__name__)
 
 
+def _is_cupy_like(matrix) -> bool:
+    """Return True if ``matrix`` lives on GPU (cupy dense or cupyx sparse)."""
+    try:
+        import cupy as cp
+        import cupyx.scipy.sparse as cp_sparse
+    except ImportError:
+        return False
+    return cp_sparse.issparse(matrix) or isinstance(matrix, cp.ndarray)
+
+
+def _uniques_and_masks(
+    col: pd.Series,
+) -> tuple[NDArray[np.str_], dict[str, NDArray[np.int_]]]:
+    """Return ``(unique_perts, {pert: row_indices})`` for an obs column.
+
+    Fast path: when ``col`` is :class:`pd.Categorical`, reads uniques from
+    ``.cat.categories`` and builds masks from ``.cat.codes`` — avoids
+    materialising every row's category as a string. On the Arc data this
+    saves ~20 s vs ``np.unique(col.to_numpy(str))`` × multiple calls.
+    """
+    if isinstance(col.dtype, pd.CategoricalDtype):
+        cats = np.asarray(col.cat.categories, dtype=object)
+        codes = col.cat.codes.to_numpy()
+        masks = {
+            str(cats[i]): np.flatnonzero(codes == i) for i in range(len(cats))
+        }
+        # Cast uniques to plain str array (preserves original ordering).
+        return np.asarray(cats, dtype=str), masks
+
+    arr = col.to_numpy(str)
+    unique_perts, inverse = np.unique(arr, return_inverse=True)
+    masks = {
+        pert: np.flatnonzero(inverse == i) for i, pert in enumerate(unique_perts)
+    }
+    return unique_perts, masks
+
+
 @dataclass(frozen=True)
 class PerturbationAnndataPair:
     """Pair of AnnData objects with perturbation information."""
@@ -71,11 +108,15 @@ class PerturbationAnndataPair:
                 f"Perturbation column ({self.pert_col}) not found in pred AnnData: {self.pred.obs.columns}"
             )
 
-        perts_real = np.unique(
-            cast(pd.Series, self.real.obs[self.pert_col]).to_numpy(str)
+        # Fast path: when obs[pert_col] is already categorical (cell-eval's
+        # downstream pdex / aggregate paths require it anyway), we can read
+        # uniques from .cat.categories and build masks from .cat.codes without
+        # materialising an 8.59M-row string array four times (~20 s on Arc).
+        perts_real, pert_mask_real = _uniques_and_masks(
+            cast(pd.Series, self.real.obs[self.pert_col])
         )
-        perts_pred = np.unique(
-            cast(pd.Series, self.pred.obs[self.pert_col]).to_numpy(str)
+        perts_pred, pert_mask_pred = _uniques_and_masks(
+            cast(pd.Series, self.pred.obs[self.pert_col])
         )
         if not np.array_equal(perts_real, perts_pred):
             raise ValueError(
@@ -94,13 +135,6 @@ class PerturbationAnndataPair:
         perts = np.union1d(perts_real, perts_pred)
         perts = np.array([p for p in perts if p != self.control_pert])
 
-        pert_mask_real = self.pert_mask(
-            cast(pd.Series, self.real.obs[self.pert_col]).to_numpy(str),
-        )
-        pert_mask_pred = self.pert_mask(
-            cast(pd.Series, self.pred.obs[self.pert_col]).to_numpy(str),
-        )
-
         object.__setattr__(self, "perts", perts)
         object.__setattr__(self, "pert_mask_real", pert_mask_real)
         object.__setattr__(self, "pert_mask_pred", pert_mask_pred)
@@ -115,30 +149,47 @@ class PerturbationAnndataPair:
         groupby_key: str,
         embed_key: str | None = None,
     ) -> tuple[NDArray[np.str_], NDArray[np.float64]]:
-        """Get bulk anndata for a groupby key."""
+        """Per-group mean pseudobulks via aggregate, sparse-native.
 
+        Dispatches by where the matrix lives:
+          * cupy / cupyx.sparse → ``rsc.get.aggregate`` (runs on GPU)
+          * numpy / scipy.sparse → ``scanpy.get.aggregate`` (runs on host)
+
+        Neither path densifies the full ``(n_obs, n_genes)`` matrix; only the
+        small ``(n_groups, n_genes)`` mean lands here as host numpy.
+        """
         matrix = adata.X if not embed_key else adata.obsm[embed_key]
-        if issparse(matrix):
-            # Convert sparse matrix to dense array
-            logger.info("Converting sparse matrix to dense array for bulk calculation")
-            matrix = matrix.toarray()  # type: ignore
 
-        # Create a polars dataframe with the groupby key
-        frame = pl.DataFrame(
-            matrix,
-        ).with_columns(
-            groupby_key=adata.obs[groupby_key].to_numpy(str),  # type: ignore
-        )
+        # rsc/sc.get.aggregate require a categorical groupby column.
+        if not isinstance(adata.obs[groupby_key].dtype, pd.CategoricalDtype):
+            adata = adata.copy()
+            adata.obs[groupby_key] = adata.obs[groupby_key].astype("category")
 
-        # Pseudobulk (mean) the dataframe by the groupby key
-        bulked = frame.group_by("groupby_key").mean().sort("groupby_key")
+        if _is_cupy_like(matrix):
+            import cupy as cp
+            import cupyx.scipy.sparse as cp_sparse
+            import rapids_singlecell as rsc
 
-        # identify the key column
-        keys = bulked["groupby_key"].to_numpy()
+            bulk = rsc.get.aggregate(
+                adata, by=groupby_key, func="mean", obsm=embed_key
+            )
+            mean_mat = bulk.X if bulk.X is not None else bulk.layers["mean"]
+            if cp_sparse.issparse(mean_mat):
+                mean_mat = mean_mat.toarray()
+            if isinstance(mean_mat, cp.ndarray):
+                mean_mat = cp.asnumpy(mean_mat)
+        else:
+            import scanpy as sc
 
-        # identify the pseudobulks
-        values = bulked.drop("groupby_key").to_numpy()
+            bulk = sc.get.aggregate(
+                adata, by=groupby_key, func="mean", obsm=embed_key
+            )
+            mean_mat = bulk.X if bulk.X is not None else bulk.layers["mean"]
+            if issparse(mean_mat):
+                mean_mat = mean_mat.toarray()  # type: ignore
 
+        values = np.asarray(mean_mat, dtype=np.float64)
+        keys = np.asarray(bulk.obs_names)
         return (keys, values)
 
     @staticmethod
