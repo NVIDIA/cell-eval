@@ -119,11 +119,16 @@ def run_evaluation(args: ap.Namespace):
     from cell_eval import MetricsEvaluator
     from cell_eval.utils import split_anndata_on_celltype
 
-    # `embed_key` is honoured only by `pearson_edistance` — it lets the caller
-    # plug in a precomputed joint embedding (e.g. a pre-fit PCA) instead of
-    # having the metric fit its own shared PCA on (real, pred).
+    # `embed_key` is the load-bearing input for `pearson_edistance` (skips
+    # the internal shared-PCA fit). It's also forwarded to discrimination_score
+    # for backward-compat with prior CLI behaviour; those metrics emit a
+    # DeprecationWarning at call time.
     metric_kwargs = (
-        {"pearson_edistance": {"embed_key": args.embed_key}}
+        {
+            "pearson_edistance": {"embed_key": args.embed_key},
+            "discrimination_score_l2": {"embed_key": args.embed_key},
+            "discrimination_score_cosine": {"embed_key": args.embed_key},
+        }
         if args.embed_key is not None
         else {}
     )

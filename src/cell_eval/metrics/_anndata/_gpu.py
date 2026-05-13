@@ -35,15 +35,15 @@ logger = getLogger(__name__)
 # --------------------------------------------------------------------------- #
 
 def _stack_effects(
-    data: PerturbationAnndataPair,
+    data: PerturbationAnndataPair, embed_key: str | None = None,
 ) -> tuple["np.ndarray", "np.ndarray", "np.ndarray", "np.ndarray"]:
     """Return ``(cent_real, cent_pred, eff_real, eff_pred)`` as host numpy arrays.
 
     ``eff_*`` are control-subtracted (perturbation_effect).  Shapes are
     ``(n_perts_non_ctrl, n_features)`` for the effect matrices and the matching
-    perturbation row arrangement for centroids. Always operates on ``adata.X``.
+    perturbation row arrangement for centroids.
     """
-    bulks = list(data.iter_bulk_arrays())
+    bulks = list(data.iter_bulk_arrays(embed_key=embed_key))
     cent_real = np.vstack([b.pert_real for b in bulks])
     cent_pred = np.vstack([b.pert_pred for b in bulks])
     eff_real = np.vstack([b.perturbation_effect(which="real", abs=False) for b in bulks])
@@ -51,19 +51,23 @@ def _stack_effects(
     return cent_real, cent_pred, eff_real, eff_pred
 
 
-def _pert_keys(data: PerturbationAnndataPair) -> list[str]:
-    return [b.key for b in data.iter_bulk_arrays()]
+def _pert_keys(
+    data: PerturbationAnndataPair, embed_key: str | None = None,
+) -> list[str]:
+    return [b.key for b in data.iter_bulk_arrays(embed_key=embed_key)]
 
 
 # --------------------------------------------------------------------------- #
 # Centroid-based metrics — vectorized cupy.
 # --------------------------------------------------------------------------- #
 
-def pearson_delta(data: PerturbationAnndataPair) -> dict[str, float]:
+def pearson_delta(
+    data: PerturbationAnndataPair, embed_key: str | None = None
+) -> dict[str, float]:
     import cupy as cp
 
-    _, _, eff_real, eff_pred = _stack_effects(data)
-    keys = _pert_keys(data)
+    _, _, eff_real, eff_pred = _stack_effects(data, embed_key)
+    keys = _pert_keys(data, embed_key)
 
     er = cp.asarray(eff_real, dtype=cp.float64)
     ep = cp.asarray(eff_pred, dtype=cp.float64)
@@ -75,44 +79,52 @@ def pearson_delta(data: PerturbationAnndataPair) -> dict[str, float]:
     return {k: float(v) for k, v in zip(keys, corr)}
 
 
-def mse(data: PerturbationAnndataPair) -> dict[str, float]:
+def mse(
+    data: PerturbationAnndataPair, embed_key: str | None = None
+) -> dict[str, float]:
     import cupy as cp
 
-    cent_real, cent_pred, _, _ = _stack_effects(data)
-    keys = _pert_keys(data)
+    cent_real, cent_pred, _, _ = _stack_effects(data, embed_key)
+    keys = _pert_keys(data, embed_key)
     cr = cp.asarray(cent_real, dtype=cp.float64)
     cp_ = cp.asarray(cent_pred, dtype=cp.float64)
     vals = cp.asnumpy(((cp_ - cr) ** 2).mean(axis=1))
     return {k: float(v) for k, v in zip(keys, vals)}
 
 
-def mae(data: PerturbationAnndataPair) -> dict[str, float]:
+def mae(
+    data: PerturbationAnndataPair, embed_key: str | None = None
+) -> dict[str, float]:
     import cupy as cp
 
-    cent_real, cent_pred, _, _ = _stack_effects(data)
-    keys = _pert_keys(data)
+    cent_real, cent_pred, _, _ = _stack_effects(data, embed_key)
+    keys = _pert_keys(data, embed_key)
     cr = cp.asarray(cent_real, dtype=cp.float64)
     cp_ = cp.asarray(cent_pred, dtype=cp.float64)
     vals = cp.asnumpy(cp.abs(cp_ - cr).mean(axis=1))
     return {k: float(v) for k, v in zip(keys, vals)}
 
 
-def mse_delta(data: PerturbationAnndataPair) -> dict[str, float]:
+def mse_delta(
+    data: PerturbationAnndataPair, embed_key: str | None = None
+) -> dict[str, float]:
     import cupy as cp
 
-    _, _, eff_real, eff_pred = _stack_effects(data)
-    keys = _pert_keys(data)
+    _, _, eff_real, eff_pred = _stack_effects(data, embed_key)
+    keys = _pert_keys(data, embed_key)
     er = cp.asarray(eff_real, dtype=cp.float64)
     ep = cp.asarray(eff_pred, dtype=cp.float64)
     vals = cp.asnumpy(((ep - er) ** 2).mean(axis=1))
     return {k: float(v) for k, v in zip(keys, vals)}
 
 
-def mae_delta(data: PerturbationAnndataPair) -> dict[str, float]:
+def mae_delta(
+    data: PerturbationAnndataPair, embed_key: str | None = None
+) -> dict[str, float]:
     import cupy as cp
 
-    _, _, eff_real, eff_pred = _stack_effects(data)
-    keys = _pert_keys(data)
+    _, _, eff_real, eff_pred = _stack_effects(data, embed_key)
+    keys = _pert_keys(data, embed_key)
     er = cp.asarray(eff_real, dtype=cp.float64)
     ep = cp.asarray(eff_pred, dtype=cp.float64)
     vals = cp.asnumpy(cp.abs(ep - er).mean(axis=1))
@@ -122,17 +134,26 @@ def mae_delta(data: PerturbationAnndataPair) -> dict[str, float]:
 def discrimination_score(
     data: PerturbationAnndataPair,
     metric: str = "l1",
+    embed_key: str | None = None,
     exclude_target_gene: bool = True,
 ) -> dict[str, float]:
-    """cuml-pairwise discrimination score on stacked effect matrices."""
+    """cuml-pairwise discrimination score on stacked effect matrices.
+
+    ``embed_key`` is ignored for l1/manhattan/cityblock (gene-space l1 is
+    the meaningful form). ``exclude_target_gene`` is silently disabled when
+    operating in embedding space.
+    """
     import cupy as cp
     from cuml.metrics import pairwise_distances as cuml_pairwise
 
-    _, _, eff_real, eff_pred = _stack_effects(data)
-    keys = _pert_keys(data)
+    if metric in {"l1", "manhattan", "cityblock"}:
+        embed_key = None
+
+    _, _, eff_real, eff_pred = _stack_effects(data, embed_key)
+    keys = _pert_keys(data, embed_key)
     perts = np.asarray(keys)
 
-    if exclude_target_gene:
+    if exclude_target_gene and embed_key is None:
         genes = np.asarray(data.genes)
         out = {}
         # exclude_target_gene varies per pert, so we can't reuse a single
@@ -356,11 +377,13 @@ class ClusteringAgreement:
 
     def __init__(
         self,
+        embed_key: str | None = None,
         real_resolution: float = 1.0,
         pred_resolutions: tuple[float, ...] = (0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0),
         metric: Literal["ami", "nmi", "ari"] = "ami",
         n_neighbors: int = 15,
     ) -> None:
+        self.embed_key = embed_key
         self.real_resolution = real_resolution
         self.pred_resolutions = pred_resolutions
         self.metric = metric
@@ -385,6 +408,7 @@ class ClusteringAgreement:
         adata: ad.AnnData,
         category_key: str,
         control_pert: str,
+        embed_key: str | None = None,
     ) -> ad.AnnData:
         """Per-category mean centroid AnnData via ``rsc.get.aggregate``.
 
@@ -405,7 +429,9 @@ class ClusteringAgreement:
         if not (cp_sparse.issparse(adata.X) or isinstance(adata.X, cp.ndarray)):
             rsc.get.anndata_to_GPU(adata)
 
-        bulk = rsc.get.aggregate(adata, by=category_key, func="mean")
+        bulk = rsc.get.aggregate(
+            adata, by=category_key, func="mean", obsm=embed_key
+        )
         mean_mat = bulk.X if bulk.X is not None else bulk.layers["mean"]
 
         if cp_sparse.issparse(mean_mat):
@@ -439,10 +465,10 @@ class ClusteringAgreement:
 
         cats_sorted = sorted([c for c in data.perts if c != data.control_pert])
         ad_real = self._centroid_ann(
-            data.real, data.pert_col, data.control_pert
+            data.real, data.pert_col, data.control_pert, self.embed_key
         )
         ad_pred = self._centroid_ann(
-            data.pred, data.pert_col, data.control_pert
+            data.pred, data.pert_col, data.control_pert, self.embed_key
         )
 
         # Materialise to plain AnnData with the embedded centroids on GPU.

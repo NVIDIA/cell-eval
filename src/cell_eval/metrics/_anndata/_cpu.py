@@ -21,29 +21,49 @@ from ..._types import PerturbationAnndataPair
 logger = getLogger(__name__)
 
 
-def pearson_delta(data: PerturbationAnndataPair) -> dict[str, float]:
+def pearson_delta(
+    data: PerturbationAnndataPair, embed_key: str | None = None
+) -> dict[str, float]:
     """Compute Pearson correlation between mean differences from control."""
-    return _generic_evaluation(data, pearsonr, use_delta=True)
+    return _generic_evaluation(
+        data, pearsonr, use_delta=True, embed_key=embed_key
+    )
 
 
-def mse(data: PerturbationAnndataPair) -> dict[str, float]:
+def mse(
+    data: PerturbationAnndataPair, embed_key: str | None = None
+) -> dict[str, float]:
     """Compute mean squared error of each perturbation from control."""
-    return _generic_evaluation(data, skm.mean_squared_error, use_delta=False)
+    return _generic_evaluation(
+        data, skm.mean_squared_error, use_delta=False, embed_key=embed_key
+    )
 
 
-def mae(data: PerturbationAnndataPair) -> dict[str, float]:
+def mae(
+    data: PerturbationAnndataPair, embed_key: str | None = None
+) -> dict[str, float]:
     """Compute mean absolute error of each perturbation from control."""
-    return _generic_evaluation(data, skm.mean_absolute_error, use_delta=False)
+    return _generic_evaluation(
+        data, skm.mean_absolute_error, use_delta=False, embed_key=embed_key
+    )
 
 
-def mse_delta(data: PerturbationAnndataPair) -> dict[str, float]:
+def mse_delta(
+    data: PerturbationAnndataPair, embed_key: str | None = None
+) -> dict[str, float]:
     """Compute mean squared error of each perturbation-control delta."""
-    return _generic_evaluation(data, skm.mean_squared_error, use_delta=True)
+    return _generic_evaluation(
+        data, skm.mean_squared_error, use_delta=True, embed_key=embed_key
+    )
 
 
-def mae_delta(data: PerturbationAnndataPair) -> dict[str, float]:
+def mae_delta(
+    data: PerturbationAnndataPair, embed_key: str | None = None
+) -> dict[str, float]:
     """Compute mean absolute error of each perturbation-control delta."""
-    return _generic_evaluation(data, skm.mean_absolute_error, use_delta=True)
+    return _generic_evaluation(
+        data, skm.mean_absolute_error, use_delta=True, embed_key=embed_key
+    )
 
 
 def edistance(
@@ -161,6 +181,7 @@ def _edistances_to_control_cpu(
 def discrimination_score(
     data: PerturbationAnndataPair,
     metric: str = "l1",
+    embed_key: str | None = None,
     exclude_target_gene: bool = True,
 ) -> dict[str, float]:
     """Base implementation for discrimination score computation.
@@ -170,29 +191,37 @@ def discrimination_score(
     Args:
         data: PerturbationAnndataPair containing real and predicted data
         metric: Metric for distance calculation (e.g., "l1", "l2", see `scipy.metrics.pairwise.distance_metrics`)
+        embed_key: Optional ``obsm`` key. When set, distances run in that
+            embedding space; when ``None`` they run on raw expression.
+            Ignored for l1/manhattan/cityblock — gene-space l1 is the
+            interpretable form.
         exclude_target_gene: Whether to exclude target gene from calculation
+            (only meaningful in gene space; ignored when ``embed_key`` is set)
 
     Returns:
         Dictionary mapping perturbation names to normalized ranks
     """
+    if metric in {"l1", "manhattan", "cityblock"}:
+        embed_key = None
+
     # Compute perturbation effects for all perturbations
     real_effects = np.vstack(
         [
             d.perturbation_effect(which="real", abs=False)
-            for d in data.iter_bulk_arrays()
+            for d in data.iter_bulk_arrays(embed_key=embed_key)
         ]
     )
     pred_effects = np.vstack(
         [
             d.perturbation_effect(which="pred", abs=False)
-            for d in data.iter_bulk_arrays()
+            for d in data.iter_bulk_arrays(embed_key=embed_key)
         ]
     )
 
     norm_ranks = {}
     for p_idx, p in enumerate(data.perts):
         # Determine which features to include in the comparison
-        if exclude_target_gene:
+        if exclude_target_gene and not embed_key:
             include_mask = np.flatnonzero(data.genes != p)
         else:
             # For embedding data or when not excluding target gene, use all features
@@ -227,10 +256,11 @@ def _generic_evaluation(
     data: PerturbationAnndataPair,
     func: Callable[[np.ndarray, np.ndarray], float],
     use_delta: bool = False,
+    embed_key: str | None = None,
 ) -> dict[str, float]:
     """Generic evaluation function for anndata pair."""
     res = {}
-    for bulk_array in data.iter_bulk_arrays():
+    for bulk_array in data.iter_bulk_arrays(embed_key=embed_key):
         if use_delta:
             x = bulk_array.perturbation_effect(which="pred", abs=False)
             y = bulk_array.perturbation_effect(which="real", abs=False)
@@ -253,11 +283,13 @@ class ClusteringAgreement:
 
     def __init__(
         self,
+        embed_key: str | None = None,
         real_resolution: float = 1.0,
         pred_resolutions: tuple[float, ...] = (0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0),
         metric: Literal["ami", "nmi", "ari"] = "ami",
         n_neighbors: int = 15,
     ) -> None:
+        self.embed_key = embed_key
         self.real_resolution = real_resolution
         self.pred_resolutions = pred_resolutions
         self.metric = metric
@@ -314,6 +346,7 @@ class ClusteringAgreement:
         adata: ad.AnnData,
         category_key: str,
         control_pert: str,
+        embed_key: str | None = None,
     ) -> ad.AnnData:
         """Per-category mean centroid AnnData via ``scanpy.get.aggregate``.
 
@@ -326,7 +359,9 @@ class ClusteringAgreement:
             adata = adata.copy()
             adata.obs[category_key] = adata.obs[category_key].astype("category")
 
-        bulk = sc.get.aggregate(adata, by=category_key, func="mean")
+        bulk = sc.get.aggregate(
+            adata, by=category_key, func="mean", obsm=embed_key
+        )
         mean_mat = bulk.X if bulk.X is not None else bulk.layers["mean"]
         if issparse(mean_mat):
             mean_mat = mean_mat.toarray()  # type: ignore
@@ -344,11 +379,13 @@ class ClusteringAgreement:
             adata=data.real,
             category_key=data.pert_col,
             control_pert=data.control_pert,
+            embed_key=self.embed_key,
         )
         ad_pred_cent = self._centroid_ann(
             adata=data.pred,
             category_key=data.pert_col,
             control_pert=data.control_pert,
+            embed_key=self.embed_key,
         )
 
         # 3. cluster real once
