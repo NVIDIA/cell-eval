@@ -109,7 +109,10 @@ def parse_args_run(parser: ap.ArgumentParser):
         "--replicate-col",
         type=str,
         default=None,
-        help="AnnData obs column used to pseudobulk replicates for the pydeseq2 backend",
+        help=(
+            "AnnData obs column identifying the sample/replicate unit used for "
+            "pydeseq2 pseudobulk aggregation"
+        ),
     )
     parser.add_argument(
         "--skip-metrics",

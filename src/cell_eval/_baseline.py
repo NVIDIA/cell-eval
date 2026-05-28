@@ -9,7 +9,8 @@ from numpy.typing import NDArray
 from pdex import pdex
 from scipy.sparse import issparse
 
-from ._evaluator import _build_pdex_kwargs, _convert_to_normlog
+from ._evaluator import _convert_to_normlog
+from ._pdex_backend import _build_pdex_kwargs
 
 logger = logging.getLogger(__name__)
 

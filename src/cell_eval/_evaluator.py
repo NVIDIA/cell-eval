@@ -13,7 +13,6 @@ from cell_eval.utils import guess_is_lognorm
 from ._de_backends import (
     DEInputByMethod,
     DEMethod,
-    _build_pdex_kwargs,
     build_de_frame,
     compare_de_backends,
     de_input_for_method,
@@ -85,7 +84,8 @@ class MetricsEvaluator:
         AnnData layer containing raw integer counts for PyDESeq2. If omitted,
         PyDESeq2 uses .X and validates it contains raw integer counts.
     replicate_col: str | None = None
-        AnnData obs column used to create PyDESeq2 pseudobulk replicates.
+        AnnData obs column identifying the independent sample/replicate unit
+        used to create PyDESeq2 pseudobulk samples.
     """
 
     def __init__(

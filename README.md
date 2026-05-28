@@ -78,9 +78,11 @@ cell-eval run \
 ```
 
 PyDESeq2 requires raw non-negative integer counts and replicate/sample metadata for
-pseudobulk samples. Use `--counts-layer` when `.X` contains normalized/log values.
-If `.X` already contains raw counts, use `--allow-discrete`; note that AnnData metrics
-are designed for normalized/log expression, so `--profile de` is usually the right
+pseudobulk samples. `--replicate-col` should identify the independent sample unit
+to aggregate within each perturbation, such as donor, sample, or experimental
+batch. Use `--counts-layer` when `.X` contains normalized/log values. If `.X`
+already contains raw counts, use `--allow-discrete`; note that AnnData metrics are
+designed for normalized/log expression, so `--profile de` is usually the right
 choice for raw-count-only inputs.
 
 To run this as a python module you will need to use the `MetricsEvaluator` class.
@@ -113,9 +115,18 @@ evaluator = MetricsEvaluator(
     de_methods=["pdex", "pydeseq2"],
     counts_layer="counts",
     replicate_col="batch",
+    de_kwargs={
+        "pydeseq2": {
+            "dds_kwargs": {"design": "~perturbation"},
+            "stats_kwargs": {"alpha": 0.05},
+        },
+    },
 )
 (results, agg_results) = evaluator.compute(profile="de")
 ```
+
+For PyDESeq2, pass `DeseqDataSet` constructor options under `dds_kwargs` and
+`DeseqStats` options under `stats_kwargs`.
 
 This will give you metric evaluations for each perturbation individually (`results`) and aggregated results over all perturbations (`agg_results`).
 

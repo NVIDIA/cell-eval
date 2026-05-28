@@ -11,6 +11,7 @@ from cell_eval._de_backends import (
     normalize_de_methods,
     normalize_pydeseq2_results,
 )
+from cell_eval._pydeseq2_backend import _parse_pydeseq2_kwargs
 
 
 def _adata_for_de() -> AnnData:
@@ -124,6 +125,106 @@ def test_build_pydeseq2_inputs_rejects_fractional_counts() -> None:
             counts_layer=None,
             replicate_col="batch",
         )
+
+
+def test_build_pydeseq2_inputs_rejects_fractional_values_even_if_sums_are_integer() -> (
+    None
+):
+    adata = AnnData(
+        X=np.array(
+            [
+                [0.5, 1.5],
+                [0.5, 2.5],
+                [3.0, 4.0],
+                [5.0, 6.0],
+            ],
+            dtype=np.float32,
+        ),
+        obs=pd.DataFrame(
+            {
+                "target": ["control", "control", "p1", "p1"],
+                "batch": ["b1", "b1", "b1", "b1"],
+            },
+            index=pd.Index(["c1", "c2", "c3", "c4"]),
+        ),
+        var=pd.DataFrame(index=pd.Index(["g1", "g2"])),
+    )
+
+    with pytest.raises(ValueError, match="raw integer counts"):
+        build_pydeseq2_inputs(
+            adata=adata,
+            groupby="target",
+            reference="control",
+            counts_layer=None,
+            replicate_col="batch",
+        )
+
+
+def test_build_pydeseq2_inputs_rejects_missing_obs_values() -> None:
+    adata = AnnData(
+        X=np.array([[1, 2], [3, 4]], dtype=np.float32),
+        obs=pd.DataFrame(
+            {
+                "target": ["control", None],
+                "batch": ["b1", "b1"],
+            },
+            index=pd.Index(["c1", "c2"]),
+        ),
+        var=pd.DataFrame(index=pd.Index(["g1", "g2"])),
+    )
+
+    with pytest.raises(ValueError, match="target.*missing"):
+        build_pydeseq2_inputs(
+            adata=adata,
+            groupby="target",
+            reference="control",
+            counts_layer=None,
+            replicate_col="batch",
+        )
+
+
+def test_build_pydeseq2_inputs_rejects_empty_obs_values() -> None:
+    adata = AnnData(
+        X=np.array([[1, 2], [3, 4]], dtype=np.float32),
+        obs=pd.DataFrame(
+            {
+                "target": ["control", "p1"],
+                "batch": ["b1", ""],
+            },
+            index=pd.Index(["c1", "c2"]),
+        ),
+        var=pd.DataFrame(index=pd.Index(["g1", "g2"])),
+    )
+
+    with pytest.raises(ValueError, match="batch.*empty"):
+        build_pydeseq2_inputs(
+            adata=adata,
+            groupby="target",
+            reference="control",
+            counts_layer=None,
+            replicate_col="batch",
+        )
+
+
+def test_parse_pydeseq2_kwargs_accepts_nested_backend_options() -> None:
+    options = _parse_pydeseq2_kwargs(
+        {
+            "min_total_count": 10,
+            "fill_filtered": False,
+            "dds_kwargs": {"fit_type": "mean"},
+            "stats_kwargs": {"alpha": 0.1},
+        }
+    )
+
+    assert options.min_total_count == 10
+    assert options.fill_filtered is False
+    assert options.dds_kwargs == {"fit_type": "mean"}
+    assert options.stats_kwargs == {"alpha": 0.1}
+
+
+def test_parse_pydeseq2_kwargs_rejects_unknown_top_level_keys() -> None:
+    with pytest.raises(ValueError, match="Unknown PyDESeq2 option"):
+        _parse_pydeseq2_kwargs({"fit_type": "mean"})
 
 
 def test_normalize_pydeseq2_results_maps_to_cell_eval_schema() -> None:
