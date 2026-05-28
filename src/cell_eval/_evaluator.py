@@ -7,10 +7,20 @@ import anndata as ad
 import pandas as pd
 import polars as pl
 import scanpy as sc
-from pdex import pdex
 
 from cell_eval.utils import guess_is_lognorm
 
+from ._de_backends import (
+    DEInputByMethod,
+    DEMethod,
+    _build_pdex_kwargs,
+    build_de_frame,
+    compare_de_backends,
+    de_input_for_method,
+    kwargs_for_de_method,
+    normalize_de_methods,
+    write_de_frame,
+)
 from ._pipeline import MetricPipeline
 from ._types import PerturbationAnndataPair, initialize_de_comparison
 from .utils import _cast_float16_to_float32
@@ -63,14 +73,27 @@ class MetricsEvaluator:
     pdex_kwargs: dict[str, Any] | None = None
         Keyword arguments for parallel_differential_expression.
         These will overwrite arguments passed to MetricsEvaluator.__init__ if they conflict.
+    de_method: str = "pdex"
+        Differential-expression backend to use. One of "pdex" or "pydeseq2".
+    de_methods: list[str] | str | None = None
+        Optional list/comma-separated list of DE backends to run in one evaluation.
+        If provided, this overrides de_method.
+    de_kwargs: dict[str, Any] | None = None
+        Keyword arguments for DE backends. For multi-backend runs, this may be
+        nested by backend name, e.g. {"pdex": {...}, "pydeseq2": {...}}.
+    counts_layer: str | None = None
+        AnnData layer containing raw integer counts for PyDESeq2. If omitted,
+        PyDESeq2 uses .X and validates it contains raw integer counts.
+    replicate_col: str | None = None
+        AnnData obs column used to create PyDESeq2 pseudobulk replicates.
     """
 
     def __init__(
         self,
         adata_pred: ad.AnnData | str,
         adata_real: ad.AnnData | str,
-        de_pred: pl.DataFrame | str | None = None,
-        de_real: pl.DataFrame | str | None = None,
+        de_pred: DEInputByMethod = None,
+        de_real: DEInputByMethod = None,
         control_pert: str = "non-targeting",
         pert_col: str = "target",
         num_threads: int = -1,
@@ -78,10 +101,21 @@ class MetricsEvaluator:
         allow_discrete: bool = False,
         prefix: str | None = None,
         pdex_kwargs: dict[str, Any] | None = None,
+        de_method: str | list[str] = "pdex",
+        de_methods: str | list[str] | None = None,
+        de_kwargs: dict[str, Any] | None = None,
+        counts_layer: str | None = None,
+        replicate_col: str | None = None,
         skip_de: bool = False,
     ):
         # Enable a global string cache for categorical columns
         pl.enable_string_cache()
+
+        normalized_de_methods = normalize_de_methods(de_method, de_methods)
+        if pdex_kwargs is not None:
+            if de_kwargs is not None:
+                raise ValueError("Use either pdex_kwargs or de_kwargs, not both")
+            de_kwargs = {"pdex": pdex_kwargs}
 
         if num_threads == -1:
             num_threads = _available_cpus()
@@ -102,8 +136,10 @@ class MetricsEvaluator:
 
         if skip_de:
             self.de_comparison = None
+            self.de_comparisons: dict[str, Any] = {}
+            self.de_backend_comparison = pl.DataFrame()
         else:
-            self.de_comparison = _build_de_comparison(
+            self.de_comparisons = _build_de_comparisons(
                 anndata_pair=self.anndata_pair,
                 de_pred=de_pred,
                 de_real=de_real,
@@ -111,8 +147,23 @@ class MetricsEvaluator:
                 allow_discrete=allow_discrete,
                 outdir=outdir,
                 prefix=prefix,
-                pdex_kwargs=pdex_kwargs or {},
+                de_methods=normalized_de_methods,
+                de_kwargs=de_kwargs or {},
+                counts_layer=counts_layer,
+                replicate_col=replicate_col,
             )
+            self.de_comparison = next(iter(self.de_comparisons.values()))
+            self.de_backend_comparison = compare_de_backends(self.de_comparisons)
+            if self.de_backend_comparison.height > 0:
+                safe_prefix = prefix.replace("/", "-") if prefix is not None else None
+                basename = (
+                    f"{safe_prefix}_de_backend_comparison.csv"
+                    if safe_prefix
+                    else "de_backend_comparison.csv"
+                )
+                outpath = os.path.join(outdir, basename)
+                logger.info(f"Writing DE backend comparison to {outpath}")
+                self.de_backend_comparison.write_csv(outpath)
 
         self.outdir = outdir
         self.prefix = prefix
@@ -126,6 +177,16 @@ class MetricsEvaluator:
         write_csv: bool = True,
         break_on_error: bool = False,
     ) -> tuple[pl.DataFrame, pl.DataFrame]:
+        if len(self.de_comparisons) > 1:
+            return self._compute_multi_de_method(
+                profile=profile,
+                metric_configs=metric_configs,
+                skip_metrics=skip_metrics,
+                basename=basename,
+                write_csv=write_csv,
+                break_on_error=break_on_error,
+            )
+
         pipeline = MetricPipeline(
             profile=profile,
             metric_configs=metric_configs,
@@ -147,6 +208,79 @@ class MetricsEvaluator:
                 basename = basename.replace(
                     "/", "-"
                 )  # some basenames (e.g. HepG2/C3A_results.csv) may have slashes in them
+            outpath = os.path.join(
+                self.outdir,
+                f"{self.prefix}_{basename}" if self.prefix else basename,
+            )
+            agg_outpath = os.path.join(
+                self.outdir,
+                f"{self.prefix}_agg_{basename}" if self.prefix else f"agg_{basename}",
+            )
+
+            logger.info(f"Writing perturbation level metrics to {outpath}")
+            results.write_csv(outpath)
+
+            logger.info(f"Writing aggregate metrics to {agg_outpath}")
+            agg_results.write_csv(agg_outpath)
+
+        return results, agg_results
+
+    def _compute_multi_de_method(
+        self,
+        profile: Literal["full", "vcc", "minimal", "de", "anndata"] = "full",
+        metric_configs: dict[str, dict[str, Any]] | None = None,
+        skip_metrics: list[str] | None = None,
+        basename: str = "results.csv",
+        write_csv: bool = True,
+        break_on_error: bool = False,
+    ) -> tuple[pl.DataFrame, pl.DataFrame]:
+        anndata_pipeline = MetricPipeline(
+            profile=profile,
+            metric_configs=metric_configs,
+            break_on_error=break_on_error,
+        )
+        if skip_metrics is not None:
+            anndata_pipeline.skip_metrics(skip_metrics)
+        anndata_pipeline.compute_anndata_metrics(self.anndata_pair)
+        anndata_results = anndata_pipeline.get_results()
+
+        results_by_method: list[pl.DataFrame] = []
+        agg_by_method: list[pl.DataFrame] = []
+        for de_method, de_comparison in self.de_comparisons.items():
+            de_pipeline = MetricPipeline(
+                profile=profile,
+                metric_configs=metric_configs,
+                break_on_error=break_on_error,
+            )
+            if skip_metrics is not None:
+                de_pipeline.skip_metrics(skip_metrics)
+            de_pipeline.compute_de_metrics(de_comparison)
+            de_results = de_pipeline.get_results()
+            results = _merge_metric_results(de_results, anndata_results)
+            if not results.is_empty():
+                results = results.with_columns(pl.lit(de_method).alias("de_method"))
+                results = results.select("de_method", pl.all().exclude("de_method"))
+
+            agg_results = _describe_metric_results(results)
+            if not agg_results.is_empty():
+                agg_results = agg_results.with_columns(
+                    pl.lit(de_method).alias("de_method")
+                )
+                agg_results = agg_results.select(
+                    "de_method", pl.all().exclude("de_method")
+                )
+
+            results_by_method.append(results)
+            agg_by_method.append(agg_results)
+
+        results = pl.concat(results_by_method, how="diagonal")
+        agg_results = pl.concat(agg_by_method, how="diagonal")
+
+        if write_csv:
+            if self.prefix is not None:
+                self.prefix = self.prefix.replace("/", "-")
+            if basename is not None:
+                basename = basename.replace("/", "-")
             outpath = os.path.join(
                 self.outdir,
                 f"{self.prefix}_{basename}" if self.prefix else basename,
@@ -239,107 +373,150 @@ def _build_de_comparison(
     prefix: str | None = None,
     pdex_kwargs: dict[str, Any] | None = None,
 ):
-    return initialize_de_comparison(
-        real=_load_or_build_de(
-            mode="real",
-            de_path=de_real,
-            anndata_pair=anndata_pair,
-            num_threads=num_threads,
-            allow_discrete=allow_discrete,
-            outdir=outdir,
-            prefix=prefix,
-            pdex_kwargs=pdex_kwargs or {},
-        ),
-        pred=_load_or_build_de(
-            mode="pred",
-            de_path=de_pred,
-            anndata_pair=anndata_pair,
-            num_threads=num_threads,
-            allow_discrete=allow_discrete,
-            outdir=outdir,
-            prefix=prefix,
-            pdex_kwargs=pdex_kwargs or {},
-        ),
-    )
+    return _build_de_comparisons(
+        anndata_pair=anndata_pair,
+        de_pred=de_pred,
+        de_real=de_real,
+        num_threads=num_threads,
+        allow_discrete=allow_discrete,
+        outdir=outdir,
+        prefix=prefix,
+        de_methods=("pdex",),
+        de_kwargs={"pdex": pdex_kwargs or {}},
+    )["pdex"]
 
 
-def _build_pdex_kwargs(
-    reference: str,
-    groupby: str,
-    threads: int,
-    allow_discrete: bool,
-    pdex_kwargs: dict[str, Any] | None = None,
+def _build_de_comparisons(
+    anndata_pair: PerturbationAnndataPair | None = None,
+    de_pred: DEInputByMethod = None,
+    de_real: DEInputByMethod = None,
+    num_threads: int = 1,
+    allow_discrete: bool = False,
+    outdir: str | None = None,
+    prefix: str | None = None,
+    de_methods: tuple[DEMethod, ...] = ("pdex",),
+    de_kwargs: dict[str, Any] | None = None,
+    counts_layer: str | None = None,
+    replicate_col: str | None = None,
 ) -> dict[str, Any]:
-    pdex_kwargs = pdex_kwargs or {}
-    if "reference" not in pdex_kwargs:
-        pdex_kwargs["reference"] = reference
-    if "groupby" not in pdex_kwargs:
-        pdex_kwargs["groupby"] = groupby
-    if "threads" not in pdex_kwargs:
-        pdex_kwargs["threads"] = threads
-    if "is_log1p" not in pdex_kwargs:
-        if allow_discrete:
-            pdex_kwargs["is_log1p"] = False
-        else:
-            pdex_kwargs["is_log1p"] = True
-    return pdex_kwargs
+    comparisons = {}
+    multiple_methods = len(de_methods) > 1
+    for de_method in de_methods:
+        real = _load_or_build_de(
+            mode="real",
+            de_path=de_input_for_method(
+                de_real,
+                de_method,
+                multiple_methods=multiple_methods,
+                label="de_real",
+            ),
+            anndata_pair=anndata_pair,
+            num_threads=num_threads,
+            allow_discrete=allow_discrete,
+            outdir=outdir,
+            prefix=prefix,
+            de_method=de_method,
+            de_kwargs=kwargs_for_de_method(de_kwargs, de_method),
+            counts_layer=counts_layer,
+            replicate_col=replicate_col,
+            include_method_in_filename=multiple_methods or de_method != "pdex",
+        )
+        pred = _load_or_build_de(
+            mode="pred",
+            de_path=de_input_for_method(
+                de_pred,
+                de_method,
+                multiple_methods=multiple_methods,
+                label="de_pred",
+            ),
+            anndata_pair=anndata_pair,
+            num_threads=num_threads,
+            allow_discrete=allow_discrete,
+            outdir=outdir,
+            prefix=prefix,
+            de_method=de_method,
+            de_kwargs=kwargs_for_de_method(de_kwargs, de_method),
+            counts_layer=counts_layer,
+            replicate_col=replicate_col,
+            include_method_in_filename=multiple_methods or de_method != "pdex",
+        )
+        comparisons[de_method] = initialize_de_comparison(real=real, pred=pred)
+    return comparisons
 
 
 def _load_or_build_de(
     mode: Literal["pred", "real"],
-    de_path: pl.DataFrame | str | None = None,
+    de_path: pl.DataFrame | pd.DataFrame | str | None = None,
     anndata_pair: PerturbationAnndataPair | None = None,
     num_threads: int = 1,
     outdir: str | None = None,
     prefix: str | None = None,
     allow_discrete: bool = False,
     pdex_kwargs: dict[str, Any] | None = None,
+    de_method: DEMethod = "pdex",
+    de_kwargs: dict[str, Any] | None = None,
+    counts_layer: str | None = None,
+    replicate_col: str | None = None,
+    include_method_in_filename: bool = False,
 ) -> pl.DataFrame:
-    if de_path is None:
-        if anndata_pair is None:
-            raise ValueError("anndata_pair must be provided if de_path is not provided")
-        logger.info(f"Computing DE for {mode} data")
-        pdex_kwargs = _build_pdex_kwargs(
-            reference=anndata_pair.control_pert,
-            groupby=anndata_pair.pert_col,
-            threads=num_threads,
-            allow_discrete=allow_discrete,
-            pdex_kwargs=pdex_kwargs or {},
-        )
-        logger.info(f"Using the following pdex kwargs: {pdex_kwargs}")
-        frame = pdex(
-            adata=anndata_pair.real if mode == "real" else anndata_pair.pred,
-            mode="ref",
-            **pdex_kwargs,
-        )
-        if outdir is not None:
-            if prefix is not None:
-                prefix = prefix.replace(
-                    "/", "-"
-                )  # some prefixes (e.g. HepG2/C3A) may have slashes in them
-            pathname = f"{mode}_de.csv" if not prefix else f"{prefix}_{mode}_de.csv"
-            logger.info(f"Writing {mode} DE results to: {pathname}")
-            frame.write_csv(os.path.join(outdir, pathname))
+    if pdex_kwargs is not None:
+        if de_kwargs is not None:
+            raise ValueError("Use either pdex_kwargs or de_kwargs, not both")
+        de_kwargs = pdex_kwargs
 
-        return frame  # type: ignore
-    elif isinstance(de_path, str):
-        logger.info(f"Reading {mode} DE results from {de_path}")
-        if pdex_kwargs:
-            logger.warning("pdex_kwargs are ignored when reading from a CSV file")
-        return pl.read_csv(
-            de_path,
-            schema_overrides={
-                "target": pl.Utf8,
-                "feature": pl.Utf8,
-            },
-        )
-    elif isinstance(de_path, pl.DataFrame):
-        if pdex_kwargs:
-            logger.warning("pdex_kwargs are ignored when reading from a CSV file")
-        return de_path
-    elif isinstance(de_path, pd.DataFrame):
-        if pdex_kwargs:
-            logger.warning("pdex_kwargs are ignored when reading from a CSV file")
-        return pl.from_pandas(de_path)
-    else:
-        raise TypeError(f"Unexpected type for de_path: {type(de_path)}")
+    if anndata_pair is None and de_path is None:
+        raise ValueError("anndata_pair must be provided if de_path is not provided")
+
+    adata = None
+    control_pert = ""
+    pert_col = ""
+    if anndata_pair is not None:
+        adata = anndata_pair.real if mode == "real" else anndata_pair.pred
+        control_pert = anndata_pair.control_pert
+        pert_col = anndata_pair.pert_col
+
+    frame = build_de_frame(
+        mode=mode,
+        de_path=de_path,
+        adata=adata,
+        control_pert=control_pert,
+        pert_col=pert_col,
+        num_threads=num_threads,
+        allow_discrete=allow_discrete,
+        de_method=de_method,
+        de_kwargs=de_kwargs or {},
+        counts_layer=counts_layer,
+        replicate_col=replicate_col,
+    )
+    write_de_frame(
+        frame,
+        mode=mode,
+        outdir=outdir if de_path is None else None,
+        prefix=prefix,
+        de_method=de_method,
+        include_method_in_filename=include_method_in_filename,
+    )
+    return frame
+
+
+def _merge_metric_results(left: pl.DataFrame, right: pl.DataFrame) -> pl.DataFrame:
+    if left.is_empty():
+        return right
+    if right.is_empty():
+        return left
+    return left.join(right, on="perturbation", how="full", coalesce=True)
+
+
+def _describe_metric_results(results: pl.DataFrame) -> pl.DataFrame:
+    if results.is_empty():
+        return pl.DataFrame()
+    metric_results = results.drop(
+        [
+            column
+            for column in ["de_method", "perturbation"]
+            if column in results.columns
+        ]
+    )
+    if metric_results.is_empty():
+        return pl.DataFrame()
+    return metric_results.describe()

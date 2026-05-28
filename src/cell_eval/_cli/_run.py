@@ -32,7 +32,7 @@ def parse_args_run(parser: ap.ArgumentParser):
         "--de-pred",
         type=str,
         help="Path to the predicted DE results "
-        f"(computed with pdex from adata-pred if not provided and saved to {DEFAULT_OUTDIR}/pred_de.csv)",
+        f"(computed with the selected DE backend from adata-pred if not provided and saved to {DEFAULT_OUTDIR})",
         required=False,
     )
     parser.add_argument(
@@ -40,7 +40,7 @@ def parse_args_run(parser: ap.ArgumentParser):
         "--de-real",
         type=str,
         help="Path to the real DE results "
-        f"(computed with pdex from adata-real if not provided and saved to {DEFAULT_OUTDIR}/real_de.csv)",
+        f"(computed with the selected DE backend from adata-real if not provided and saved to {DEFAULT_OUTDIR})",
         required=False,
     )
     parser.add_argument(
@@ -90,6 +90,26 @@ def parse_args_run(parser: ap.ArgumentParser):
         default="full",
         help="Profile of metrics to compute [default: %(default)s]",
         choices=KNOWN_PROFILES,
+    )
+    parser.add_argument(
+        "--de-methods",
+        "--de-method",
+        dest="de_methods",
+        type=str,
+        default="pdex",
+        help="Differential-expression backend(s), comma-separated for multiple [default: %(default)s]",
+    )
+    parser.add_argument(
+        "--counts-layer",
+        type=str,
+        default=None,
+        help="AnnData layer containing raw integer counts for the pydeseq2 backend",
+    )
+    parser.add_argument(
+        "--replicate-col",
+        type=str,
+        default=None,
+        help="AnnData obs column used to pseudobulk replicates for the pydeseq2 backend",
     )
     parser.add_argument(
         "--skip-metrics",
@@ -158,6 +178,9 @@ def run_evaluation(args: ap.Namespace):
                 outdir=args.outdir,
                 allow_discrete=args.allow_discrete,
                 prefix=ct,
+                de_methods=args.de_methods,
+                counts_layer=args.counts_layer,
+                replicate_col=args.replicate_col,
                 skip_de=args.profile == "pds",
             )
             evaluator.compute(
@@ -178,6 +201,9 @@ def run_evaluation(args: ap.Namespace):
             num_threads=args.num_threads,
             outdir=args.outdir,
             allow_discrete=args.allow_discrete,
+            de_methods=args.de_methods,
+            counts_layer=args.counts_layer,
+            replicate_col=args.replicate_col,
             skip_de=args.profile == "pds",
         )
         evaluator.compute(

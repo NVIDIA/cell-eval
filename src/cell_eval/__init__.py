@@ -1,4 +1,5 @@
 from ._baseline import build_base_mean_adata
+from ._de_backends import KNOWN_DE_METHODS
 from ._evaluator import MetricsEvaluator
 from ._pipeline import KNOWN_PROFILES, MetricPipeline
 from ._score import score_agg_metrics
@@ -21,6 +22,7 @@ __all__ = [
     "build_base_mean_adata",
     # Scoring
     "score_agg_metrics",
+    "KNOWN_DE_METHODS",
     # Types
     "DEComparison",
     "DEResults",

@@ -61,6 +61,28 @@ cell-eval run \
     --profile full
 ```
 
+By default, differential expression is computed with [`pdex`](https://github.com/arcinstitute/pdex).
+You can also request the optional PyDESeq2 backend, or run both backends in the same evaluation:
+
+```bash
+# Install the optional backend dependency first
+uv pip install "cell-eval[pydeseq2]"
+
+cell-eval run \
+    -ap <your/path/to/pred>.h5ad \
+    -ar <your/path/to/real>.h5ad \
+    --de-methods pdex,pydeseq2 \
+    --counts-layer counts \
+    --replicate-col batch \
+    --profile de
+```
+
+PyDESeq2 requires raw non-negative integer counts and replicate/sample metadata for
+pseudobulk samples. Use `--counts-layer` when `.X` contains normalized/log values.
+If `.X` already contains raw counts, use `--allow-discrete`; note that AnnData metrics
+are designed for normalized/log expression, so `--profile de` is usually the right
+choice for raw-count-only inputs.
+
 To run this as a python module you will need to use the `MetricsEvaluator` class.
 
 ```python
@@ -77,6 +99,22 @@ evaluator = MetricsEvaluator(
     num_threads=64,
 )
 (results, agg_results) = evaluator.compute()
+```
+
+For PyDESeq2 from Python, provide raw counts and replicate metadata:
+
+```python
+evaluator = MetricsEvaluator(
+    adata_pred=adata_pred,
+    adata_real=adata_real,
+    control_pert="control",
+    pert_col="perturbation",
+    num_threads=64,
+    de_methods=["pdex", "pydeseq2"],
+    counts_layer="counts",
+    replicate_col="batch",
+)
+(results, agg_results) = evaluator.compute(profile="de")
 ```
 
 This will give you metric evaluations for each perturbation individually (`results`) and aggregated results over all perturbations (`agg_results`).
