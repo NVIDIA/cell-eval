@@ -1,0 +1,23 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.13
+    hooks:
+      - id: ruff-check
+        args: [--fix, --exit-non-zero-on-fix, --unsafe-fixes]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: ty-check
+        name: ty check
+        entry: uv run ty check
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: pytest
+        name: pytest (optional; set RUN_PYTEST_PRE_PUSH=1)
+        entry: bash -c 'if [ "${RUN_PYTEST_PRE_PUSH:-0}" = "1" ]; then uv run pytest -q; else echo "Skipping pytest; set RUN_PYTEST_PRE_PUSH=1 to run."; fi'
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

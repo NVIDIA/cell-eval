@@ -29,7 +29,7 @@ jobs:
 
   all_jobs:
     runs-on: linux-amd64-cpu8
-    needs: [formatting, typing, pytest, cli-test]
+    needs: [prek, pytest, cli-test]
     steps:
       - name: Complete
         run: echo "Complete"
@@ -51,7 +51,7 @@ jobs:
         run: |
           uv sync --all-extras --dev
 
-  formatting:
+  prek:
     runs-on: linux-amd64-cpu8
 
     needs: [install-job]
@@ -70,32 +70,9 @@ jobs:
         run: |
           uv sync --all-extras --dev
 
-      - name: run formatting
+      - name: run prek
         run: |
-          uv run ruff format --check
-
-  typing:
-    runs-on: linux-amd64-cpu8
-
-    needs: [install-job]
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-          cache-dependency-glob: "pyproject.toml"
-          python-version: "3.12"
-
-      - name: install dependencies
-        run: |
-          uv sync --all-extras --dev
-
-      - name: run type checking
-        run: |
-          uv run ty check
+          uv run prek run --all-files --show-diff-on-failure
 
   pytest:
     runs-on: linux-amd64-cpu8
