@@ -32,7 +32,7 @@ def build_random_anndata(
     normlog: bool = True,
     normtotal: int | float = NORM_TOTAL,
 ) -> ad.AnnData:
-    """Sample a random AnnData object."""
+    """Generate a random AnnData object for testing and tutorials."""
     if random_state is not None:
         np.random.seed(random_state)
 
