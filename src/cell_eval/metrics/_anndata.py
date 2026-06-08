@@ -8,7 +8,6 @@ import numpy as np
 import pandas as pd
 import scanpy as sc
 import sklearn.metrics as skm
-from scipy.sparse import issparse
 from scipy.stats import pearsonr
 from sklearn.metrics import (
     adjusted_mutual_info_score,
@@ -17,6 +16,7 @@ from sklearn.metrics import (
 )
 
 from .._types import PerturbationAnndataPair
+from .._types._anndata import aggregate_group_means
 
 logger = getLogger(__name__)
 
@@ -283,28 +283,14 @@ class ClusteringAgreement:
         control_pert: str,
         embed_key: str | None = None,
     ) -> ad.AnnData:
-        # Isolate the features
-        feats = adata.obsm.get(embed_key, adata.X)  # type: ignore
+        keys, values = aggregate_group_means(
+            adata,
+            category_key,
+            embed_key=embed_key,
+        )
 
-        # Convert to float if not already
-        if feats.dtype != np.dtype("float64"):
-            feats = feats.astype(np.float64)
-
-        # Densify if required
-        if issparse(feats):
-            feats = feats.toarray()
-
-        cats = cast(pd.Series, adata.obs[category_key]).values
-        uniq, inv = np.unique(cats, return_inverse=True)
-        centroids = np.zeros((uniq.size, feats.shape[1]), dtype=feats.dtype)
-
-        for i, cat in enumerate(uniq):
-            mask = cats == cat
-            if np.any(mask):
-                centroids[i] = feats[mask].mean(axis=0)
-
-        adc = ad.AnnData(X=centroids)
-        adc.obs[category_key] = uniq
+        adc = ad.AnnData(X=values.astype(np.float64, copy=False))
+        adc.obs[category_key] = keys
         return adc[adc.obs[category_key] != control_pert]
 
     def __call__(self, data: PerturbationAnndataPair) -> float:
