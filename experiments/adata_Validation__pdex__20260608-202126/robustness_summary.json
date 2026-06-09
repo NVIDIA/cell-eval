@@ -1,0 +1,156 @@
+{
+  "config": {
+    "adata_path": "/home/yangzhang/code/cell-eval/adata_Validation.h5ad",
+    "de_method": "pdex",
+    "pert_col": "target_gene",
+    "control_pert": "non-targeting",
+    "replicate_col": "batch",
+    "sgrna_col": "guide_id",
+    "target_gene_col": "target_gene",
+    "block_cols": [
+      "batch"
+    ],
+    "allow_discrete": false,
+    "normalize_if_raw": true,
+    "counts_layer": null,
+    "fdr_threshold": 0.05,
+    "lfc_threshold": 0.1,
+    "n_permutations": 10,
+    "min_cells_per_group": 20,
+    "seed": 0,
+    "max_conditions": null,
+    "num_threads": 16,
+    "outdir": ".",
+    "tests": [
+      "test_1",
+      "test_2",
+      "test_3",
+      "test_4",
+      "test_5",
+      "test_6"
+    ],
+    "lambda_gc_warn": 1.05,
+    "lambda_gc_fail": 1.1
+  },
+  "global_verdict": "WARN",
+  "power": {
+    "lambda_gc_mean_gates": 0.9016967713815387,
+    "alpha_empirical": 0.05,
+    "alpha_note": "lambda_gc < 1 (deflation) -> alpha_empirical = fdr_threshold (NOT inflated); investigate covariate overcorrection / under-powered null",
+    "phi_median_approx": 0.0010000000474974513,
+    "delta_floor": 0.1264732337909283,
+    "delta_typical": 0.28563045537182175,
+    "delta_ceiling": 1.1269388287788176,
+    "rho_reproducibility": 0.2865950163645664,
+    "delta_effective": 0.15291103550040797,
+    "n_required_typical_80pct": 464.3814958372016,
+    "n_required_effective_80pct": 1620.3403930004022,
+    "n_required_floor_80pct": 2368.572414940266,
+    "note": "pdex is cell-level Wilcoxon (no NB dispersion fit); phi approximated by method-of-moments on control counts. Power is a planning estimate, not DESeq2-derived."
+  },
+  "tests": [
+    {
+      "name": "test_1",
+      "title": "Within-Condition Direct Split Null",
+      "verdict": "WARN",
+      "metrics": {
+        "frac_sig": 2.8624193544954597e-06,
+        "mean_lfc": 0.0017745508068358262,
+        "mean_abs_lfc": 0.19523047652509917,
+        "lambda_gc": 0.7984290521084172,
+        "ks_p_uniform": 3.9574470333362476e-128,
+        "lambda_gc_sd": 0.054310003160526775
+      },
+      "pvalues": {
+        "ks_p_uniform_mean": 3.9574470333362476e-128,
+        "lambda_gc": 0.7984290521084172
+      },
+      "flags": [
+        "\u03bb_GC=0.798 < 0.9 (deflated null \u2014 under-powered)",
+        "ks_p_uniform=3.96e-128 < 0.05 (p-values not Uniform[0,1])",
+        "split-to-split SD(\u03bb_GC)=0.054 > 0.05 (residual confounding?)"
+      ]
+    },
+    {
+      "name": "test_2",
+      "title": "Control-Control Split Null",
+      "verdict": "WARN",
+      "metrics": {
+        "frac_sig": 0.0,
+        "mean_lfc": 0.0009491504834339152,
+        "mean_abs_lfc": 0.10714077880111354,
+        "lambda_gc": 1.0049644906546602,
+        "ks_p_uniform": 2.1610054394678046e-14,
+        "lambda_gc_sd": 0.03174649284163869
+      },
+      "pvalues": {
+        "ks_p_uniform_mean": 2.1610054394678046e-14,
+        "lambda_gc": 1.0049644906546602
+      },
+      "flags": [
+        "ks_p_uniform=2.16e-14 < 0.05 (p-values not Uniform[0,1])"
+      ]
+    },
+    {
+      "name": "test_3",
+      "title": "Label Permutation Null",
+      "verdict": "PASS",
+      "metrics": {
+        "true_signal": 0.14751216814159293,
+        "perm_mean": 0.007086836283185842,
+        "perm_sd": 9.869787552799573e-05,
+        "separation_z": 1422.7796809929848
+      },
+      "pvalues": {
+        "perm_p": 0.0,
+        "separation_z": 1422.7796809929848
+      },
+      "flags": []
+    },
+    {
+      "name": "test_4",
+      "title": "Same-sgRNA Split Reproducibility",
+      "verdict": "PASS",
+      "metrics": {
+        "n_guides": 54,
+        "median_lfc_spearman": 0.2865950163645664,
+        "median_jaccard": 0.2890805780399689,
+        "median_direction": 0.8284725299069562
+      },
+      "pvalues": {},
+      "flags": []
+    },
+    {
+      "name": "test_5",
+      "title": "Same-Gene Independent sgRNA Reproducibility",
+      "verdict": "FAIL",
+      "metrics": {
+        "n_genes": 4,
+        "n_same_pairs": 4,
+        "same_gene_mean_rho": 0.11898355123049015,
+        "background_mean_rho": 0.0458045748388922,
+        "separation_z": 0.5281370181808444
+      },
+      "pvalues": {
+        "separation_z": 0.5281370181808444
+      },
+      "flags": []
+    },
+    {
+      "name": "test_6",
+      "title": "Target Gene Knockdown Recovery",
+      "verdict": "PASS",
+      "metrics": {
+        "n_targets": 50,
+        "recovery_rate": 1.0,
+        "direction_rate": 1.0,
+        "median_pval_rank": 5.5309734513274336e-05,
+        "median_lfc_rank": 0.10763274336283186
+      },
+      "pvalues": {
+        "median_padj_target": 0.0
+      },
+      "flags": []
+    }
+  ]
+}
