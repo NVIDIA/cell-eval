@@ -1,15 +1,15 @@
-# Robustness report — adata_Validation__pdex__20260608-202126
+# Robustness report — adata_Validation__pydeseq2__20260611-182223
 
 ## Global verdict: ❌ **FAIL**
 
 Validity gates (Tests 0–3) must hold before the sensitivity diagnostics (Tests 4–6) are interpretable.
 
-- ⚠️ **test_0** — WARN: null FPR=6.14e-05 clean but FPR→0.5901 at δ=2.0 (compositional coupling — false DE in untouched genes under strong/broad effects)
-- ❌ **test_1** — FAIL [matched]: median split-half LFC ρ=0.1999 (low reproducibility; PASS>0.6/WARN≥0.3/FAIL<0.3); Jaccard=0.4462, direction=0.9655; (2°) difference-is-null λ_GC=0.8018, frac_sig=2.65e-06
-- ⚠️ **test_2** — WARN: p-values not Uniform[0,1] (ks_p_uniform=2.16e-14); frac_sig=0
-- ✅ **test_3** — PASS: true signal 0.1475 vs shuffled 0.0071 (separation z=1422.78, perm_p=0)
+- ✅ **test_0** — PASS: null FPR=0 controlled; resolves δ≥0.5 log2FC
+- ❌ **test_1** — FAIL [matched]: median split-half LFC ρ=0.2163 (low reproducibility; PASS>0.6/WARN≥0.3/FAIL<0.3); Jaccard=0.4539, direction=0.97; (2°) difference-is-null λ_GC=0.3787, frac_sig=1.24e-06
+- ⚠️ **test_2** — WARN: deflated/under-powered null (λ_GC=0.4727<0.9, ks_p_uniform=1.06e-276); no false positives but p-values are not calibrated
+- ✅ **test_3** — PASS: true signal 0.1526 vs shuffled 0.0133 (separation z=245.403, perm_p=0)
 
-> ❌ A validity gate FAILED — **do not interpret the biology** until the pipeline is fixed. Failure mode(s): effect-driven FPR inflation (compositional coupling under strong/broad perturbation); non-uniform null p-values (test_1); non-uniform null p-values (test_2).
+> ❌ A validity gate FAILED — **do not interpret the biology** until the pipeline is fixed. Failure mode(s): non-uniform null p-values (test_1); deflated/under-powered cell-level null (test_2: λ_GC=0.4727).
 
 ## 1. Dataset & experimental context
 
@@ -26,14 +26,14 @@ Validity gates (Tests 0–3) must hold before the sensitivity diagnostics (Tests
 
 ## 2. How DE was computed
 
-- **DE backend**: `pdex`
-- **unit of analysis**: **individual cell (Wilcoxon rank-sum)**
+- **DE backend**: `pydeseq2`
+- **unit of analysis**: **pseudobulk replicate / sample (DESeq2 Wald)**
 - **covariate correction of .X**: **none** (this run evaluates the metric on this state of the data)
-- **input scaling**: normalize_if_raw=True, allow_discrete=False (pdex is_log1p=True)
+- **input scaling**: normalize_if_raw=False, allow_discrete=True (pdex is_log1p=False)
 - **stratification / blocking**: ['batch']
 - **scale**: full (all conditions), n_resamples=10, seed=0
 
-> **Unit-of-analysis caveat.** Each cell is one observation, so cells from the same sample/batch are treated as independent — **pseudoreplication** (Squair et al. 2021, Nat Commun 12:5692 (https://www.nature.com/articles/s41467-021-25960-2)). Expect the null-split tests to be deflated/under-powered and p-values non-uniform even when there are no false positives. For calibrated significance on raw counts, prefer the pseudobulk `pydeseq2` backend; here pdex output is best read as a *ranking*, not calibrated FDR.
+> **Unit-of-analysis caveat.** Counts are aggregated to replicate-level pseudobulk samples before testing, which respects the true unit of replication and avoids pseudoreplication.
 
 > **Correction note.** Many groups regress out batch / cell-cycle before DE. An ideal perturbation metric is insensitive to this, but real ones are not — evaluate on **both corrected and uncorrected** data. This run is **none**; set `covariate_correction` and re-run to compare.
 
@@ -54,20 +54,20 @@ Validity gates (Tests 0–3) must hold before the sensitivity diagnostics (Tests
 
 | test | verdict | what it tells you (local reason) |
 |---|---|---|
-| **test_0** — Effect-Size Injection / Calibration Curve | ⚠️ WARN | WARN: null FPR=6.14e-05 clean but FPR→0.5901 at δ=2.0 (compositional coupling — false DE in untouched genes under strong/broad effects) |
-| **test_1** — Within-Condition Reproducibility | ❌ FAIL | FAIL [matched]: median split-half LFC ρ=0.1999 (low reproducibility; PASS>0.6/WARN≥0.3/FAIL<0.3); Jaccard=0.4462, direction=0.9655; (2°) difference-is-null λ_GC=0.8018, frac_sig=2.65e-06 |
-| **test_2** — Control-Control Split Null | ⚠️ WARN | WARN: p-values not Uniform[0,1] (ks_p_uniform=2.16e-14); frac_sig=0 |
-| **test_3** — Label Permutation Null | ✅ PASS | PASS: true signal 0.1475 vs shuffled 0.0071 (separation z=1422.78, perm_p=0) |
-| **test_4** — Same-sgRNA Split Reproducibility | ❌ FAIL | FAIL: same-sgRNA reproducibility ceiling — median LFC ρ=0.2866 (low), Jaccard=0.2891 (moderate), direction=0.8285 (strong) |
-| **test_5** — Same-Gene Independent sgRNA Reproducibility | ⚠️ WARN | WARN (underpowered, cannot conclude): same-gene ρ=0.119 trends higher than background ρ=0.0458 on only 4 pair(s) |
-| **test_6** — Target Gene Knockdown Recovery | ✅ PASS | PASS: recovery_rate=1, direction_rate=1 over 50 targets (note: also reflects assay/guide quality, not the metric alone) |
+| **test_0** — Effect-Size Injection / Calibration Curve | ✅ PASS | PASS: null FPR=0 controlled; resolves δ≥0.5 log2FC |
+| **test_1** — Within-Condition Reproducibility | ❌ FAIL | FAIL [matched]: median split-half LFC ρ=0.2163 (low reproducibility; PASS>0.6/WARN≥0.3/FAIL<0.3); Jaccard=0.4539, direction=0.97; (2°) difference-is-null λ_GC=0.3787, frac_sig=1.24e-06 |
+| **test_2** — Control-Control Split Null | ⚠️ WARN | WARN: deflated/under-powered null (λ_GC=0.4727<0.9, ks_p_uniform=1.06e-276); no false positives but p-values are not calibrated |
+| **test_3** — Label Permutation Null | ✅ PASS | PASS: true signal 0.1526 vs shuffled 0.0133 (separation z=245.403, perm_p=0) |
+| **test_4** — Same-sgRNA Split Reproducibility | ✅ PASS | PASS: same-sgRNA reproducibility ceiling — median LFC ρ=0.7378 (strong), Jaccard=0.7454 (strong), direction=0.9652 (strong) |
+| **test_5** — Same-Gene Independent sgRNA Reproducibility | ⚠️ WARN | WARN (underpowered, cannot conclude): same-gene ρ=0.569 trends higher than background ρ=0.5123 on only 4 pair(s) |
+| **test_6** — Target Gene Knockdown Recovery | ✅ PASS | PASS: recovery_rate=1, direction_rate=1 over 50 target genes (one DE per perturbation/gene, not per guide; also reflects assay/guide quality, not the metric alone) |
 | **composition** — Composition Control | ⏭️ SKIP | SKIP: no cell-state column to assess composition shift |
 
 _This verdict table is also exported as a **MultiQC** custom-content file (`multiqc/cell_eval_robustness_mqc.txt`) — run `multiqc .` in this folder to render an interactive HTML report that integrates with downstream single-cell pipelines._
 
 ## 4. Per-test detail
 
-### test_0 — Effect-Size Injection / Calibration Curve  ⚠️ WARN
+### test_0 — Effect-Size Injection / Calibration Curve  ✅ PASS
 
 *What this tests.* Spike a known log2 fold-change into a known fraction of genes in a control-vs-control split, then measure how many injected genes we recover (TPR) and how many untouched genes are wrongly called (FPR) across effect sizes. This separates a genuinely calibrated null from a pipeline that simply finds nothing, and tells you the smallest effect the metric can resolve.
 
@@ -75,18 +75,18 @@ _This verdict table is also exported as a **MultiQC** custom-content file (`mult
 
 *Injection design (ground truth).* An **arm** is one side of the two-group split that differential expression compares (term borrowed from clinical trials: a reference arm vs a treatment arm). Here **both arms are control cells** (so they are truly identical) — **arm A** is the reference and **arm B** is the pretend-perturbation that receives the injected effect; DE is run as *B vs A*.
 
-From the **38,176 `non-targeting` control cells**, a random ~6,000 were subsampled and split into the two arms of **~2,988 cells each**, stratified within `['batch']` (the per-arm count is capped at `injection_max_cells_per_arm`=3000 for speed/memory — DE is re-run for every δ tier — and is slightly under the cap because the split halves each batch with integer rounding; raise the cap to use more of the available control cells). **1,782 genes (10% of the 17,841 expressed genes; 18,080 genes total)** were chosen as the *injected* (**anchor**) set, **stratified across the expression (detection) spectrum** — equal shares from the low / mid / high mean-expression tertiles (**594 low · 594 mid · 594 high**) — because detectability is dominated by expression level, so this makes the TPR-vs-δ curve readable *per tier* (the smallest resolvable δ for sparse vs typical vs abundant genes) rather than an artifact of the mix. In arm B their expression was scaled by 2^δ for each effect size **δ ∈ [0.0, 0.25, 0.5, 1.0, 2.0]** (log2 fold-change; δ=0 = untouched null). The other 16,059 expressed genes are the *untouched* set used to measure the false-positive rate. TPR is recovery of the injected/anchor set (reported per expression tier); FPR is false calls among the untouched set (reported per gene class).
+From the **38,176 `non-targeting` control cells**, a random ~6,000 were subsampled and split into the two arms of **~2,988 cells each**, stratified within `['batch']` (the per-arm count is capped at `injection_max_cells_per_arm`=3000 for speed/memory — DE is re-run for every δ tier — and is slightly under the cap because the split halves each batch with integer rounding; raise the cap to use more of the available control cells). **1,782 genes (10% of the 17,841 expressed genes; 18,080 genes total)** were chosen as the *injected* (**anchor**) set, **stratified across the expression (detection) spectrum** — equal shares from the low / mid / high mean-expression tertiles (**594 low · 594 mid · 594 high**) — because detectability is dominated by expression level, so this makes the TPR-vs-δ curve readable *per tier* (the smallest resolvable δ for sparse vs typical vs abundant genes) rather than an artifact of the mix. In arm B their raw counts were multiplied by 2^δ for each effect size **δ ∈ [0.0, 0.25, 0.5, 1.0, 2.0]** (log2 fold-change; δ=0 = untouched null). The other 16,059 expressed genes are the *untouched* set used to measure the false-positive rate. TPR is recovery of the injected/anchor set (reported per expression tier); FPR is false calls among the untouched set (reported per gene class).
 
 *Gene-class FPR breakdown.* The untouched-gene FPR is broken down into gene classes — **AnchorCorr** (genes most correlated with the injected anchors — the easiest/upper-bound case and the one most exposed to compositional coupling), **HighlyExpr** (abundant, high signal), **LowlyExpr** (sparse, zero-dominated, hard), **HouseKeeping** (constitutive — should be predictable; watch for memorization), **Marker** (cell-type identity genes — the biologically interesting case; N/A without a cell-type annotation), **HighlyVarG** (high-variance complement to the anchors), and **Random** (unbiased baseline). All class memberships are computed **deterministically over all control cells** (a fixed function of the h5ad), independent of the DE cell subsample.
 
-**Verdict reason:** WARN: null FPR=6.14e-05 clean but FPR→0.5901 at δ=2.0 (compositional coupling — false DE in untouched genes under strong/broad effects)
+**Verdict reason:** PASS: null FPR=0 controlled; resolves δ≥0.5 log2FC
 
 | metric | value |
 |---|---|
-| `null_FPR` | 6.14e-05 |
-| `max_TPR` | 0.651 |
-| `min_resolvable_delta_log2fc` | 0.25 |
-| `FPR_at_max_delta` | 0.5901 |
+| `null_FPR` | 0 |
+| `max_TPR` | 0.8305 |
+| `min_resolvable_delta_log2fc` | 0.5 |
+| `FPR_at_max_delta` | 0.0081 |
 | `max_delta_log2fc` | 2 |
 | `n_injected_genes` | 1782 |
 | `n_injected_low_expr` | 594 |
@@ -98,29 +98,29 @@ From the **38,176 `non-targeting` control cells**, a random ~6,000 were subsampl
 | `frac_genes_injected` | 0.1 |
 | `control_cells_used` | 6000 |
 | `cells_per_arm` | 2988 |
-| `FPR_AnchorCorr_at_max_delta` | 0.9911 |
-| `FPR_HighlyExpr_at_max_delta` | 1 |
-| `FPR_LowlyExpr_at_max_delta` | 0.0165 |
-| `FPR_HouseKeeping_at_max_delta` | 0.8889 |
+| `FPR_AnchorCorr_at_max_delta` | 0.0095 |
+| `FPR_HighlyExpr_at_max_delta` | 0 |
+| `FPR_LowlyExpr_at_max_delta` | 0 |
+| `FPR_HouseKeeping_at_max_delta` | 0 |
 | `FPR_Marker_at_max_delta` | nan |
-| `FPR_HighlyVarG_at_max_delta` | 0.6473 |
-| `FPR_Random_at_max_delta` | 0.5963 |
-| `TPR_lowexpr_at_max_delta` | 0.0286 |
-| `TPR_midexpr_at_max_delta` | 0.9242 |
+| `FPR_HighlyVarG_at_max_delta` | 0.0122 |
+| `FPR_Random_at_max_delta` | 0.0079 |
+| `TPR_lowexpr_at_max_delta` | 0.4916 |
+| `TPR_midexpr_at_max_delta` | 1 |
 | `TPR_highexpr_at_max_delta` | 1 |
 | `min_resolvable_delta_lowexpr` | nan |
-| `min_resolvable_delta_midexpr` | 0.25 |
+| `min_resolvable_delta_midexpr` | 0.5 |
 | `min_resolvable_delta_highexpr` | 0.25 |
 
 Calibration curve (injected δ in log2FC; δ=0 is the null FPR baseline):
 
 | δ (log2FC) | TPR (injected) | FPR (untouched) | median obs LFC | λ_GC |
 |---|---|---|---|---|
-| 0 | 0 | 6.14e-05 | -6.28e-05 | 0.8811 |
-| 0.25 | 0.5146 | 0.005 | 0.2023 | 2.0135 |
-| 0.5 | 0.5875 | 0.0298 | 0.3939 | 3.7422 |
-| 1 | 0.6324 | 0.4334 | 0.7443 | 10.6193 |
-| 2 | 0.651 | 0.5901 | 1.3351 | 63.191 |
+| 0 | 0 | 0 | -0.000441 | 0.4696 |
+| 0.25 | 0.4714 | 0.0017 | 0.1609 | 0.8398 |
+| 0.5 | 0.5898 | 0.0028 | 0.3655 | 1.2993 |
+| 1 | 0.7828 | 0.0073 | 0.9603 | 1.9874 |
+| 2 | 0.8305 | 0.0081 | 1.9584 | 2.1518 |
 
 _FPR and λ_GC climb steeply as δ grows — the compositional-coupling artifact (false DE in untouched genes from library-size renormalization under strong, widespread injected effects)._
 
@@ -128,11 +128,11 @@ FPR by gene class (false calls among **untouched** genes; anchors = injected):
 
 | δ (log2FC) | AnchorCorr | HighlyExpr | LowlyExpr | HouseKeeping | Marker | HighlyVarG | Random |
 |---|---|---|---|---|---|---|---|
-| 0 | 0.000635 | 0 | 0 | 0 | nan | 0 | 0 |
-| 0.25 | 0.007 | 0.000311 | 0.0028 | 0 | nan | 0.0028 | 0.0049 |
-| 0.5 | 0.0463 | 0.0118 | 0.0081 | 0 | nan | 0.0288 | 0.0287 |
-| 1 | 0.7714 | 0.9698 | 0.0134 | 0.8333 | nan | 0.4592 | 0.436 |
-| 2 | 0.9911 | 1 | 0.0165 | 0.8889 | nan | 0.6473 | 0.5963 |
+| 0 | 0 | 0 | 0 | 0 | nan | 0 | 0 |
+| 0.25 | 0.0032 | 0 | 0 | 0 | nan | 0.0033 | 0.0012 |
+| 0.5 | 0.0044 | 0 | 0 | 0 | nan | 0.0055 | 0.0024 |
+| 1 | 0.0095 | 0 | 0 | 0 | nan | 0.0111 | 0.0061 |
+| 2 | 0.0095 | 0 | 0 | 0 | nan | 0.0122 | 0.0079 |
 
 _Compare classes: AnchorCorr/HighlyExpr/HighlyVarG should inflate first under coupling; LowlyExpr stays low (zero-dominated); Random is the baseline; HouseKeeping flags memorization; Marker is N/A without cell-type labels._
 
@@ -141,16 +141,16 @@ TPR by **injected-gene expression tier** (recovery of the anchors; detection pow
 | δ (log2FC) | high expr | mid expr | low expr |
 |---|---|---|---|
 | 0 | 0 | 0 | 0 |
-| 0.25 | 1 | 0.5438 | 0 |
-| 0.5 | 1 | 0.7559 | 0.0067 |
-| 1 | 1 | 0.8838 | 0.0135 |
-| 2 | 1 | 0.9242 | 0.0286 |
+| 0.25 | 1 | 0.4141 | 0 |
+| 0.5 | 1 | 0.7694 | 0 |
+| 1 | 1 | 1 | 0.3485 |
+| 2 | 1 | 1 | 0.4916 |
 
-_min resolvable δ (TPR≥0.5): high-expr=0.25, mid=0.25, low=nan. Abundant genes are easiest to recover; sparse (low-expr) genes are the conservative floor — the real limit on what the metric can resolve._
+_min resolvable δ (TPR≥0.5): high-expr=0.25, mid=0.5, low=nan. Abundant genes are easiest to recover; sparse (low-expr) genes are the conservative floor — the real limit on what the metric can resolve._
 
-**Verification p-values:** `null_FPR`=6.14e-05
+**Verification p-values:** `null_FPR`=0
 
-- ⚠️ FPR rises to 0.5901 at δ=2.0 (vs null 6.14e-05) — strong perturbations induce false DE in UNTOUCHED genes via library-size renormalization (compositional coupling). This is a worst-case stress (δ=2.0 log2FC injected into 0.1 of genes); the effect scales with the fraction × magnitude of truly perturbed genes, so broad/strong perturbations risk contaminating the REAL analysis with false hits. Test 6 shows strong real knockdowns are present here, so this is a live risk: prefer median-of-ratios / pseudobulk DESeq2 (or spike-in normalization) before interpreting non-target hits.
+- ⚠️ null FPR=0 ≤ α — conservative (no false positives)
 
 ![test_0](plots/test_0_injection.png)
 
@@ -162,29 +162,29 @@ _Full per-gene/per-split numbers: `tables/test_0__*.csv`_
 
 **Tiers** (per metric, strong/moderate/low) — LFC Spearman ρ (verdict driver): > 0.6 PASS · 0.3–0.6 WARN · < 0.3 FAIL. DEG Jaccard: > 0.3 · 0.1–0.3 · < 0.1. Direction agreement: > 0.7 · 0.6–0.7 · ≈ 0.5. Low ρ = the two half-signatures disagree → ceiling for downstream metrics. (Secondary difference-is-null should be ≈null: λ_GC≈1, p uniform.)
 
-**Verdict reason:** FAIL [matched]: median split-half LFC ρ=0.1999 (low reproducibility; PASS>0.6/WARN≥0.3/FAIL<0.3); Jaccard=0.4462, direction=0.9655; (2°) difference-is-null λ_GC=0.8018, frac_sig=2.65e-06
+**Verdict reason:** FAIL [matched]: median split-half LFC ρ=0.2163 (low reproducibility; PASS>0.6/WARN≥0.3/FAIL<0.3); Jaccard=0.4539, direction=0.97; (2°) difference-is-null λ_GC=0.3787, frac_sig=1.24e-06
 
 **What this compares.** Split each perturbation's cells into two halves A and B and run each half against control (`DE_A`, `DE_B`). The **primary** question is *reproducibility* — do the two independent half-signatures agree (`DE_A ≈ DE_B`)? — under two control-assignment scenarios: **no_match** (1.a — controls split into two halves, cell-eval pdex, no 1:1 matching) vs **matched** (2.a — perturbed cells 1:1 batch-matched to controls, then split into perturb–control pairs). The comparison answers: *does 1:1 batch matching improve reproducibility?* A **secondary** difference-is-null stat (direct `A_pert vs B_pert`, the same perturbation ⇒ should be ≈null) is reported as a sanity check.
 
 | statistic | no_match | matched |
 |---|---|---|
-| **reproducibility** — median Spearman LFC ρ (PRIMARY) | 0.2963 (low) | 0.1999 (low) |
-| reproducibility — median DEG Jaccard | 0.2949 (moderate) | 0.4462 (strong) |
-| reproducibility — median direction agreement | 0.8627 (strong) | 0.9655 (strong) |
-| # perturbations strong (ρ>0.6) | 36 | 29 |
-| # moderate (0.3–0.6) | 37 | 25 |
-| # low (<0.3) | 77 | 96 |
-| (2°) difference-is-null λ_GC | 0.8006 | 0.8018 |
-| (2°) difference-is-null frac_sig | 2.6e-06 | 2.65e-06 |
-| (2°) difference-is-null ks_p_uniform | 4.22e-127 | 8.61e-128 |
+| **reproducibility** — median Spearman LFC ρ (PRIMARY) | 0.7168 (strong) | 0.2163 (low) |
+| reproducibility — median DEG Jaccard | 0.6477 (strong) | 0.4539 (strong) |
+| reproducibility — median direction agreement | 0.957 (strong) | 0.97 (strong) |
+| # perturbations strong (ρ>0.6) | 70 | 24 |
+| # moderate (0.3–0.6) | 30 | 14 |
+| # low (<0.3) | 0 | 62 |
+| (2°) difference-is-null λ_GC | 0.3783 | 0.3787 |
+| (2°) difference-is-null frac_sig | 0 | 1.24e-06 |
+| (2°) difference-is-null ks_p_uniform | 0 | 0 |
 | # perturbations tested | 50 | 50 |
 
 _Tiers (strong/moderate/low) per metric: LFC ρ (verdict driver): >0.6 strong/PASS, 0.3–0.6 moderate/WARN, <0.3 low/FAIL. DEG Jaccard: >0.3 strong, 0.1–0.3 moderate, <0.1 low. Direction agreement: >0.7 strong, 0.6–0.7 moderate, ≈0.5 low. Low = the two half-signatures disagree, so downstream metrics cannot be trusted above this ceiling. The matched (batch-controlled) scenario's LFC ρ drives the verdict. difference-is-null: A and B are the same perturbation, so a calibrated pipeline calls ≈α (λ_GC≈1, p uniform)._
 
-- ⚠️ median split-half LFC ρ — matched (batch-controlled)=0.1999 vs no-match=0.2963 (Δ=-0.0964)
-- ⚠️ per-perturbation reproducibility tiers (matched): 29 strong / 25 moderate / 96 low (of 50)
+- ⚠️ median split-half LFC ρ — matched (batch-controlled)=0.2163 vs no-match=0.7168 (Δ=-0.5004)
+- ⚠️ per-perturbation reproducibility tiers (matched): 24 strong / 14 moderate / 62 low (of 50)
 - ⚠️ thresholds — LFC ρ (verdict driver): >0.6 strong/PASS, 0.3–0.6 moderate/WARN, <0.3 low/FAIL. DEG Jaccard: >0.3 strong, 0.1–0.3 moderate, <0.1 low. Direction agreement: >0.7 strong, 0.6–0.7 moderate, ≈0.5 low. Low = the two half-signatures disagree, so downstream metrics cannot be trusted above this ceiling.
-- ⚠️ secondary difference-is-null (A_pert vs B_pert, same perturbation ⇒ should be ≈null): λ_GC=0.8018, frac_sig=2.65e-06, ks_p_uniform=8.61e-128
+- ⚠️ secondary difference-is-null (A_pert vs B_pert, same perturbation ⇒ should be ≈null): λ_GC=0.3787, frac_sig=1.24e-06, ks_p_uniform=0
 
 ![test_1](plots/test_1_reproducibility.png)
 
@@ -196,20 +196,21 @@ _Full per-gene/per-split numbers: `tables/test_1__*.csv`_
 
 **Tiers** — λ_GC: ≈ 1 calibrated · 1.05–1.10 or < 0.9 WARN · > 1.10 FAIL (anti-conservative). frac_sig: ≈ α good · ≫ α FAIL. ks_p_uniform: > 0.05 good · < 0.05 WARN (p-values not Uniform[0,1]). Arms are a stratified control-control split (true null).
 
-**Verdict reason:** WARN: p-values not Uniform[0,1] (ks_p_uniform=2.16e-14); frac_sig=0
+**Verdict reason:** WARN: deflated/under-powered null (λ_GC=0.4727<0.9, ks_p_uniform=1.06e-276); no false positives but p-values are not calibrated
 
 | metric | value |
 |---|---|
 | `frac_sig` | 0 |
-| `mean_lfc` | 0.000949 |
-| `mean_abs_lfc` | 0.1071 |
-| `lambda_gc` | 1.005 |
-| `ks_p_uniform` | 2.16e-14 |
-| `lambda_gc_sd` | 0.0317 |
+| `mean_lfc` | 0.000218 |
+| `mean_abs_lfc` | 0.0528 |
+| `lambda_gc` | 0.4727 |
+| `ks_p_uniform` | 1.06e-276 |
+| `lambda_gc_sd` | 0.0204 |
 
-**Verification p-values:** `ks_p_uniform_mean`=2.16e-14, `lambda_gc`=1.005
+**Verification p-values:** `ks_p_uniform_mean`=1.06e-276, `lambda_gc`=0.4727
 
-- ⚠️ ks_p_uniform=2.16e-14 < 0.05 (p-values not Uniform[0,1])
+- ⚠️ λ_GC=0.4727 < 0.9 (deflated null — under-powered)
+- ⚠️ ks_p_uniform=1.06e-276 < 0.05 (p-values not Uniform[0,1])
 
 ![test_2](plots/test_2_qq.png)
 
@@ -221,36 +222,35 @@ _Full per-gene/per-split numbers: `tables/test_2__*.csv`_
 
 **Tiers** — separation z (true signal vs permuted null): > 2 PASS · 1–2 WARN · ≤ 1 FAIL (metric cannot tell signal from noise).
 
-**Verdict reason:** PASS: true signal 0.1475 vs shuffled 0.0071 (separation z=1422.78, perm_p=0)
+**Verdict reason:** PASS: true signal 0.1526 vs shuffled 0.0133 (separation z=245.403, perm_p=0)
 
 | metric | value |
 |---|---|
-| `true_signal` | 0.1475 |
-| `perm_mean` | 0.0071 |
-| `perm_sd` | 9.87e-05 |
-| `separation_z` | 1422.78 |
+| `true_signal` | 0.1526 |
+| `perm_mean` | 0.0133 |
+| `perm_sd` | 0.000568 |
+| `separation_z` | 245.403 |
 
-**Verification p-values:** `perm_p`=0, `separation_z`=1422.78
+**Verification p-values:** `perm_p`=0, `separation_z`=245.403
 
 _Full per-gene/per-split numbers: `tables/test_3__*.csv`_
 
-### test_4 — Same-sgRNA Split Reproducibility  ❌ FAIL
+### test_4 — Same-sgRNA Split Reproducibility  ✅ PASS
 
 *What this tests.* Split each guide's cells in two and compare each half vs control. Agreement between the halves is the reproducibility ceiling — no model can score higher on a perturbation than the data agrees with itself.
 
 **Tiers** (same as Test 1) — LFC Spearman ρ: > 0.6 strong/PASS · 0.3–0.6 moderate/WARN · < 0.3 low/FAIL. DEG Jaccard: > 0.3 · 0.1–0.3 · < 0.1. Direction: > 0.7 · 0.6–0.7 · ≈ 0.5. This is the empirical reproducibility ceiling for downstream metrics.
 
-**Verdict reason:** FAIL: same-sgRNA reproducibility ceiling — median LFC ρ=0.2866 (low), Jaccard=0.2891 (moderate), direction=0.8285 (strong)
+**Verdict reason:** PASS: same-sgRNA reproducibility ceiling — median LFC ρ=0.7378 (strong), Jaccard=0.7454 (strong), direction=0.9652 (strong)
 
 | metric | value |
 |---|---|
 | `n_guides` | 54 |
-| `median_lfc_spearman` | 0.2866 |
-| `median_jaccard` | 0.2891 |
-| `median_direction` | 0.8285 |
+| `median_lfc_spearman` | 0.7378 |
+| `median_jaccard` | 0.7454 |
+| `median_direction` | 0.9652 |
 
 - ⚠️ tiers — LFC ρ (verdict driver): >0.6 strong/PASS, 0.3–0.6 moderate/WARN, <0.3 low/FAIL. DEG Jaccard: >0.3 strong, 0.1–0.3 moderate, <0.1 low. Direction agreement: >0.7 strong, 0.6–0.7 moderate, ≈0.5 low. Low = the two half-signatures disagree, so downstream metrics cannot be trusted above this ceiling.
-- ⚠️ LOW REPRODUCIBILITY (median LFC ρ=0.2866 < 0.3) — empirical ceiling is low; downstream cross-model/condition metrics are bounded by this.
 
 _Full per-gene/per-split numbers: `tables/test_4__*.csv`_
 
@@ -260,19 +260,19 @@ _Full per-gene/per-split numbers: `tables/test_4__*.csv`_
 
 **Tiers** — separation (same-gene vs background guide agreement): > 1.5 PASS · 1.0–1.5 WARN · < 1.0 FAIL. With < ~5 guide pairs the result is power-limited ⇒ WARN (cannot conclude), never FAIL.
 
-**Verdict reason:** WARN (underpowered, cannot conclude): same-gene ρ=0.119 trends higher than background ρ=0.0458 on only 4 pair(s)
+**Verdict reason:** WARN (underpowered, cannot conclude): same-gene ρ=0.569 trends higher than background ρ=0.5123 on only 4 pair(s)
 
 | metric | value |
 |---|---|
 | `n_genes` | 4 |
 | `n_same_pairs` | 4 |
-| `same_gene_mean_rho` | 0.119 |
-| `background_mean_rho` | 0.0458 |
-| `separation_z` | 0.5281 |
+| `same_gene_mean_rho` | 0.569 |
+| `background_mean_rho` | 0.5123 |
+| `separation_z` | 0.5328 |
 
-**Verification p-values:** `separation_z`=0.5281
+**Verification p-values:** `separation_z`=0.5328
 
-- ⚠️ UNINFORMATIVE / power-limited: only 4 gene(s) with ≥2 guides (4 same-gene pair(s)). Separation z=0.5281 carries essentially no statistical weight, so this is NOT evidence that guides are off-target or inefficacious. Same-gene guides also genuinely differ in knockdown efficacy, so only modest concordance is expected even with more pairs.
+- ⚠️ UNINFORMATIVE / power-limited: only 4 gene(s) with ≥2 guides (4 same-gene pair(s)). Separation z=0.5328 carries essentially no statistical weight, so this is NOT evidence that guides are off-target or inefficacious. Same-gene guides also genuinely differ in knockdown efficacy, so only modest concordance is expected even with more pairs.
 
 _Full per-gene/per-split numbers: `tables/test_5__*.csv`_
 
@@ -282,15 +282,15 @@ _Full per-gene/per-split numbers: `tables/test_5__*.csv`_
 
 **Tiers** — recovery_rate (targets detected as DE): > 0.5 PASS · 0.2–0.5 WARN · < 0.2 FAIL. direction_rate (knocked down in expected direction): > 0.8 PASS · 0.6–0.8 WARN · < 0.6 FAIL. (Also reflects assay/guide quality, not the metric alone.)
 
-**Verdict reason:** PASS: recovery_rate=1, direction_rate=1 over 50 targets (note: also reflects assay/guide quality, not the metric alone)
+**Verdict reason:** PASS: recovery_rate=1, direction_rate=1 over 50 target genes (one DE per perturbation/gene, not per guide; also reflects assay/guide quality, not the metric alone)
 
 | metric | value |
 |---|---|
 | `n_targets` | 50 |
 | `recovery_rate` | 1 |
 | `direction_rate` | 1 |
-| `median_pval_rank` | 5.53e-05 |
-| `median_lfc_rank` | 0.1076 |
+| `median_pval_rank` | 8.3e-05 |
+| `median_lfc_rank` | 0.1046 |
 
 **Verification p-values:** `median_padj_target`=0
 
@@ -312,7 +312,7 @@ _Full per-gene/per-split numbers: `tables/composition__*.csv`_
 
 | parameter | value | source |
 |---|---|---|
-| de_method / unit | pdex / individual cell (Wilcoxon rank-sum) | config |
+| de_method / unit | pydeseq2 / pseudobulk replicate / sample (DESeq2 Wald) | config |
 | covariate_correction | none | config |
 | fdr_threshold | 0.05 | config |
 | lfc_threshold | 0.1 | config |
