@@ -1,6 +1,44 @@
 # Cell Metrics Robustness & Stability Test Plan
 
-> **Purpose.** Validate that a cell-metrics evaluation pipeline produces calibrated, unbiased results before interpreting biological findings. Tests 1–3 are **validity gates** — all must pass before proceeding. Tests 4–6 are **sensitivity diagnostics** — they characterise how much signal the data contains and set empirical ceilings for downstream metrics.
+> **Purpose.** Validate that a cell-metrics evaluation pipeline produces calibrated, unbiased results before interpreting biological findings. Tests **0–3** are **validity gates** — all must pass before proceeding. Tests **4–6** plus the **composition** diagnostic are **sensitivity diagnostics** — they characterise how much signal the data contains and set empirical ceilings for downstream metrics.
+
+---
+
+## ⚠️ Read first: unit of analysis & DE method (the single most important framing)
+
+**The null-split tests (0, 1, 2, 4) split *cells* and run DE directly. Whether the null looks null depends entirely on the DE method's *unit of analysis*.**
+
+- **Cell-level tests** (e.g. `pdex` = Wilcoxon rank-sum, or a t-test) treat every cell as an independent observation. Cells from the same sample/animal/batch are correlated, so this **pseudoreplication** inflates the effective *n* and intra-sample correlation alone produces "significant" genes under a true null. See **Squair et al. 2021, *Nat Commun* 12:5692** (https://www.nature.com/articles/s41467-021-25960-2). For such tests, expect the null-split p-values to be **mis-shaped** (deflated *or* inflated, λ_GC ≠ 1, non-uniform) even with zero real effect — and read the output as a **gene ranking, not a calibrated FDR**.
+- **Pseudobulk / mixed-model tests** (e.g. DESeq2/edgeR/limma on replicate-level pseudobulk, or a GLMM) aggregate to the true unit of replication first. Only under these does the expected null behaviour (λ_GC ≈ 1, Uniform p-values, `frac_sig ≈ α`) actually hold.
+
+> **The report MUST state the DE method and unit of analysis up front** and interpret every null in that light. The null-split tests **must use the same DE method as the intended real analysis** — they calibrate *that* pipeline, not DE in the abstract.
+
+### Corrected vs uncorrected data
+
+It is common to regress out **batch** and **cell-cycle** (and sometimes other covariates) before DE. An ideal perturbation metric would be insensitive to this; real metrics are not. **Evaluate the metric on both corrected and uncorrected data** for the major covariates and report which state each run used. State explicitly what (if anything) was regressed out of `.X`.
+
+### Composition confounder
+
+A perturbation that changes **proliferation or differentiation** shifts cell-type/state proportions. Cross-population DE then reads that composition change as expression change. When a cell-type / cluster / cell-cycle annotation exists, run the **Composition diagnostic** (below); when it does not, say so and flag that strong hits may be composition-driven.
+
+### Scope & validation
+
+- This battery calibrates DE-based metrics. It deliberately **excludes gene-set / pathway enrichment** as a gate: enrichment is an unsolved problem (databases disagree; many real effects only appear under multi-gene perturbation), so it is too noisy to act as a pass/fail. It may be reported as informational only.
+- Metric behaviour is partly experiment-dependent. **Validate across ≥2 datasets / modalities** (e.g. a CRISPRi Perturb-seq screen *and* a chemical/Tahoe-style screen) before trusting thresholds.
+
+---
+
+## Report & presentation conventions (the deliverable must be readable)
+
+The generated report is the deliverable; a domain expert must be able to make sense of it without reverse-engineering the code. Required:
+
+1. **Lead with dataset & experimental context** — what experiment, #cells/#genes, #perturbations, #samples/replicates/batches, cells-per-perturbation, guides-per-gene, and **which covariates are present vs absent** (cell type, cell cycle, donor/patient, sex, tissue, timepoint). Do not make the reader guess. State the **DE method, unit of analysis, and corrected/uncorrected state** in this opening section.
+2. **Plain-language per test** — one to three sentences on *what the test asks and how to read it*, alongside the numbers.
+3. **Local verdict reasons** — each test states its own one-line PASS/WARN/FAIL reason next to its result; do not make the reader hunt in a global flag list.
+4. **Round numbers** — 4–6 significant figures (`0.1952`, not `0.19523047652509917`).
+5. **Glossary** — define λ_GC, ks_p_uniform, frac_sig, separation z, TPR/FPR, reproducibility ρ, "unit of analysis".
+6. **Don't bury context at the bottom** — verdict + context + per-test detail first; heavy appendices (full test plan, parameter dumps) last.
+7. **Interactive-friendly output** — optionally emit **MultiQC** custom-content files (https://github.com/MultiQC/MultiQC) so the results render as an interactive HTML report that integrates with downstream single-cell pipelines. (Ideal future state: hover tooltips explaining λ_GC etc.)
 
 ---
 
@@ -28,7 +66,7 @@
 
 | Parameter | Default | Description |
 |---|---|---|
-| `n_permutations` | `10` | Resampling iterations for Tests 2 and 3 |
+| `n_resamples` | `10` | Resampling iterations for Tests 2 and 3 |
 | `min_cells_per_group` | `20` | Minimum cells per split arm; skip condition if not met |
 | `fdr_threshold` | `0.05` | BH-adjusted p-value cutoff for significance calls |
 | `lfc_threshold` | `0.1` | Minimum \|LFC\| for a gene to be called significant |
@@ -148,46 +186,96 @@ This ensures the split coefficient is tested cleanly. Omitting covariates can pr
 
 ---
 
-## Test 1 — Within-Condition Direct Split Null
+## Test 0 — Controlled Effect-Size Injection / Calibration Curve
+
+> **In one sentence.** Spike a known log2 fold-change into a known fraction of genes in a control-vs-control split, then measure how many injected genes are recovered (TPR) and how many untouched genes are wrongly called (FPR) across effect sizes — separating "null = null" from "pipeline is dead" and quantifying the smallest effect the metric can resolve.
 
 ### Question
 
-If cells from the same condition are split into two balanced groups, does the pipeline detect little to no difference between them?
+When a real effect of known size is present, does the pipeline detect it (and only it)? And under no effect, is the false-positive rate controlled? A null that produces nothing is indistinguishable from a broken pipeline unless you also show it *can* detect a planted signal.
 
 ### Design
 
-For each perturbation condition with ≥ `2 × min_cells_per_group` cells:
+On control cells only (so the only DE is what we inject):
 
-1. Perform `n_permutations` independent stratified splits of the condition's cells into arms A and B, stratified by all available covariates in `batch_cols` plus `cell_cycle_col`.
-2. For each split, run DE: A vs B, with covariates in the design formula.
-3. Compute shared metrics per split: `frac_sig`, `mean_lfc`, `mean_abs_lfc`, `ks_p_uniform`, `λ_GC`, QQ-plot envelope.
-4. Aggregate metrics as mean ± SD across splits within each condition, then across all conditions.
+1. Stratified-split control cells into reference arm A and pseudo-perturbation arm B (as in Test 2). Cap cells/arm for speed if needed.
+2. Pick the injected gene set (the **anchors**), a fraction `injection_frac_genes` (e.g. 10%) of expressed genes, **stratified across the expression (detection) spectrum** — equal shares from the **low / mid / high mean-expression tertiles**. Detectability is dominated by expression level, so injecting evenly across tiers makes the TPR-vs-δ curve interpretable **per tier** (the smallest resolvable δ for sparse vs typical vs abundant genes) instead of an artifact of the injected mix. Do NOT inject only housekeeping/marker/anchor-correlated genes (biased, circular), or only HEG (optimistic) / only LEG (pessimistic).
+3. For each effect size `δ` in `injection_deltas` (log2 fold-change tiers; **include `δ = 0` as the FPR-at-null baseline**), multiply the **raw counts** of the anchor genes in arm B by `2^δ`, then normalize (`normalize_total` + `log1p`) and run the **same DE method** as the real analysis, B vs A.
+4. Record, per `δ`: **TPR** = fraction of injected/anchor genes called significant; **FPR** = fraction of *untouched* genes called significant; the median observed LFC of anchors; and λ_GC.
+5. **Break the injected-gene TPR down by EXPRESSION TIER** (low/mid/high) — report the min resolvable δ (TPR≥0.5) per tier — and **break the untouched-gene FPR down by gene class**: **AnchorCorr** (genes most correlated with the anchor signature — easiest/upper-bound, most exposed to coupling), **HighlyExpr** (abundant — high signal), **LowlyExpr** (sparse — hard, zero-dominated), **HouseKeeping** (constitutive — should be predictable; watch memorization), **Marker** (cell-type identity — N/A without a cell-type annotation), **HighlyVarG** (high-variance complement to the anchors), **Random** (unbiased baseline). All expression tiers and gene-class memberships must be computed **deterministically over all control cells** — a fixed function of the h5ad, independent of the DE cell subsample.
 
-> **Why `n_permutations` here:** a single split can be unlucky — one draw may by chance separate a latent covariate. Averaging over multiple independent stratified splits gives a stable estimate of null behaviour and exposes split-to-split variance that would indicate residual confounding.
+> **Determinism.** Anchor selection, gene-class assignment, and the cell subsample are all seeded; given the same h5ad + seed the calibration curve (and every per-class FPR) is bit-for-bit reproducible.
 
-### Test Statistic
+### Reported metrics
 
-Wald statistic `W = β̂ / SE(β̂)` from the negative binomial model, where `β̂` is the A-vs-B LFC. Under H₀, `W ~ N(0,1)` and p-values are Uniform[0,1]. Report the mean W distribution pooled across all splits and conditions.
-
-### Expected Behaviour
-
-| Metric | Expected |
+| Metric | Meaning |
 |---|---|
-| `frac_sig` | ≤ `fdr_threshold` (≈ 5%) |
-| `mean_lfc` | ≈ 0.0 |
-| `mean_abs_lfc` | Near zero; low relative to real analysis |
-| `ks_p_uniform` | > 0.05 (fail to reject uniformity) |
-| `λ_GC` | ≈ 1.00 |
-| Split-to-split SD of `λ_GC` | Low (< 0.05); high SD indicates residual confounding |
-| QQ-plot | Points hug y = x diagonal within envelope; stable across splits |
+| `null_FPR` | FPR at `δ = 0` — the empirical false-positive rate under a true null. Should be ≈ `fdr_threshold`. |
+| `max_TPR` | Highest TPR across the injected tiers — can the metric resolve a strong effect at all? |
+| `min_resolvable_delta` | Smallest `δ` reaching TPR ≥ 0.5 — the effect size the metric can actually detect. |
+| `FPR_at_max_delta` | FPR among untouched genes at the largest `δ`. If this rises far above `null_FPR`, strong perturbation of a few genes is inducing **false DE in untouched genes via library-size renormalization** — a **compositional coupling** artifact (related to the composition confounder; mitigate with median-of-ratios / spike-in normalization or pseudobulk). |
+
+**The report MUST show the full per-`δ` calibration curve inline** — one row per `δ` (including
+`δ=0`) with `TPR` (injected genes), `FPR` (untouched genes), median observed LFC, and `λ_GC` — and
+write it to `tables/test_0__calibration_curve.csv`. The per-tier ramp (e.g. FPR/λ_GC rising sharply
+with `δ`) is the headline evidence and must not be hidden behind summary scalars or a plot alone.
 
 ### Verdict Rules
 
 | Condition | Verdict |
 |---|---|
-| All metrics within expected range | **PASS** |
-| λ_GC ∈ (1.05, 1.10] OR `frac_sig` modestly elevated | **WARN** |
-| λ_GC > 1.10 OR `frac_sig` >> `fdr_threshold` OR QQ grossly inflated | **FAIL** |
+| `null_FPR` controlled (≤ ~2×`fdr_threshold`) and TPR rises with δ to ≥ 0.5 | **PASS** |
+| `null_FPR` clean but `FPR_at_max_delta` ≫ `null_FPR` (compositional coupling), or `max_TPR < 0.5` (under-powered) | **WARN** |
+| `null_FPR` > 2×`fdr_threshold` (anti-conservative) | **FAIL** |
+
+---
+
+## Test 1 — Within-Condition Reproducibility
+
+> **In one sentence.** Split each perturbation's cells into two halves and compare each half to control (`DE_A`, `DE_B`) — both carry the *real* perturbation signal (NOT a uniform null; that's Test 2) — and measure whether the two independent half-signatures **agree** (`DE_A ≈ `DE_B`); high split-half LFC correlation = a reproducible signature and the empirical ceiling for downstream metrics.
+
+### Question
+
+When a perturbation's cells are split in half and each half is profiled against control, do the two halves recover the **same** differential-expression signature? And does **1:1 batch-matched** control assignment improve that reproducibility over a plain split?
+
+### Design
+
+For each perturbation with ≥ `2 × min_cells_per_group` cells, in **two scenarios**:
+
+- **Scenario 1.a — no_match (baseline, no batch control):** split the perturbed cells into A and B (stratified by `batch_cols`); split the **control** cells into two halves `ctrl_A`, `ctrl_B` (each = half of all controls); compute `DE_A = A vs ctrl_A` and `DE_B = B vs ctrl_B` with cell-eval's DE (**no 1:1 matching**).
+- **Scenario 2.a — matched (batch-controlled):** **1:1-match** the perturbed cells to control cells *within batch* on QC features (`total_counts`, `n_genes_by_counts`) using `scmetrics` (inline fallback); split the matched **perturb–control pairs** into A and B (stratified by batch); compute `DE_A = A_pert vs A_matched_ctrl` and `DE_B = B_pert vs B_matched_ctrl` (Wilcoxon).
+
+Two statistics per scenario:
+1. **(PRIMARY) reproducibility** — agreement of `DE_A` and `DE_B`: **median split-half Spearman LFC ρ** (+ DEG Jaccard, direction agreement), over perturbations.
+2. **(secondary) difference-is-null** — the direct `A_pert vs B_pert` contrast (same perturbation ⇒ should be ≈null): `frac_sig` / `λ_GC` / `ks_p_uniform`, as a sanity check.
+
+Average over `test1_n_resamples` seeded splits; report both scenarios side by side (does matching raise reproducibility?).
+
+### Test Statistic
+
+`ρ = Spearman(LFC_A, LFC_B)` over genes, per perturbation; the test reports the **median ρ across perturbations**. (The secondary difference-is-null uses the same null statistics as Test 2 on the `A_pert`-vs-`B_pert` contrast.)
+
+### Expected Behaviour
+
+| Perturbation strength | median split-half LFC ρ | direction agreement |
+|---|---|---|
+| Strong / reproducible | > 0.6 | > 0.8 |
+| Moderate | 0.3–0.6 | 0.6–0.8 |
+| Low / non-reproducible | < 0.3 | ≈ 0.5 |
+
+The matched scenario should reach ρ ≥ the no_match scenario (batch/depth matching removes a nuisance source of disagreement). The secondary difference-is-null should be ≈null (λ_GC≈1, p uniform) by construction.
+
+### Verdict Rules
+
+Applied to the **median split-half Spearman LFC ρ** of the **matched** scenario (verdict driver); both scenarios reported.
+
+| Condition | Verdict |
+|---|---|
+| median ρ > 0.6 | **PASS** — strong, reproducible signatures |
+| median ρ ∈ [0.3, 0.6] | **WARN** — moderate reproducibility (downstream metrics bounded by this) |
+| median ρ < 0.3 | **FAIL** — low; the two half-signatures disagree, so the data cannot support reliable downstream comparisons |
+
+Report the result, the thresholds, and the per-perturbation tier counts (how many strong / moderate / low) so the ceiling is explicit.
 
 ### Failure Diagnostics
 
@@ -202,6 +290,8 @@ Wald statistic `W = β̂ / SE(β̂)` from the negative binomial model, where `β
 
 ## Test 2 — Control-Control Split Null
 
+> **In one sentence.** Same as Test 1 but splitting only control cells, so any detected signal is pure noise/batch — this confirms the null and that downstream cell-metrics collapse to chance; uncorrected batch structure leaks in here.
+
 ### Question
 
 Do metrics remain near null when pseudo-perturbations are created by splitting control cells?
@@ -209,7 +299,7 @@ Do metrics remain near null when pseudo-perturbations are created by splitting c
 ### Design
 
 1. Take all cells where `perturbation_col == control_label`.
-2. Perform `n_permutations` independent stratified splits into groups A and B.
+2. Perform `n_resamples` independent **stratified** splits into groups A and B (random A/B balanced within `batch_cols`). No 1:1 control-to-control matching mode: both arms are the *same* population (controls), so a stratified split already balances batch/depth and matching controls-to-controls is uninformative. (The batch-controlled 1:1-matched design belongs to **Test 1**, where two *different* populations — perturbed vs control — are compared.)
 3. In each split, treat group A as a pseudo-perturbation and group B as the reference.
 4. Run the full cell-metrics workflow for each split.
 5. Aggregate metrics: mean ± SD across splits.
@@ -240,6 +330,8 @@ Same thresholds as Test 1, applied to the mean over splits. Additionally: if cel
 
 ## Test 3 — Label Permutation Null
 
+> **In one sentence.** Shuffle the perturbation labels (within batch) and recompute; real biological signal should sit far outside the shuffled distribution (high separation z), otherwise the metric cannot tell signal from noise.
+
 ### Question
 
 Do metrics collapse when perturbation labels are broken?
@@ -247,7 +339,7 @@ Do metrics collapse when perturbation labels are broken?
 ### Design
 
 1. Compute all metrics under true perturbation labels → `true_metrics`.
-2. For each of `n_permutations` iterations:
+2. For each of `n_resamples` iterations:
    a. Shuffle `perturbation_col` values within each stratum defined by `batch_cols`.
    b. Recompute DE and all cell-metrics → `perm_metrics[i]`.
 3. Compute separation score between true and permuted distributions.
@@ -261,7 +353,7 @@ separation = (true_metric − mean(perm_metrics)) / SD(perm_metrics)
 This is equivalent to a z-score of the true metric relative to the permutation null. Also compute an empirical p-value:
 
 ```
-perm_p = |{i : perm_metrics[i] ≥ true_metric}| / n_permutations
+perm_p = |{i : perm_metrics[i] ≥ true_metric}| / n_resamples
 ```
 
 ### Expected Behaviour
@@ -283,6 +375,8 @@ perm_p = |{i : perm_metrics[i] ≥ true_metric}| / n_permutations
 ---
 
 ## Test 4 — Same-sgRNA Split Reproducibility
+
+> **In one sentence.** Split each guide's cells in two and compare each half vs control; agreement between the halves is the **reproducibility ceiling** — no model can score higher on a perturbation than the data agrees with itself.
 
 ### Question
 
@@ -324,6 +418,8 @@ Reproducibility is not a pass/fail gate but an empirical characterisation. Flag 
 
 ## Test 5 — Same-Gene Independent sgRNA Reproducibility
 
+> **In one sentence.** Do two different guides for the same gene agree more than two unrelated guides? **Expect only modest concordance** — guides for one gene often differ substantially in knockdown efficacy — and treat a low score with few guide pairs as **power-limited, not proof of off-target activity.**
+
 ### Question
 
 Do independent sgRNAs targeting the same gene recover similar perturbation signatures?
@@ -358,13 +454,16 @@ separation = (mean_same_gene_metric − mean_background_metric) / SD(background_
 
 | Condition | Verdict |
 |---|---|
-| Same-gene pairs score clearly above background | **PASS** |
+| **Underpowered: < ~5 genes with ≥2 guides (< ~5 same-gene pairs)** | **WARN (uninformative — cannot conclude)** — too few pairs to carry statistical weight; **never FAIL.** Do NOT read a low score as "guides off-target": same-gene guides genuinely differ in knockdown efficacy, so modest concordance is expected, and with few pairs the separation z is meaningless. |
+| Same-gene pairs score clearly above background (separation > 1.5) | **PASS** |
 | Marginal separation (1.0 < separation ≤ 1.5) | **WARN** — possible off-target effects or weak perturbation |
-| Same-gene pairs indistinguishable from background | **FAIL** — guides may be off-target or inefficacious |
+| Same-gene pairs indistinguishable from background **and enough pairs to conclude** | **FAIL** — guides may be off-target or inefficacious |
 
 ---
 
 ## Test 6 — Target Gene Knockdown Recovery
+
+> **In one sentence.** Is the targeted gene itself knocked down (negative LFC, significant)? High recovery is reassuring, but it **partly measures assay and guide quality, not the metric alone.**
 
 ### Question
 
@@ -421,6 +520,30 @@ median_lfc_rank     = median over sgRNAs of lfc_rank
 
 ---
 
+## Composition Diagnostic
+
+> **In one sentence.** Do perturbations shift cell-type / cluster / cell-cycle proportions versus control? Such shifts make cross-population DE read composition change as expression change; this requires a cell-state annotation in `obs`.
+
+### Design
+
+If a categorical cell-state column exists (`cell_type` / `cluster` / `leiden` / cell-cycle `phase`, configurable via `celltype_cols`):
+
+1. Compute the control's cell-state proportion vector.
+2. For each perturbation, compute its proportion vector and the **total-variation distance (TVD)** from control: `TVD = ½ Σ_k |p_pert(k) − p_ctrl(k)|`.
+3. Flag perturbations with `TVD > 0.10` — their DE may partly reflect composition.
+
+If no such column exists, **SKIP with an explicit message**: composition cannot be assessed, only the available structural columns are present, and strong hits should be interpreted with this confounder in mind. Recommend annotating cell type / cell-cycle and re-running.
+
+### Verdict Rules
+
+| Condition | Verdict |
+|---|---|
+| No perturbation shifts proportions (`TVD ≤ 0.10` for all) | **PASS** |
+| One or more perturbations with `TVD > 0.10` | **WARN** — list them; their DE is partly compositional |
+| No cell-state column available | **SKIP** (with guidance) |
+
+---
+
 ## Output Schema
 
 ```python
@@ -429,16 +552,19 @@ class TestResult:
     verdict:  Literal["PASS", "WARN", "FAIL", "SKIP"]
     metrics:  dict[str, float]       # all numeric outputs for this test
     flags:    list[str]              # human-readable failure reasons
+    reason:   str                    # one-line LOCAL verdict reason (shown next to the result)
     details:  dict                   # per-condition or per-sgRNA breakdown
 
 @dataclass
 class RobustnessReport:
-    test1: TestResult   # Within-condition null
-    test2: TestResult   # Control-control null
-    test3: TestResult   # Label permutation
+    test0: TestResult   # Effect-size injection / calibration curve   (GATE)
+    test1: TestResult   # Within-condition null                       (GATE)
+    test2: TestResult   # Control-control null                        (GATE)
+    test3: TestResult   # Label permutation                          (GATE)
     test4: TestResult   # Same-sgRNA reproducibility
     test5: TestResult   # Cross-sgRNA reproducibility
     test6: TestResult   # Target knockdown recovery
+    composition: TestResult  # Composition diagnostic
 
     global_verdict: Literal["PASS", "WARN", "FAIL"]
     blocking_flags: list[str]   # reasons for FAIL at global level
@@ -449,13 +575,16 @@ class RobustnessReport:
 
 ## Global Verdict Logic
 
+Validity gates are Tests **0, 1, 2, 3**.
+
 | Rule | Global Verdict |
 |---|---|
-| Tests 1, 2, 3 all PASS | Proceed to Tests 4–6 |
-| Any of Tests 1–3 is FAIL | **FAIL** — do not interpret real results; fix pipeline first |
-| Tests 1–3 PASS but Test 6 WARN | **WARN** — results valid but guide efficacy may limit sensitivity |
+| Tests 0–3 all PASS | Proceed to Tests 4–6 |
+| Any of Tests 0–3 is FAIL (e.g. anti-conservative null, or injected-effect FPR > 2×α) | **FAIL** — do not interpret real results; fix pipeline first |
+| Any of Tests 0–3 WARN (e.g. deflated/under-powered cell-level null, compositional coupling) | **WARN** — results usable but read the caveats; with a cell-level test, treat output as ranking, not calibrated FDR |
+| Gates PASS/WARN but Test 6 WARN | **WARN** — results valid but guide efficacy may limit sensitivity |
 | Tests 4–5 show no separation from background | **WARN** — empirical ceiling is low; downstream metrics may not be informative |
-| Tests 4–5 FAIL and Tests 1–3 also FAIL | **FAIL** |
+| Composition diagnostic WARN | informational — flag affected perturbations |
 
 ---
 
@@ -469,186 +598,12 @@ class RobustnessReport:
 
 4. **Consistency requirement.** All six tests must use the same DE function as the real analysis pipeline. Pass the DE function as a callable argument to each test runner.
 
-5. **Permutation seed.** Set a fixed random seed for all stratified splits and permutations to ensure reproducibility of the report.
+5. **Determinism (REQUIRED — completely seeded).** The entire run must be **bit-for-bit reproducible**: the same dataset + `config.yaml` + `seed` must produce an identical report and identical per-test tables every time. A single `seed` drives **every** stochastic step — all stratified splits, label permutations, and the Test-0 injection gene-selection/subsampling — via `np.random.default_rng(seed + fixed_offset)` (never an unseeded `default_rng()` / global `np.random`). Call a `seed_everything(seed)` at startup that pins `PYTHONHASHSEED`, `random`, `np.random`, and `scanpy.settings.seed`, and pass `random_state=seed` to any PCA/HVG/neighbors. The DE backends are deterministic given fixed input (pdex Wilcoxon; pydeseq2 DESeq2). Validate by running twice and diffing `robustness_summary.json` / `tables/` — they must be identical.
 
 ---
 
-## Section 7 — From Realized Tests to a Real DE Analysis
-
-Once all six robustness tests have been run, their outputs collectively define the statistical parameters for the real analysis. This section specifies exactly how each realized result maps to a p-value threshold, effect size estimate, power calculation, and required sample size.
-
 ---
 
-### 7.1 Calibrated α from Tests 1 and 2
+## Power / sample-size analysis — REMOVED
 
-The nominal FDR threshold (`fdr_threshold = 0.05`) assumes a well-calibrated test. The realized null tests provide an **empirical α** that corrects for any residual inflation.
-
-```
-α_empirical = fdr_threshold / λ_GC
-```
-
-where `λ_GC` is the mean genomic inflation factor from Tests 1 and 2.
-
-| λ_GC (realized) | α_empirical (if fdr_threshold = 0.05) | Action |
-|---|---|---|
-| 1.00 | 0.050 | Use nominal threshold unchanged |
-| 1.05 | 0.048 | Minor adjustment; use nominal |
-| 1.10 | 0.045 | Apply corrected threshold |
-| 1.20 | 0.042 | Apply corrected threshold; investigate cause |
-| > 1.10 | — | **FAIL** — do not run real analysis until resolved |
-
-The real DE analysis should use `α_empirical` as the BH input threshold rather than the raw nominal level. If λ_GC < 1 (deflation), do not inflate α — instead flag the deflation and investigate covariate overcorrection.
-
-**p-value interpretation rule for the real analysis:**
-
-A gene is called significant in the real analysis if and only if:
-
-```
-q(g) ≤ α_empirical  AND  |LFC(g)| ≥ lfc_threshold
-```
-
-where `lfc_threshold` is informed by Test 4 (see Section 7.3).
-
----
-
-### 7.2 Empirical Effect Size from Tests 4 and 5
-
-Tests 4 and 5 yield a distribution of LFC correlations and DEG overlaps across sgRNAs. These define three effect size tiers used in power calculations.
-
-**From Test 4 (same-sgRNA split):**
-
-```
-lfc_sd_signal  = SD of LFC(g) across significant genes, averaged over sgRNAs
-lfc_ceiling    = median LFC of top-decile significant genes across sgRNAs
-lfc_floor      = 10th percentile of |LFC| among detected DEGs
-```
-
-**From Test 6 (target knockdown):**
-
-```
-delta_target   = median |lfc_target| across sgRNAs where detected = True
-```
-
-**Effect size tiers:**
-
-| Tier | Definition | Use |
-|---|---|---|
-| Strong | `|LFC| ≥ lfc_ceiling` | Upper bound on detectable effect; sets optimistic power |
-| Typical | `|LFC| = median(|LFC_detected|)` from Test 4 | Primary effect size for power calculation |
-| Minimal detectable | `|LFC| = lfc_floor` | Conservative lower bound; sets required n |
-
-For the real analysis, use the **typical** effect size as the primary estimand. Report power at all three tiers.
-
----
-
-### 7.3 Refined lfc_threshold from Tests 4 and 6
-
-The initial `lfc_threshold = 0.1` is a prior. Tests 4 and 6 provide data to refine it.
-
-```
-lfc_threshold_realized = max(lfc_floor, lfc_threshold_prior)
-```
-
-If `lfc_floor` from Test 4 is substantially above 0.1 (e.g. 0.3), raising the threshold reduces false positives without sacrificing real signal. If `lfc_floor` is below 0.1, the prior is conservative and can be relaxed only if Test 1 and 2 are cleanly calibrated.
-
----
-
-### 7.4 Power Calculation
-
-Power for detecting a gene with true LFC `δ` at the calibrated threshold `α_empirical`, given `n` cells per group:
-
-**Wald test power (negative binomial approximation):**
-
-```
-SE(β̂) ≈ sqrt[ (1/μ_A + 1/μ_B + φ) / n ]
-
-W_ncp   = δ / SE(β̂)
-
-Power   = Φ( W_ncp − z_{α/2} ) + Φ( −W_ncp − z_{α/2} )
-```
-
-where:
-
-| Symbol | Definition |
-|---|---|
-| `δ` | True LFC (use typical effect size from Section 7.2) |
-| `μ_A`, `μ_B` | Mean count in each group (use baseline expression from `baseline_expression` or empirical mean from `adata`) |
-| `φ` | Dispersion estimate from DESeq2 fit on the null split data |
-| `n` | Cells per group |
-| `z_{α/2}` | Normal quantile at `α_empirical / 2` (two-tailed) |
-| `Φ` | Standard normal CDF |
-
-**Dispersion φ from robustness tests:** use the median fitted dispersion from the Test 1 or Test 2 DESeq2 run. This is data-derived and more accurate than a prior.
-
-**Multiple testing correction on power:** since G genes are tested, the effective per-gene α after BH correction is approximately:
-
-```
-α_per_gene ≈ α_empirical × (G_sig / G)
-```
-
-where `G_sig` is the expected number of true positives (estimated from Test 4 recovery rate × G). Substitute `α_per_gene` for `α_empirical` in the power formula for a conservative estimate.
-
----
-
-### 7.5 Required Sample Size
-
-Invert the power formula to solve for n given a target power (typically 0.80):
-
-```
-n_required = [ (z_{α/2} + z_{1−β}) / (δ / sqrt(1/μ_A + 1/μ_B + φ)) ]²
-```
-
-where `z_{1−β}` is the normal quantile at target power (0.84 for 80%, 1.28 for 90%).
-
-Compute `n_required` at each effect size tier from Section 7.2:
-
-| Tier | δ | n_required (80% power) | Interpretation |
-|---|---|---|---|
-| Strong | `lfc_ceiling` | Lowest n | Optimistic; achievable for top-effect genes |
-| Typical | `median LFC` | Middle n | Primary planning target |
-| Minimal detectable | `lfc_floor` | Highest n | Conservative; needed to detect weakest real signals |
-
-**Adjustment for reproducibility ceiling (Test 4):**
-
-If the same-sgRNA LFC correlation from Test 4 is `ρ < 1`, the effective detectable LFC is attenuated:
-
-```
-δ_effective = δ × sqrt(ρ)
-```
-
-Substitute `δ_effective` into `n_required`. This accounts for the fact that no single comparison can recover more signal than the data's internal reproducibility allows.
-
----
-
-### 7.6 Summary: Realized Parameters Table
-
-After running all six tests, populate this table. It becomes the statistical specification for the real analysis.
-
-| Parameter | Source | Realized Value |
-|---|---|---|
-| `α_empirical` | Tests 1–2: mean λ_GC | `fdr_threshold / λ_GC` |
-| `lfc_threshold_realized` | Tests 4, 6: `lfc_floor` | `max(lfc_floor, 0.1)` |
-| `φ_median` | Test 1 or 2: DESeq2 dispersion fit | empirical |
-| `δ_typical` | Test 4: median detected LFC | empirical |
-| `δ_ceiling` | Test 4: top-decile LFC | empirical |
-| `δ_floor` | Test 4: 10th percentile detected LFC | empirical |
-| `ρ_reproducibility` | Test 4: median same-sgRNA LFC correlation | empirical |
-| `δ_effective` | `δ_typical × sqrt(ρ)` | derived |
-| `n_required_typical` | Power formula at `δ_typical`, 80% power | derived |
-| `n_required_conservative` | Power formula at `δ_floor`, 80% power | derived |
-| `recovery_rate` | Test 6 | empirical |
-| `direction_rate` | Test 6 | empirical |
-
-**Decision rule for the real analysis:**
-
-```
-IF global_verdict == PASS:
-    use α_empirical, lfc_threshold_realized, n_required_typical
-    report power at all three δ tiers
-ELIF global_verdict == WARN:
-    use α_empirical with additional Bonferroni factor of 2
-    flag that power estimates may be optimistic
-ELIF global_verdict == FAIL:
-    STOP — do not run real analysis
-    return blocking_flags for diagnosis
-```
+A power / `n_required` / dispersion calculation is intentionally **not** part of this skill (it was removed). Report calibration (Tests 0–3), reproducibility (Tests 1, 4), and recovery (Test 6) directly; do not derive power, `α_empirical`, or required sample sizes.

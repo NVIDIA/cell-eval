@@ -1,0 +1,2122 @@
+#!/usr/bin/env python
+"""Standalone, reproducible robustness experiment for cell-eval metrics (pdex backend).
+
+Reads ``config.yaml`` + the dataset and runs the tests from ``TEST_PLAN.md`` using the *real*
+cell-eval DE backend (``cell_eval._de_backends.build_de_frame``). Writes per-test tables, QQ /
+calibration plots, a JSON summary, a context-first markdown report (dataset & experimental context,
+how DE was run + the pseudoreplication caveat, plain-language per-test explanations, a glossary, all
+verification p-values, power/sample-size analysis, every threshold, and the embedded test plan), an
+optional MultiQC custom-content export, and renders ``report.pdf``.
+
+DE unit of analysis (CRITICAL — see TEST_PLAN.md "Unit of analysis"):
+  - ``pdex``     -> cell-level Wilcoxon rank-sum. Each cell is treated as an independent observation,
+                   so the null-split tests are subject to PSEUDOREPLICATION (Squair et al. 2021,
+                   Nat Commun 12:5692). The report foregrounds this and reads the nulls accordingly.
+  - ``pydeseq2`` -> pseudobulk DESeq2 Wald (aggregates to replicate-level samples first).
+
+pdex expects log-normalized input. ``cell-eval run`` normalizes inside ``MetricsEvaluator`` before
+pdex; this runner drives ``build_de_frame`` directly, so it applies the same ``normalize_total`` +
+``log1p`` once up front when ``normalize_if_raw`` is set and ``.X`` is raw integer counts
+(per-cell ops, so normalizing once then subsetting == normalizing each subset). ``allow_discrete:
+false`` then makes pdex treat the matrix as log1p data (``is_log1p=True``).
+
+Reproducible: a single ``seed`` drives every split/permutation/injection. Re-running with the same
+config and seed reproduces the report.
+
+    python run.py --config config.yaml                 # full compute + report
+    python run.py --config config.yaml --report-only   # re-render report from cached summary (cheap)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+from dataclasses import asdict, dataclass, field
+
+import anndata as ad
+import numpy as np
+import polars as pl
+import scanpy as sc
+import scipy.sparse as sp
+import yaml
+from scipy import stats
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+
+from cell_eval._de_backends import build_de_frame  # noqa: E402
+
+log = logging.getLogger("robustness")
+CHI2_MEDIAN_1DF = 0.4549  # chi2.ppf(0.5, df=1)
+SQUAIR = "Squair et al. 2021, Nat Commun 12:5692 (https://www.nature.com/articles/s41467-021-25960-2)"
+
+
+# Curated canonical (non-ribosomal) housekeeping genes — stably expressed; used to break down the
+# Test-0 false-positive rate by gene class. Includes the Eisenberg–Levanon "stable" reference set.
+HOUSEKEEPING = {
+    "ACTB", "GAPDH", "B2M", "TBP", "HPRT1", "PGK1", "PPIA", "GUSB", "TFRC", "YWHAZ", "SDHA", "UBC",
+    "HMBS", "EEF1A1", "EEF2", "PABPC1", "VCP", "PSMB2", "PSMB4", "TUBB", "TUBA1B", "TUBB4B", "CLTC",
+    "HSP90AB1", "HSPA8", "CANX", "CALM1", "CALM2", "RAB7A", "CHMP2A", "EMC7", "REEP5", "SNRPD3",
+    "VPS29", "C1orf43", "GPI", "LDHA", "ENO1", "PKM", "NACA", "CFL1", "PFN1",
+}
+
+
+def seed_everything(seed: int) -> None:
+    """Seed every RNG source so the whole run is bit-for-bit reproducible (REQUIRED).
+
+    All splits/permutations/injection sampling already use np.random.default_rng(seed + offset)
+    (deterministic), but this also pins the global RNGs and PYTHONHASHSEED so any library that reads
+    a global RNG, and any future stochastic step, stays deterministic. The DE backends (pdex
+    Wilcoxon, pydeseq2 DESeq2) are themselves deterministic given fixed input."""
+    import os
+    import random as _random
+
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    _random.seed(seed)
+    np.random.seed(seed)
+    try:
+        sc.settings.seed = seed
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# config
+# --------------------------------------------------------------------------- #
+def load_cfg(path: str) -> dict:
+    with open(path) as fh:
+        cfg = yaml.safe_load(fh)
+    cfg.setdefault("num_threads", 8)
+    cfg.setdefault("lfc_threshold", 0.1)
+    cfg.setdefault("block_cols", [])
+    cfg.setdefault("lambda_gc_warn", 1.05)
+    cfg.setdefault("lambda_gc_fail", 1.10)
+    cfg.setdefault("normalize_if_raw", False)
+    cfg.setdefault("allow_discrete", False)
+    cfg.setdefault("covariate_correction", "none")        # what (if anything) was regressed out of .X
+    cfg.setdefault("celltype_cols", [])                   # obs cols to use for composition control
+    cfg.setdefault("injection_deltas", [0.0, 0.25, 0.5, 1.0, 2.0])
+    cfg.setdefault("injection_frac_genes", 0.10)
+    cfg.setdefault("injection_max_cells_per_arm", 3000)
+    cfg.setdefault("injection_n_hvg", 2000)          # # highly variable genes flagged for stratification
+    cfg.setdefault("injection_hvg_max_frac", 0.5)    # cap injected HVGs at this fraction of all HVGs
+    cfg.setdefault("emit_multiqc", True)
+    # `n_resamples` = # independent stratified-split repeats (Tests 0/1/2/4) or label permutations
+    # (Test 3). Backward-compatible with the old name `n_permutations`.
+    if "n_resamples" not in cfg and "n_permutations" in cfg:
+        cfg["n_resamples"] = cfg["n_permutations"]
+    cfg.setdefault("n_resamples", 10)
+    if "test1_n_resamples" not in cfg and "test1_n_permutations" in cfg:
+        cfg["test1_n_resamples"] = cfg["test1_n_permutations"]
+    return cfg
+
+
+# --------------------------------------------------------------------------- #
+# rounding / presentation helpers
+# --------------------------------------------------------------------------- #
+def fmt(v, nd: int = 4) -> str:
+    """Compact numeric formatting: <=nd decimals, scientific only for very small/large magnitudes."""
+    if isinstance(v, bool):
+        return str(v)
+    if isinstance(v, float):
+        if not np.isfinite(v):
+            return str(v)
+        if v != 0 and (abs(v) < 1e-3 or abs(v) >= 1e4):
+            return f"{v:.3g}"
+        return f"{round(v, nd):g}"
+    return str(v)
+
+
+def kv(d: dict, nd: int = 4) -> str:
+    return ", ".join(f"{k}={fmt(v, nd)}" for k, v in d.items())
+
+
+# --------------------------------------------------------------------------- #
+# dataset fingerprint / experimental context
+# --------------------------------------------------------------------------- #
+COVARIATE_HINTS = ("cell_type", "celltype", "cell.type", "cluster", "leiden", "louvain",
+                   "phase", "cell_cycle", "cellcycle", "donor", "patient", "subject",
+                   "sample", "tissue", "sex", "gender", "condition", "timepoint", "time",
+                   "lane", "well", "plate", "replicate")
+
+
+def fingerprint(adata: ad.AnnData, cfg: dict) -> dict:
+    obs = adata.obs
+    pc, ctrl, sg = cfg["pert_col"], cfg["control_pert"], cfg.get("sgrna_col")
+    X = adata.X
+    data = X.data if sp.issparse(X) else np.asarray(X).ravel()
+    data = data[np.isfinite(data)]
+    samp = data if data.size <= 5_000_000 else data[np.random.default_rng(0).integers(0, data.size, 5_000_000)]
+    raw_int = bool(np.allclose(samp, np.rint(samp))) if samp.size else False
+    cols = {}
+    for c in obs.columns:
+        try:
+            cols[c] = int(obs[c].nunique())
+        except TypeError:
+            cols[c] = None
+    # perturbation / control accounting
+    vc = obs[pc].astype(str).value_counts()
+    n_ctrl = int(vc.get(ctrl, 0))
+    perts = [g for g in vc.index if g != ctrl]
+    per_pert = vc.drop(labels=[ctrl], errors="ignore")
+    # guides per gene
+    guides_per_gene = None
+    if sg and sg in obs.columns:
+        gpg = obs.groupby(pc, observed=True)[sg].nunique()
+        guides_per_gene = gpg.drop(labels=[ctrl], errors="ignore")
+    # which obs columns look like correctable / structural covariates that are present vs absent
+    present_cov = [c for c in obs.columns if any(h in c.lower() for h in COVARIATE_HINTS)]
+    has_celltype = any(any(k in c.lower() for k in ("cell_type", "celltype", "cluster", "leiden", "louvain"))
+                       for c in obs.columns)
+    has_cellcycle = any(any(k in c.lower() for k in ("phase", "cell_cycle", "cellcycle")) for c in obs.columns)
+    return {
+        "n_cells": int(adata.n_obs),
+        "n_genes": int(adata.n_vars),
+        "layers": list(adata.layers.keys()),
+        "obs_columns": cols,
+        "X_raw_integer": raw_int,
+        "X_min": float(samp.min()) if samp.size else None,
+        "X_max": float(samp.max()) if samp.size else None,
+        "X_mean": float(samp.mean()) if samp.size else None,
+        "n_perturbations": len(perts),
+        "control_label": ctrl,
+        "n_control_cells": n_ctrl,
+        "cells_per_pert_min": int(per_pert.min()) if len(per_pert) else None,
+        "cells_per_pert_median": int(per_pert.median()) if len(per_pert) else None,
+        "cells_per_pert_max": int(per_pert.max()) if len(per_pert) else None,
+        "n_guides": int(obs[sg].nunique()) if (sg and sg in obs.columns) else None,
+        "genes_with_ge2_guides": int((guides_per_gene >= 2).sum()) if guides_per_gene is not None else None,
+        "present_covariate_like_cols": present_cov,
+        "has_celltype_col": has_celltype,
+        "has_cellcycle_col": has_cellcycle,
+        "covariate_correction": cfg.get("covariate_correction", "none"),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# normalization (match cell-eval run when pdex receives raw counts)
+# --------------------------------------------------------------------------- #
+def _looks_raw_integer(adata: ad.AnnData) -> bool:
+    X = adata.X
+    data = X.data if sp.issparse(X) else np.asarray(X).ravel()
+    data = data[np.isfinite(data)]
+    if data.size == 0:
+        return False
+    if data.size > 5_000_000:
+        rng = np.random.default_rng(0)
+        data = data[rng.integers(0, data.size, 5_000_000)]
+    return bool(np.allclose(data, np.rint(data)))
+
+
+def maybe_normalize(adata: ad.AnnData, cfg: dict) -> None:
+    if not cfg.get("normalize_if_raw"):
+        return
+    if _looks_raw_integer(adata):
+        log.info("normalize_if_raw: .X is raw integer counts -> normalize_total + log1p")
+        sc.pp.normalize_total(adata, inplace=True)
+        sc.pp.log1p(adata)
+    else:
+        log.info("normalize_if_raw set but .X does not look raw-integer -> skipping normalization")
+
+
+# --------------------------------------------------------------------------- #
+# DE wrapper (the real cell-eval code path)
+# --------------------------------------------------------------------------- #
+def run_de(adata: ad.AnnData, cfg: dict, groupby: str, reference: str) -> pl.DataFrame:
+    return build_de_frame(
+        mode="real",
+        adata=adata,
+        control_pert=reference,
+        pert_col=groupby,
+        num_threads=cfg["num_threads"],
+        allow_discrete=cfg["allow_discrete"],
+        de_method=cfg["de_method"],
+        de_kwargs=None,
+        counts_layer=cfg.get("counts_layer"),
+        replicate_col=cfg.get("replicate_col"),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# shared metric helpers (TEST_PLAN.md "Shared Formulas")
+# --------------------------------------------------------------------------- #
+def _sig_mask(lfc, fdr, cfg):
+    return np.isfinite(fdr) & (fdr <= cfg["fdr_threshold"]) & (np.abs(lfc) >= cfg["lfc_threshold"])
+
+
+def lambda_gc(p: np.ndarray) -> float:
+    p = p[np.isfinite(p)]
+    p = np.clip(p, 1e-300, 1.0)
+    if p.size == 0:
+        return float("nan")
+    chi2 = stats.chi2.isf(p, df=1)
+    return float(np.median(chi2) / CHI2_MEDIAN_1DF)
+
+
+def null_metrics(de: pl.DataFrame, cfg: dict) -> dict:
+    lfc = de["log2_fold_change"].to_numpy().astype(float)
+    p = de["p_value"].to_numpy().astype(float)
+    fdr = de["fdr"].to_numpy().astype(float)
+    fin = np.isfinite(lfc)
+    G = int(fin.sum())
+    sig = _sig_mask(lfc, fdr, cfg)
+    pv = p[np.isfinite(p)]
+    return {
+        "G": G,
+        "n_sig": int(np.nansum(sig)),
+        "frac_sig": float(np.nansum(sig) / G) if G else float("nan"),
+        "mean_lfc": float(np.nanmean(lfc[fin])) if G else float("nan"),
+        "mean_abs_lfc": float(np.nanmean(np.abs(lfc[fin]))) if G else float("nan"),
+        "ks_p_uniform": float(stats.kstest(pv, "uniform").pvalue) if pv.size >= 8 else float("nan"),
+        "lambda_gc": lambda_gc(p),
+    }
+
+
+def qq_plot(pvals: np.ndarray, out_png: str, title: str) -> None:
+    p = np.sort(pvals[np.isfinite(pvals)])
+    G = p.size
+    if G < 8:
+        return
+    p = np.clip(p, 1e-300, 1.0)
+    obs = -np.log10(p)
+    i = np.arange(1, G + 1)
+    exp = -np.log10((i - 0.5) / G)
+    lo = -np.log10(stats.beta.ppf(0.975, i, G - i + 1))
+    hi = -np.log10(stats.beta.ppf(0.025, i, G - i + 1))
+    if G > 3000:
+        idx = np.unique(np.linspace(0, G - 1, 3000).astype(int))
+        exp, obs, lo, hi = exp[idx], obs[idx], lo[idx], hi[idx]
+    lam = lambda_gc(pvals)
+    fig, ax = plt.subplots(figsize=(4.2, 4.2))
+    ax.fill_between(exp, lo, hi, color="0.85", label="95% envelope")
+    m = max(exp.max(), obs.max())
+    ax.plot([0, m], [0, m], "r--", lw=1)
+    ax.scatter(exp, obs, s=5, color="#1a3c6e")
+    ax.set_xlabel("expected -log10(p)")
+    ax.set_ylabel("observed -log10(p)")
+    ax.set_title(f"{title}\nλ_GC = {lam:.3f}", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=110)
+    plt.close(fig)
+
+
+def compare_signatures(de_a: pl.DataFrame, de_b: pl.DataFrame, cfg: dict) -> dict:
+    j = de_a.join(de_b, on="feature", how="inner", suffix="_b")
+    if j.height < 5:
+        return {}
+    la = j["log2_fold_change"].to_numpy().astype(float)
+    lb = j["log2_fold_change_b"].to_numpy().astype(float)
+    fa = j["fdr"].to_numpy().astype(float)
+    fb = j["fdr_b"].to_numpy().astype(float)
+    ok = np.isfinite(la) & np.isfinite(lb)
+    sa = _sig_mask(la, fa, cfg)
+    sb = _sig_mask(lb, fb, cfg)
+    union = int((sa | sb).sum())
+    inter = int((sa & sb).sum())
+    spear = float(stats.spearmanr(la[ok], lb[ok]).statistic) if ok.sum() >= 5 else float("nan")
+    direction = float(np.mean(np.sign(la[sa | sb]) == np.sign(lb[sa | sb]))) if union else float("nan")
+    auc = float("nan")
+    if sb.sum() > 0 and (~sb).sum() > 0:
+        try:
+            from sklearn.metrics import roc_auc_score
+            auc = float(roc_auc_score(sb.astype(int), np.abs(la)))
+        except Exception:
+            auc = float("nan")
+    return {
+        "lfc_spearman": spear,
+        "sig_jaccard": float(inter / union) if union else float("nan"),
+        "direction_agreement": direction,
+        "auc_recovery": auc,
+        "n_sig_a": int(sa.sum()),
+        "n_sig_b": int(sb.sum()),
+    }
+
+
+def stratified_split(obs, strat_cols, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    cols = [c for c in strat_cols if c in obs.columns]
+    out = np.empty(len(obs), dtype=object)
+    if cols:
+        groups = obs.groupby(cols, observed=True, sort=False).indices.values()
+    else:
+        groups = [np.arange(len(obs))]
+    for idx in groups:
+        idx = np.asarray(idx, dtype=int)
+        rng.shuffle(idx)
+        half = idx.size // 2
+        out[idx[:half]] = "A"
+        out[idx[half:]] = "B"
+    return out.astype(str)
+
+
+def matched_arms_within_batch(obs, feature_cols, block_cols, seed):
+    """1:1 BATCH-CONTROLLED arm assignment: within each batch, split cells into two halves and
+    optimally pair them on standardized log1p QC features (scipy linear_sum_assignment). Returns
+    (a_pos, b_pos) integer positions into `obs` for the matched pairs, or None if features missing.
+    Self-contained (no scmetrics dependency); deterministic given the seed."""
+    from scipy.optimize import linear_sum_assignment
+
+    cols = [c for c in feature_cols if c in obs.columns]
+    if not cols:
+        return None
+    rng = np.random.default_rng(seed)
+    posarr = np.arange(len(obs))
+    bcols = [c for c in block_cols if c in obs.columns]
+    if bcols:
+        groups = obs.groupby(bcols, observed=True, sort=True).indices.values()
+    else:
+        groups = [np.arange(len(obs))]
+    feat = obs[cols].to_numpy(dtype=float)
+    a_pos, b_pos = [], []
+    for idx in sorted([np.asarray(g, dtype=int) for g in groups], key=lambda a: (a.size, a.min() if a.size else -1)):
+        idx = idx.copy()
+        rng.shuffle(idx)
+        half = idx.size // 2
+        if half < 1:
+            continue
+        ia, ib = idx[:half], idx[half:2 * half]
+        Fa, Fb = np.log1p(np.clip(feat[ia], 0, None)), np.log1p(np.clip(feat[ib], 0, None))
+        pooled = np.vstack([Fa, Fb])
+        mu, sd = pooled.mean(0), pooled.std(0)
+        sd[sd < 1e-8] = 1.0
+        Fa, Fb = (Fa - mu) / sd, (Fb - mu) / sd
+        cost = ((Fa[:, None, :] - Fb[None, :, :]) ** 2).sum(-1)
+        r, c = linear_sum_assignment(cost)
+        a_pos.extend(posarr[ia[r]].tolist())
+        b_pos.extend(posarr[ib[c]].tolist())
+    return (np.asarray(a_pos, dtype=int), np.asarray(b_pos, dtype=int)) if a_pos else None
+
+
+# --------------------------------------------------------------------------- #
+# result container
+# --------------------------------------------------------------------------- #
+@dataclass
+class TestResult:
+    name: str
+    title: str
+    verdict: str  # PASS | WARN | FAIL | SKIP
+    metrics: dict = field(default_factory=dict)
+    flags: list = field(default_factory=list)
+    pvalues: dict = field(default_factory=dict)
+    plot: str | None = None
+    reason: str = ""  # one-line, LOCAL verdict reason
+
+
+def verdict_from_null(m: dict, cfg: dict) -> tuple[str, list]:
+    flags = []
+    lam = m.get("lambda_gc", float("nan"))
+    frac = m.get("frac_sig", float("nan"))
+    ksp = m.get("ks_p_uniform", float("nan"))
+    if np.isfinite(lam) and lam > cfg["lambda_gc_fail"]:
+        flags.append(f"λ_GC={fmt(lam)} > {cfg['lambda_gc_fail']} (anti-conservative)")
+        return "FAIL", flags
+    if np.isfinite(frac) and frac > 5 * cfg["fdr_threshold"]:
+        flags.append(f"frac_sig={fmt(frac)} >> fdr_threshold={cfg['fdr_threshold']}")
+        return "FAIL", flags
+    if (np.isfinite(lam) and lam > cfg["lambda_gc_warn"]) or (np.isfinite(frac) and frac > 2 * cfg["fdr_threshold"]):
+        flags.append(f"λ_GC={fmt(lam)} / frac_sig={fmt(frac)} mildly elevated")
+        return "WARN", flags
+    defl = []
+    if np.isfinite(lam) and lam < 0.9:
+        defl.append(f"λ_GC={fmt(lam)} < 0.9 (deflated null — under-powered)")
+    if np.isfinite(ksp) and ksp < 0.05:
+        defl.append(f"ks_p_uniform={fmt(ksp)} < 0.05 (p-values not Uniform[0,1])")
+    if defl:
+        return "WARN", defl
+    return "PASS", flags
+
+
+# Pure verdict functions of cached metrics (reused by the live tests AND by --report-only, so a
+# verdict-rule change can be re-applied to cached results without recomputing DE).
+def verdict_test_0(m: dict, cfg: dict) -> tuple[str, str, list]:
+    fpr_null = m.get("null_FPR", float("nan"))
+    tpr_max = m.get("max_TPR", float("nan"))
+    fpr_hi = m.get("FPR_at_max_delta", float("nan"))
+    delta_hi = m.get("max_delta_log2fc", float("nan"))
+    min_delta = m.get("min_resolvable_delta_log2fc", float("nan"))
+    frac = m.get("frac_genes_injected", float("nan"))
+    flags, verdict = [], "PASS"
+    if np.isfinite(fpr_null) and fpr_null > 2 * cfg["fdr_threshold"]:
+        verdict = "FAIL"
+        flags.append(f"null FPR={fmt(fpr_null)} > 2×fdr_threshold ({2*cfg['fdr_threshold']}) — anti-conservative")
+    if np.isfinite(tpr_max) and tpr_max < 0.5:
+        flags.append(f"max TPR={fmt(tpr_max)} < 0.5 even at δ={delta_hi} — resolves little real signal")
+        if verdict != "FAIL":
+            verdict = "WARN"
+    coupling = np.isfinite(fpr_hi) and np.isfinite(fpr_null) and fpr_hi > max(2 * cfg["fdr_threshold"], fpr_null + 0.05)
+    if coupling:
+        flags.append(
+            f"FPR rises to {fmt(fpr_hi)} at δ={delta_hi} (vs null {fmt(fpr_null)}) — strong perturbations "
+            "induce false DE in UNTOUCHED genes via library-size renormalization (compositional coupling). "
+            f"This is a worst-case stress (δ={delta_hi} log2FC injected into {fmt(frac)} of genes); the "
+            "effect scales with the fraction × magnitude of truly perturbed genes, so broad/strong "
+            "perturbations risk contaminating the REAL analysis with false hits. Test 6 shows strong real "
+            "knockdowns are present here, so this is a live risk: prefer median-of-ratios / pseudobulk "
+            "DESeq2 (or spike-in normalization) before interpreting non-target hits.")
+        if verdict == "PASS":
+            verdict = "WARN"
+    if np.isfinite(fpr_null) and fpr_null <= cfg["fdr_threshold"] and verdict == "PASS":
+        flags.append(f"null FPR={fmt(fpr_null)} ≤ α — conservative (no false positives)")
+    if verdict == "FAIL":
+        reason = f"FAIL: anti-conservative null FPR={fmt(fpr_null)}"
+    elif verdict == "WARN" and coupling:
+        reason = (f"WARN: null FPR={fmt(fpr_null)} clean but FPR→{fmt(fpr_hi)} at δ={delta_hi} "
+                  "(compositional coupling — false DE in untouched genes under strong/broad effects)")
+    elif verdict == "WARN":
+        reason = f"WARN: under-powered (max TPR={fmt(tpr_max)})"
+    else:
+        reason = f"PASS: null FPR={fmt(fpr_null)} controlled; resolves δ≥{fmt(min_delta)} log2FC"
+    return verdict, reason, flags
+
+
+def verdict_test_5(m: dict, cfg: dict) -> tuple[str, str, list]:
+    n_genes = m.get("n_genes", 0)
+    n_pairs = m.get("n_same_pairs", 0)
+    same = m.get("same_gene_mean_rho", float("nan"))
+    bg = m.get("background_mean_rho", float("nan"))
+    sep = m.get("separation_z", float("nan"))
+    underpowered = (n_genes < 5) or (n_pairs < 5)
+    flags = []
+    if underpowered:
+        # Never FAIL on an underpowered comparison — too few guide pairs to conclude anything.
+        verdict = "WARN"
+        trend = "trends higher than" if (np.isfinite(same) and np.isfinite(bg) and same > bg) else \
+                ("≈" if (np.isfinite(same) and np.isfinite(bg)) else "vs")
+        flags.append(
+            f"UNINFORMATIVE / power-limited: only {n_genes} gene(s) with ≥2 guides ({n_pairs} same-gene "
+            f"pair(s)). Separation z={fmt(sep)} carries essentially no statistical weight, so this is NOT "
+            "evidence that guides are off-target or inefficacious. Same-gene guides also genuinely differ "
+            "in knockdown efficacy, so only modest concordance is expected even with more pairs.")
+        reason = (f"WARN (underpowered, cannot conclude): same-gene ρ={fmt(same)} {trend} background "
+                  f"ρ={fmt(bg)} on only {n_pairs} pair(s)")
+        return verdict, reason, flags
+    if (not np.isfinite(sep) and np.isfinite(same) and np.isfinite(bg) and same > bg) or sep > 1.5:
+        verdict = "PASS"
+    elif np.isfinite(sep) and sep > 1.0:
+        verdict = "WARN"
+    else:
+        verdict = "FAIL"
+    reason = (f"{verdict}: same-gene ρ={fmt(same)} vs background ρ={fmt(bg)} "
+              f"(separation z={fmt(sep)}; {n_pairs} same-gene pair(s))")
+    return verdict, reason, flags
+
+
+# --------------------------------------------------------------------------- #
+# TEST 0 — effect-size injection / calibration curve (NEW)
+# --------------------------------------------------------------------------- #
+def test_0_injection(adata_raw, cfg, outdir):
+    """Inject known log2FC into a known fraction of genes in a control-vs-control split; measure
+    FPR-at-null and TPR-vs-effect-size. Distinguishes 'null=null' from 'pipeline dead' and reports
+    the smallest effect the metric can resolve. Operates on RAW counts (before global normalization)."""
+    pc, ctrl = cfg["pert_col"], cfg["control_pert"]
+    mcg = cfg["min_cells_per_group"]
+    cmask = (adata_raw.obs[pc].astype(str) == ctrl).to_numpy()
+    ctrl_full = adata_raw[cmask]
+    if ctrl_full.n_obs < 2 * mcg:
+        return TestResult("test_0", "Effect-Size Injection / Calibration Curve", "SKIP",
+                          flags=["too few control cells for an injection split"],
+                          reason="SKIP: insufficient control cells")
+    deltas = list(cfg.get("injection_deltas", [0.0, 0.25, 0.5, 1.0, 2.0]))
+    frac = float(cfg.get("injection_frac_genes", 0.10))
+    hvg_max_frac = float(cfg.get("injection_hvg_max_frac", 0.5))
+    n_hvg = int(cfg.get("injection_n_hvg", 2000))
+    G = ctrl_full.n_vars
+    feats = np.asarray(ctrl_full.var_names)
+
+    # ===== Gene-class properties — computed over ALL control cells, so they are a DETERMINISTIC
+    # ===== function of the h5ad (independent of the DE cell subsample / its seed). =====
+    Xc = ctrl_full.X.tocsr() if sp.issparse(ctrl_full.X) else sp.csr_matrix(np.asarray(ctrl_full.X))
+    n_c = Xc.shape[0]
+    expressed = np.where(np.asarray(Xc.sum(0)).ravel() > 0)[0]
+    ctrlln = ctrl_full.copy()
+    sc.pp.normalize_total(ctrlln)
+    sc.pp.log1p(ctrlln)
+    Xn = ctrlln.X.tocsr() if sp.issparse(ctrlln.X) else sp.csr_matrix(np.asarray(ctrlln.X))
+    del ctrlln
+    mean_expr = np.asarray(Xn.mean(0)).ravel()                 # log-normalized mean per gene (all controls)
+    try:
+        hvtmp = ad.AnnData(X=Xn.copy(), var=ctrl_full.var.copy())
+        sc.pp.highly_variable_genes(hvtmp, n_top_genes=min(n_hvg, max(1, expressed.size // 2)), flavor="seurat")
+        hvg_bool = hvtmp.var["highly_variable"].to_numpy().astype(bool)
+        del hvtmp
+    except Exception as e:  # noqa: BLE001
+        log.warning("test0 HVG computation failed (%s); treating all genes as non-HVG", e)
+        hvg_bool = np.zeros(G, dtype=bool)
+
+    # --- EXPRESSION-STRATIFIED injection selection (ANCHORS): equal share from low/mid/high mean-
+    #     expression tertiles. Detectability is dominated by expression level, so injecting evenly
+    #     across the detection spectrum makes the TPR-vs-δ curve interpretable PER tier (the smallest
+    #     resolvable δ for sparse vs typical vs abundant genes), instead of an artifact of the mix. ---
+    n_inj = max(1, int(frac * expressed.size))
+    rng_sel = np.random.default_rng(cfg["seed"] + 8)
+    ee = mean_expr[expressed]
+    t33, t67 = float(np.quantile(ee, 1.0 / 3)), float(np.quantile(ee, 2.0 / 3))
+    EXPR_TIERS = ("low", "mid", "high")  # low = sparse/hard ... high = abundant/easy
+    expr_tier_all = np.full(G, "none", dtype=object)
+    expr_tier_all[expressed] = np.where(mean_expr[expressed] <= t33, "low",
+                                        np.where(mean_expr[expressed] >= t67, "high", "mid"))
+    per = max(1, n_inj // 3)
+    inj_parts = []
+    for t in EXPR_TIERS:
+        pool = np.where(expr_tier_all == t)[0]
+        if pool.size:
+            inj_parts.append(rng_sel.choice(pool, size=min(per, pool.size), replace=False))
+    inj_idx = np.sort(np.concatenate(inj_parts).astype(int)) if inj_parts else np.array([], int)
+    inj_feats = set(feats[inj_idx].tolist())
+    inj_mask_all = np.zeros(G, dtype=bool)
+    inj_mask_all[inj_idx] = True
+    n_inj_tier = {t: int((expr_tier_all[inj_idx] == t).sum()) for t in EXPR_TIERS}
+    log.info("test0 injected (anchors) %d genes across expression tertiles: low=%d mid=%d high=%d",
+             inj_idx.size, n_inj_tier["low"], n_inj_tier["mid"], n_inj_tier["high"])
+
+    # --- |Pearson r| of every gene with the anchor signature, over ALL controls (sparse, exact) ---
+    s = np.asarray(Xn[:, inj_idx].mean(1)).ravel()             # per-cell mean of anchor genes (log-norm)
+    mean_g = mean_expr
+    sumsq_g = np.asarray(Xn.multiply(Xn).sum(0)).ravel()
+    var_g = np.clip(sumsq_g / n_c - mean_g ** 2, 0.0, None)
+    e_gs = np.asarray(Xn.T.dot(s)).ravel() / n_c
+    cov = e_gs - mean_g * s.mean()
+    anchor_corr = np.abs(cov / (np.sqrt(var_g) * s.std() + 1e-12))
+    del Xn
+
+    # --- gene-class group masks for the UNTOUCHED-gene FPR breakdown (anchors = injected genes) ---
+    expressed_mask = np.zeros(G, dtype=bool)
+    expressed_mask[expressed] = True
+    hk_mask = np.array([g in HOUSEKEEPING for g in feats])
+    marker_set = set(cfg.get("injection_marker_genes", []) or [])
+    marker_mask = np.array([g in marker_set for g in feats])
+    expr_e = mean_expr[expressed]
+    heg_hi, leg_lo = float(np.quantile(expr_e, 0.80)), float(np.quantile(expr_e, 0.20))
+    rng_grp = np.random.default_rng(cfg["seed"] + 9)
+    random_mask = np.zeros(G, dtype=bool)
+    random_mask[rng_grp.choice(G, size=max(1, int(0.10 * G)), replace=False)] = True
+    GROUPS = {  # diagnostic lenses (may overlap); FPR is measured over UNTOUCHED genes in each
+        "AnchorCorr": anchor_corr >= float(np.quantile(anchor_corr, 0.90)),  # correlated w/ anchors -> easy/upper-bound
+        "HighlyExpr": expressed_mask & (mean_expr >= heg_hi),                # abundant -> high signal, easy
+        "LowlyExpr": expressed_mask & (mean_expr <= leg_lo),                 # sparse -> hard, zero-dominated
+        "HouseKeeping": hk_mask,                                             # constitutive -> predictable, watch memorization
+        "Marker": marker_mask,                                              # cell-type identity (N/A without annotation)
+        "HighlyVarG": hvg_bool,                                              # high-variance complement to anchors
+        "Random": random_mask,                                              # unbiased baseline across detection spectrum
+    }
+    GROUP_NAMES = list(GROUPS.keys())
+    pos = {f: i for i, f in enumerate(feats.tolist())}
+
+    # ===== DE cell subsample (only the arms are subsampled, for speed; gene classes above are not) =====
+    cap = int(cfg.get("injection_max_cells_per_arm", 3000))
+    rng = np.random.default_rng(cfg["seed"] + 7)
+    order = np.arange(ctrl_full.n_obs)
+    rng.shuffle(order)
+    sub = ctrl_full[order[: 2 * cap]].copy()
+    arm = stratified_split(sub.obs, cfg["block_cols"], cfg["seed"] + 7)
+    bmask = arm == "B"
+    base = sub.X
+    base = base.toarray().astype(np.float64) if sp.issparse(base) else np.asarray(base, float)
+
+    normalize = bool(cfg.get("normalize_if_raw"))  # pdex path normalizes; pydeseq2 consumes raw counts
+    rows = []
+    for d in deltas:
+        Xd = base.copy()
+        if d > 0:
+            Xd[np.ix_(np.where(bmask)[0], inj_idx)] *= 2.0 ** d
+        if not normalize:
+            Xd = np.rint(Xd)  # keep integer counts for pseudobulk DESeq2
+        s = ad.AnnData(X=Xd.astype(np.float32), obs=sub.obs.copy(), var=sub.var.copy())
+        s.obs["_arm"] = arm.astype(str)
+        if normalize:
+            sc.pp.normalize_total(s, inplace=True)
+            sc.pp.log1p(s)
+        try:
+            de = run_de(s, cfg, groupby="_arm", reference="A")  # target = B (anchors injected up)
+        except Exception as e:  # noqa: BLE001
+            log.warning("test0 delta=%s: %s", d, e)
+            continue
+        feat_arr = de["feature"].cast(str).to_numpy()
+        fpos = np.array([pos[f] for f in feat_arr])             # map DE rows -> gene-axis positions
+        lfc = de["log2_fold_change"].to_numpy().astype(float)
+        fdr = de["fdr"].to_numpy().astype(float)
+        pvl = de["p_value"].to_numpy().astype(float)
+        sig = _sig_mask(lfc, fdr, cfg)
+        is_inj = inj_mask_all[fpos]
+        tpr = float(sig[is_inj].mean()) if is_inj.sum() else float("nan")
+        fpr = float(sig[~is_inj].mean()) if (~is_inj).sum() else float("nan")
+        med_obs = float(np.nanmedian(lfc[is_inj])) if is_inj.sum() else float("nan")
+        row = {"delta_log2fc": float(d), "n_injected": int(is_inj.sum()),
+               "TPR": tpr, "FPR": fpr, "median_observed_lfc_injected": med_obs,
+               "lambda_gc": lambda_gc(pvl)}
+        # FPR among UNTOUCHED genes, broken down by the diagnostic gene classes (lenses)
+        for gname in GROUP_NAMES:
+            gm = GROUPS[gname][fpos]
+            unt = (~is_inj) & gm
+            row[f"FPR_{gname}"] = float(sig[unt].mean()) if unt.sum() else float("nan")
+            row[f"n_untouched_{gname}"] = int(unt.sum())
+        # TPR among INJECTED/anchor genes, broken down by EXPRESSION TIER (detection power)
+        tier_at = expr_tier_all[fpos]
+        for t in EXPR_TIERS:
+            inj_t = is_inj & (tier_at == t)
+            row[f"TPR_{t}expr"] = float(sig[inj_t].mean()) if inj_t.sum() else float("nan")
+            row[f"n_injected_{t}expr"] = int(inj_t.sum())
+        rows.append(row)
+    if not rows:
+        return TestResult("test_0", "Effect-Size Injection / Calibration Curve", "SKIP",
+                          flags=["no injection DE succeeded"], reason="SKIP: no DE result")
+    df = pl.DataFrame(rows)
+    df.write_csv(os.path.join(outdir, "tables", "test_0__calibration_curve.csv"))
+    # plot overall TPR/FPR, plus FPR-by-class and TPR-by-class panels
+    png = os.path.join(outdir, "plots", "test_0_injection.png")
+    fig, (axl, axm, axr) = plt.subplots(1, 3, figsize=(13.0, 4.0))
+    dd = df["delta_log2fc"].to_numpy()
+    axl.plot(dd, df["TPR"].to_numpy(), "-o", color="#1a3c6e", label="TPR (injected)")
+    axl.plot(dd, df["FPR"].to_numpy(), "-s", color="#b22222", label="FPR (untouched)")
+    axl.axhline(cfg["fdr_threshold"], ls="--", color="0.5", lw=1, label=f"α={cfg['fdr_threshold']}")
+    axl.set_xlabel("injected δ (log2 fold-change)"); axl.set_ylabel("rate"); axl.set_ylim(-0.02, 1.02)
+    axl.set_title("Overall TPR / FPR", fontsize=9); axl.legend(fontsize=7)
+    # middle: FPR by gene class (untouched genes)
+    grp_colors = {"AnchorCorr": "#b22222", "HighlyExpr": "#1a9850", "LowlyExpr": "#4575b4",
+                  "HouseKeeping": "#762a83", "Marker": "#e08214", "HighlyVarG": "#d6604d",
+                  "Random": "#888888"}
+    for c, col in grp_colors.items():
+        cc = f"FPR_{c}"
+        if cc in df.columns and not df[cc].is_null().all():
+            axm.plot(dd, df[cc].to_numpy(), "-o", ms=4, color=col, label=c)
+    axm.axhline(cfg["fdr_threshold"], ls="--", color="0.5", lw=1, label=f"α={cfg['fdr_threshold']}")
+    axm.set_xlabel("injected δ (log2 fold-change)"); axm.set_ylabel("FPR (untouched)"); axm.set_ylim(-0.02, 1.02)
+    axm.set_title("FPR by gene class (untouched; anchors=injected)", fontsize=8.5); axm.legend(fontsize=6.5)
+    # right: TPR by EXPRESSION TIER of the injected/anchor gene (detection power)
+    tier_colors = {"high": "#1a9850", "mid": "#4575b4", "low": "#b22222"}
+    for t, col in tier_colors.items():
+        cc = f"TPR_{t}expr"
+        if cc in df.columns and not df[cc].is_null().all():
+            axr.plot(dd, df[cc].to_numpy(), "-o", ms=4, color=col, label=f"{t} expr")
+    axr.axhline(0.5, ls=":", color="0.5", lw=1, label="TPR=0.5")
+    axr.set_xlabel("injected δ (log2 fold-change)"); axr.set_ylabel("TPR (injected)"); axr.set_ylim(-0.02, 1.02)
+    axr.set_title("TPR by injected-gene expression tier", fontsize=8.5); axr.legend(fontsize=6.5)
+    fig.suptitle("Test 0 — injection calibration curve", fontsize=11)
+    fig.tight_layout()
+    fig.savefig(png, dpi=110)
+    plt.close(fig)
+    fpr0 = df.filter(pl.col("delta_log2fc") == 0.0)["FPR"]
+    fpr_null = float(fpr0[0]) if fpr0.len() else float("nan")
+    pos = df.filter(pl.col("delta_log2fc") > 0)
+    tpr_max = float(pos["TPR"].max()) if pos.height else float("nan")
+    delta_hi = float(pos["delta_log2fc"].max()) if pos.height else float("nan")
+    fpr_hi = float(pos.filter(pl.col("delta_log2fc") == delta_hi)["FPR"][0]) if pos.height else float("nan")
+    res = pos.filter(pl.col("TPR") >= 0.5)
+    min_delta = float(res["delta_log2fc"].min()) if res.height else float("nan")
+    hi_row = pos.filter(pl.col("delta_log2fc") == delta_hi) if pos.height else df.head(0)
+    metrics = {"null_FPR": fpr_null, "max_TPR": tpr_max, "min_resolvable_delta_log2fc": min_delta,
+               "FPR_at_max_delta": fpr_hi, "max_delta_log2fc": delta_hi,
+               "n_injected_genes": int(inj_idx.size),
+               "n_injected_low_expr": n_inj_tier["low"], "n_injected_mid_expr": n_inj_tier["mid"],
+               "n_injected_high_expr": n_inj_tier["high"], "injection_stratified_by": "expression tertile",
+               "n_expressed_genes": int(expressed.size), "n_total_genes": int(G),
+               "frac_genes_injected": frac,
+               "control_cells_used": int(sub.n_obs), "cells_per_arm": int(min(bmask.sum(), (~bmask).sum()))}
+    # per-gene-class FPR (untouched) + per-expression-tier TPR (injected) at the largest injected δ
+    for c in GROUP_NAMES:
+        col = f"FPR_{c}"
+        if hi_row.height and col in hi_row.columns:
+            metrics[f"FPR_{c}_at_max_delta"] = float(hi_row[col][0])
+    for t in EXPR_TIERS:
+        col = f"TPR_{t}expr"
+        if hi_row.height and col in hi_row.columns:
+            metrics[f"TPR_{t}expr_at_max_delta"] = float(hi_row[col][0])
+    # min resolvable δ per expression tier (smallest δ reaching TPR ≥ 0.5 in that tier)
+    for t in EXPR_TIERS:
+        col = f"TPR_{t}expr"
+        if col in pos.columns:
+            r = pos.filter(pl.col(col) >= 0.5)
+            metrics[f"min_resolvable_delta_{t}expr"] = float(r["delta_log2fc"].min()) if r.height else float("nan")
+    verdict, reason, flags = verdict_test_0(metrics, cfg)
+    return TestResult("test_0", "Effect-Size Injection / Calibration Curve", verdict, metrics=metrics,
+                      flags=flags, pvalues={"null_FPR": fpr_null}, plot="plots/test_0_injection.png",
+                      reason=reason)
+
+
+# --------------------------------------------------------------------------- #
+# Composition control diagnostic (NEW)
+# --------------------------------------------------------------------------- #
+def composition_diagnostic(adata, cfg, outdir):
+    """Check whether perturbations shift cell-type / cluster / cell-cycle proportions vs control —
+    such shifts make cross-population DE read composition change as expression change. Requires a
+    categorical cell-state column; gracefully SKIPs (with guidance) if none exists."""
+    obs = adata.obs
+    explicit = [c for c in cfg.get("celltype_cols", []) if c in obs.columns]
+    auto = [c for c in obs.columns
+            if any(k in c.lower() for k in ("cell_type", "celltype", "cluster", "leiden", "louvain",
+                                            "phase", "cell_cycle", "cellcycle"))]
+    cols = explicit or auto
+    if not cols:
+        flag = ("no cell-type / cluster / cell-cycle column in obs — composition shift cannot be "
+                "assessed. Only `batch` is present. A perturbation that changes proliferation or "
+                "differentiation will alter cell-state proportions, and cross-population DE reads "
+                "that as expression change. Recommend annotating cell type (and cell-cycle phase) "
+                "and re-running, or interpreting strong hits with this confounder in mind.")
+        return TestResult("composition", "Composition Control", "SKIP", flags=[flag],
+                          reason="SKIP: no cell-state column to assess composition shift")
+    col = cols[0]
+    pc, ctrl = cfg["pert_col"], cfg["control_pert"]
+    cats = sorted(obs[col].astype(str).unique())
+    ref = obs.loc[obs[pc].astype(str) == ctrl, col].astype(str).value_counts(normalize=True)
+    ref = ref.reindex(cats, fill_value=0.0).to_numpy()
+    rows = []
+    for pert in perts_in_use(adata, cfg):
+        q = obs.loc[obs[pc].astype(str) == pert, col].astype(str).value_counts(normalize=True)
+        q = q.reindex(cats, fill_value=0.0).to_numpy()
+        tvd = float(0.5 * np.abs(q - ref).sum())  # total variation distance from control
+        rows.append({"condition": pert, "tv_distance_vs_control": tvd})
+    df = pl.DataFrame(rows)
+    df.write_csv(os.path.join(outdir, "tables", "composition__tvd.csv"))
+    med = float(df["tv_distance_vs_control"].median())
+    mx = float(df["tv_distance_vs_control"].max())
+    n_shift = int((df["tv_distance_vs_control"] > 0.10).sum())
+    verdict = "WARN" if n_shift > 0 else "PASS"
+    flags = []
+    if n_shift:
+        flags.append(f"{n_shift} perturbation(s) shift `{col}` proportions by TVD>0.10 vs control — "
+                     "their DE may partly reflect composition, not per-cell expression change")
+    reason = (f"{verdict}: {n_shift} perturbation(s) with TVD>0.10 on `{col}` (median={fmt(med)})")
+    return TestResult("composition", "Composition Control", verdict,
+                      metrics={"cell_state_col": col, "median_tvd": med, "max_tvd": mx,
+                               "n_perts_tvd_gt_0.10": n_shift},
+                      flags=flags, reason=reason)
+
+
+# --------------------------------------------------------------------------- #
+# the six tests (logic unchanged; verdict reasons made local)
+# --------------------------------------------------------------------------- #
+def perts_in_use(adata, cfg):
+    tg = adata.obs[cfg["pert_col"]].astype(str)
+    perts = [g for g in sorted(tg.unique()) if g != cfg["control_pert"]]
+    if cfg.get("max_conditions"):
+        perts = perts[: cfg["max_conditions"]]
+    return perts
+
+
+def _de_two(adata, pos1, pos2, cfg, lab1="G1", lab2="G2"):
+    """DE of cells at global positions pos1 (label lab1) vs pos2 (label lab2), reference=lab2."""
+    sel = np.concatenate([np.asarray(pos1, int), np.asarray(pos2, int)])
+    s = adata[sel].copy()
+    s.obs["_g"] = np.array([lab1] * len(pos1) + [lab2] * len(pos2))
+    return run_de(s, cfg, groupby="_g", reference=lab2)
+
+
+def _match_pert_ctrl(pert_obs, ctrl_obs, feat_cols, block_cols, seed):
+    """1:1-match perturbed cells to control cells WITHIN batch on QC features. Prefers scmetrics
+    (_match_controls); else an inline optimal-assignment matcher. Returns (pert_pos, ctrl_pos)
+    positions within pert_obs / ctrl_obs of the matched pairs (or None)."""
+    feat = [c for c in feat_cols if c in pert_obs.columns and c in ctrl_obs.columns]
+    if not feat:
+        return None
+    grp = tuple(c for c in block_cols if c in pert_obs.columns and c in ctrl_obs.columns)
+    pmap = {str(n): i for i, n in enumerate(pert_obs.index.astype(str))}
+    cmap = {str(n): i for i, n in enumerate(ctrl_obs.index.astype(str))}
+    try:
+        from scmetrics.matchers import _match_controls
+        mp, mc, _ = _match_controls(pert_obs, ctrl_obs, feature_cols=tuple(feat), group_cols=grp or None)
+        pp = np.array([pmap[str(n)] for n in mp], int)
+        cp = np.array([cmap[str(n)] for n in mc], int)
+        return (pp, cp) if pp.size else None
+    except Exception as e:  # noqa: BLE001
+        log.warning("scmetrics matcher unavailable (%s); using inline matcher", e)
+    from scipy.optimize import linear_sum_assignment
+    pf = np.log1p(np.clip(pert_obs[feat].to_numpy(float), 0, None))
+    cf = np.log1p(np.clip(ctrl_obs[feat].to_numpy(float), 0, None))
+    if grp:
+        pb = pert_obs[list(grp)].astype(str).agg("|".join, axis=1).to_numpy()
+        cb = ctrl_obs[list(grp)].astype(str).agg("|".join, axis=1).to_numpy()
+    else:
+        pb = np.zeros(len(pert_obs), dtype=int).astype(str)
+        cb = np.zeros(len(ctrl_obs), dtype=int).astype(str)
+    pp, cp = [], []
+    for b in sorted(set(pb.tolist())):
+        pi, ci = np.where(pb == b)[0], np.where(cb == b)[0]
+        if pi.size == 0 or ci.size == 0:
+            continue
+        pooled = np.vstack([pf[pi], cf[ci]])
+        mu, sd = pooled.mean(0), pooled.std(0)
+        sd[sd < 1e-8] = 1.0
+        cost = (((pf[pi] - mu) / sd)[:, None, :] - ((cf[ci] - mu) / sd)[None, :, :]) ** 2
+        r, c = linear_sum_assignment(cost.sum(-1))
+        pp.extend(pi[r].tolist())
+        cp.extend(ci[c].tolist())
+    return (np.array(pp, int), np.array(cp, int)) if pp else None
+
+
+# Reproducibility verdict tiers (Tests 1 & 4) — strong/moderate/low thresholds per metric.
+# (LFC ρ drives the verdict; Jaccard/direction are tiered too, from TEST_PLAN §Test 4 "Expected Behaviour".)
+REPRO_PASS, REPRO_WARN = 0.6, 0.3
+# metric key -> (display name, strong threshold, moderate threshold). value > strong = strong (PASS),
+# >= moderate = moderate (WARN), else low (FAIL). "strong→PASS / moderate→WARN / low→FAIL".
+REPRO_METRIC_TIERS = {
+    "lfc_spearman":        ("split-half LFC Spearman ρ", 0.6, 0.3),
+    "sig_jaccard":         ("DEG-set Jaccard",           0.3, 0.1),
+    "direction_agreement": ("direction agreement",       0.7, 0.6),
+}
+TIER_TO_VERDICT = {"strong": "PASS", "moderate": "WARN", "low": "FAIL", "n/a": "SKIP"}
+REPRO_LEGEND = (f"LFC ρ (verdict driver): >{REPRO_PASS} strong/PASS, {REPRO_WARN}–{REPRO_PASS} "
+                f"moderate/WARN, <{REPRO_WARN} low/FAIL. DEG Jaccard: >0.3 strong, 0.1–0.3 moderate, "
+                "<0.1 low. Direction agreement: >0.7 strong, 0.6–0.7 moderate, ≈0.5 low. Low = the two "
+                "half-signatures disagree, so downstream metrics cannot be trusted above this ceiling.")
+
+
+def repro_tier(value: float, strong: float, moderate: float) -> str:
+    if value is None or not np.isfinite(value):
+        return "n/a"
+    if value > strong:
+        return "strong"
+    if value >= moderate:
+        return "moderate"
+    return "low"
+
+
+def metric_tier(metric_key: str, value: float) -> str:
+    """Tier label (strong/moderate/low) for a reproducibility metric using REPRO_METRIC_TIERS."""
+    if metric_key not in REPRO_METRIC_TIERS:
+        return "n/a"
+    _, strong, moderate = REPRO_METRIC_TIERS[metric_key]
+    return repro_tier(value, strong, moderate)
+
+
+def verdict_reproducibility(rho: float) -> str:
+    return TIER_TO_VERDICT[repro_tier(rho, REPRO_PASS, REPRO_WARN)]
+
+
+def verdict_test_4(m: dict, cfg: dict) -> tuple[str, str, list]:
+    """Test 4 verdict harmonized with Test 1's reproducibility tiers (was a lenient ρ≥0.2 PASS)."""
+    rho = m.get("median_lfc_spearman", float("nan"))
+    jac = m.get("median_jaccard", float("nan"))
+    dirn = m.get("median_direction", float("nan"))
+    verdict = verdict_reproducibility(rho)
+    tr, tj, td = (metric_tier("lfc_spearman", rho), metric_tier("sig_jaccard", jac),
+                  metric_tier("direction_agreement", dirn))
+    reason = (f"{verdict}: same-sgRNA reproducibility ceiling — median LFC ρ={fmt(rho)} ({tr}), "
+              f"Jaccard={fmt(jac)} ({tj}), direction={fmt(dirn)} ({td})")
+    flags = ["tiers — " + REPRO_LEGEND]
+    if verdict == "FAIL":
+        flags.append(f"LOW REPRODUCIBILITY (median LFC ρ={fmt(rho)} < {REPRO_WARN}) — empirical ceiling "
+                     "is low; downstream cross-model/condition metrics are bounded by this.")
+    return verdict, reason, flags
+
+
+def test_1(adata, cfg, outdir):
+    """Test 1 — within-condition REPRODUCIBILITY (NOT a uniformity null; that is Test 2).
+
+    For each perturbation, split its cells into A and B (batch-stratified) and run two independent
+    perturbation-vs-control DEs (DE_A, DE_B) — each carries the REAL perturbation signal (not uniform).
+    The test asks whether the two half-signatures AGREE: DE_A ≈ DE_B. Two scenarios for control assignment:
+      • no_match (1.a): controls split into two halves; DE_A = A vs ctrl_half_A, DE_B = B vs ctrl_half_B
+        (cell-eval pdex, NO 1:1 matching) — each DE uses half of the total control cells.
+      • matched (2.a): 1:1-match perturbed cells to controls within batch (scmetrics); split the matched
+        perturb–control PAIRS into A/B; DE_A = A_pert vs A_matched_ctrl, DE_B = B_pert vs B_matched_ctrl.
+
+    Reproducibility = median over perturbations of Spearman(LFC_A, LFC_B) (+ DEG Jaccard, direction).
+    Verdict tiers (on median ρ): PASS > 0.6, WARN 0.3–0.6, FAIL < 0.3. Verdict from the matched
+    scenario; both scenarios reported side by side (does 1:1 batch matching improve reproducibility?)."""
+    pc, mcg = cfg["pert_col"], cfg["min_cells_per_group"]
+    ctrl_lab = cfg["control_pert"]
+    perts = perts_in_use(adata, cfg)
+    labels = adata.obs[pc].astype(str).to_numpy()
+    pos_C_all = np.where(labels == ctrl_lab)[0]
+    ctrl_obs_all = adata.obs.iloc[pos_C_all]
+    feat_cols = [c for c in ("total_counts", "n_genes_by_counts") if c in adata.obs.columns]
+    nperm = int(cfg.get("test1_n_resamples", min(3, cfg["n_resamples"])))
+
+    def scenario(mode):
+        repro_rows, null_rows, pooled, skipped = [], [], [], 0
+        for pi_, pert in enumerate(perts):
+            pos_P = np.where(labels == pert)[0]
+            if pos_P.size < 2 * mcg:
+                skipped += 1
+                continue
+            pert_obs = adata.obs.iloc[pos_P]
+            for r in range(nperm):
+                seed = cfg["seed"] + 1000 + pi_ * 17 + r
+                if mode == "matched":
+                    mm = _match_pert_ctrl(pert_obs, ctrl_obs_all, feat_cols, cfg["block_cols"], seed)
+                    if mm is None:
+                        continue
+                    pp, cp = mm
+                    arm = stratified_split(pert_obs.iloc[pp], cfg["block_cols"], seed + 1)
+                    ai, bi = np.where(arm == "A")[0], np.where(arm == "B")[0]
+                    if ai.size < mcg or bi.size < mcg:
+                        continue
+                    A_pert, A_ctrl = pos_P[pp[ai]], pos_C_all[cp[ai]]
+                    B_pert, B_ctrl = pos_P[pp[bi]], pos_C_all[cp[bi]]
+                else:
+                    arm = stratified_split(pert_obs, cfg["block_cols"], seed)
+                    ai, bi = np.where(arm == "A")[0], np.where(arm == "B")[0]
+                    carm = stratified_split(ctrl_obs_all, cfg["block_cols"], seed + 7)
+                    cai, cbi = np.where(carm == "A")[0], np.where(carm == "B")[0]
+                    if min(ai.size, bi.size, cai.size, cbi.size) < mcg:
+                        continue
+                    A_pert, B_pert = pos_P[ai], pos_P[bi]
+                    A_ctrl, B_ctrl = pos_C_all[cai], pos_C_all[cbi]
+                try:
+                    de_A = _de_two(adata, A_pert, A_ctrl, cfg, "pert", "ctrl")
+                    de_B = _de_two(adata, B_pert, B_ctrl, cfg, "pert", "ctrl")
+                    de_AB = _de_two(adata, A_pert, B_pert, cfg, "A", "B")  # difference-is-null
+                except Exception as e:  # noqa: BLE001
+                    log.warning("test1 %s %s rep%d: %s", mode, pert, r, e)
+                    continue
+                rep = compare_signatures(de_A, de_B, cfg)
+                if rep:
+                    rep["condition"] = pert
+                    repro_rows.append(rep)
+                nm = null_metrics(de_AB, cfg)
+                nm["condition"] = pert
+                null_rows.append(nm)
+                pooled.append(de_AB["p_value"].to_numpy().astype(float))
+        if not repro_rows:
+            return None
+        rdf = pl.DataFrame(repro_rows)
+        rdf.write_csv(os.path.join(outdir, "tables", f"test_1__reproducibility_{mode}.csv"))
+        ndf = pl.DataFrame(null_rows) if null_rows else None
+        if ndf is not None:
+            ndf.write_csv(os.path.join(outdir, "tables", f"test_1__difference_null_{mode}.csv"))
+        rhos = rdf["lfc_spearman"].to_numpy().astype(float)
+        rhos = rhos[np.isfinite(rhos)]
+        return {
+            "repro_lfc_spearman": float(np.median(rhos)) if rhos.size else float("nan"),
+            "repro_jaccard": float(rdf["sig_jaccard"].median()),
+            "repro_direction": float(rdf["direction_agreement"].median()),
+            "n_strong_rho_gt0.6": int((rhos > REPRO_PASS).sum()),
+            "n_moderate_rho_0.3_0.6": int(((rhos >= REPRO_WARN) & (rhos <= REPRO_PASS)).sum()),
+            "n_low_rho_lt0.3": int((rhos < REPRO_WARN).sum()),
+            # secondary: difference-is-null (A_pert vs B_pert — same perturbation, should be ≈null)
+            "diffnull_lambda_gc": float(ndf["lambda_gc"].mean()) if ndf is not None else float("nan"),
+            "diffnull_frac_sig": float(ndf["frac_sig"].mean()) if ndf is not None else float("nan"),
+            "diffnull_ks_p_uniform": float(ndf["ks_p_uniform"].mean()) if ndf is not None else float("nan"),
+            "n_conditions": int(rdf["condition"].n_unique()), "skipped": skipped,
+            "_rhos": rhos,
+            "_pooled_p": np.concatenate(pooled) if pooled else np.array([]),
+        }
+
+    out = {}
+    for mode in ("matched", "no_match"):
+        if mode == "matched" and not feat_cols:
+            continue
+        ag = scenario(mode)
+        if ag is not None:
+            out[mode] = ag
+    if not out:
+        return TestResult("test_1", "Within-Condition Reproducibility", "SKIP",
+                          flags=["no condition had enough cells for an A/B split"],
+                          reason="SKIP: insufficient cells")
+    primary = "matched" if "matched" in out else "no_match"
+    a = out[primary]
+    # plot: (left) per-perturbation reproducibility ρ distribution; (right) difference-is-null QQ
+    # (A_pert vs B_pert, primary scenario) with the exact Beta(i,G-i+1) 95% envelope.
+    png = os.path.join(outdir, "plots", "test_1_reproducibility.png")
+    fig, (axl, axr) = plt.subplots(1, 2, figsize=(9.6, 4.0))
+    for mode, col in (("no_match", "#b22222"), ("matched", "#1a3c6e")):
+        if mode in out:
+            axl.hist(out[mode]["_rhos"], bins=20, range=(-1, 1), alpha=0.55, color=col,
+                     label=f"{mode} (median ρ={fmt(out[mode]['repro_lfc_spearman'])})")
+    for thr in (REPRO_WARN, REPRO_PASS):
+        axl.axvline(thr, ls="--", color="0.5", lw=1)
+    axl.set_xlabel("split-half Spearman LFC ρ (per perturbation)")
+    axl.set_ylabel("perturbations")
+    axl.set_title("Reproducibility: DE_A vs DE_B (dashed=tier cutoffs 0.3/0.6)", fontsize=8.5)
+    axl.legend(fontsize=7)
+    p = np.sort(a["_pooled_p"][np.isfinite(a["_pooled_p"])])
+    if p.size >= 8:
+        p = np.clip(p, 1e-300, 1.0)
+        G = p.size
+        i = np.arange(1, G + 1)
+        exp = -np.log10((i - 0.5) / G)
+        obs = -np.log10(p)
+        lo = -np.log10(stats.beta.ppf(0.975, i, G - i + 1))
+        hi = -np.log10(stats.beta.ppf(0.025, i, G - i + 1))
+        if G > 3000:
+            k = np.unique(np.linspace(0, G - 1, 3000).astype(int))
+            exp, obs, lo, hi = exp[k], obs[k], lo[k], hi[k]
+        axr.fill_between(exp, lo, hi, color="0.85")
+        m = max(exp.max(), obs.max())
+        axr.plot([0, m], [0, m], "r--", lw=1)
+        axr.scatter(exp, obs, s=5, color="#1a3c6e")
+        axr.set_title(f"Difference-is-null QQ: A_pert vs B_pert ({primary})\nλ_GC={fmt(a['diffnull_lambda_gc'])}", fontsize=8.5)
+    else:
+        axr.set_title("Difference-is-null QQ (insufficient genes)", fontsize=8.5)
+    axr.set_xlabel("expected -log10(p)")
+    axr.set_ylabel("observed -log10(p)")
+    fig.suptitle("Test 1 — within-condition reproducibility + difference-is-null", fontsize=11)
+    fig.tight_layout(); fig.savefig(png, dpi=110); plt.close(fig)
+
+    verdict = verdict_reproducibility(a["repro_lfc_spearman"])
+    tier = {"PASS": "strong", "WARN": "moderate", "FAIL": "low", "SKIP": "n/a"}[verdict]
+    flags = []
+    if "matched" in out and "no_match" in out:
+        flags.append(f"median split-half LFC ρ — matched (batch-controlled)={fmt(out['matched']['repro_lfc_spearman'])} "
+                     f"vs no-match={fmt(out['no_match']['repro_lfc_spearman'])} "
+                     f"(Δ={fmt(out['matched']['repro_lfc_spearman'] - out['no_match']['repro_lfc_spearman'])})")
+    flags.append(f"per-perturbation reproducibility tiers (matched): "
+                 f"{a['n_strong_rho_gt0.6']} strong / {a['n_moderate_rho_0.3_0.6']} moderate / "
+                 f"{a['n_low_rho_lt0.3']} low (of {a['n_conditions']})")
+    flags.append("thresholds — " + REPRO_LEGEND)
+    flags.append(f"secondary difference-is-null (A_pert vs B_pert, same perturbation ⇒ should be ≈null): "
+                 f"λ_GC={fmt(a['diffnull_lambda_gc'])}, frac_sig={fmt(a['diffnull_frac_sig'])}, "
+                 f"ks_p_uniform={fmt(a['diffnull_ks_p_uniform'])}")
+    metrics = {"scenario_primary": primary}
+    for mode, ag in out.items():
+        for k, v in ag.items():
+            if not k.startswith("_"):
+                metrics[f"{mode}__{k}"] = v
+    reason = (f"{verdict} [{primary}]: median split-half LFC ρ={fmt(a['repro_lfc_spearman'])} ({tier} "
+              f"reproducibility; PASS>{REPRO_PASS}/WARN≥{REPRO_WARN}/FAIL<{REPRO_WARN}); "
+              f"Jaccard={fmt(a['repro_jaccard'])}, direction={fmt(a['repro_direction'])}; "
+              f"(2°) difference-is-null λ_GC={fmt(a['diffnull_lambda_gc'])}, frac_sig={fmt(a['diffnull_frac_sig'])}")
+    return TestResult("test_1", "Within-Condition Reproducibility", verdict, metrics=metrics,
+                      flags=flags, pvalues={}, plot="plots/test_1_reproducibility.png", reason=reason)
+
+
+def test_2(adata, cfg, outdir):
+    """Control-control split null. Both arms are control cells (same population ⇒ a true global null),
+    split into A/B by a **stratified** random split balanced within `block_cols` (batch). A calibrated
+    pipeline should produce Uniform[0,1] p-values (λ_GC≈1, frac_sig≈α). (No 1:1 control–control
+    'matching' mode: with a single population a stratified split already balances batch/depth, so
+    matching controls-to-controls is uninformative — that batch-controlled design belongs to Test 1,
+    where two *different* populations are compared.)"""
+    pc, mcg = cfg["pert_col"], cfg["min_cells_per_group"]
+    ctrl = adata[adata.obs[pc].astype(str) == cfg["control_pert"]]
+    if ctrl.n_obs < 2 * mcg:
+        return TestResult("test_2", "Control-Control Split Null", "SKIP", flags=["too few control cells"],
+                          reason="SKIP: too few control cells")
+    rows, pooled = [], []
+    for r in range(cfg["n_resamples"]):
+        s = ctrl.copy()
+        s.obs["_arm"] = stratified_split(ctrl.obs, cfg["block_cols"], cfg["seed"] + 100 + r)
+        try:
+            de = run_de(s, cfg, groupby="_arm", reference="B")
+        except Exception as e:  # noqa: BLE001
+            log.warning("test2 rep%d: %s", r, e)
+            continue
+        m = null_metrics(de, cfg)
+        m["rep"] = r
+        rows.append(m)
+        pooled.append(de["p_value"].to_numpy().astype(float))
+    if not rows:
+        return TestResult("test_2", "Control-Control Split Null", "SKIP", flags=["no valid control split"],
+                          reason="SKIP: no valid control split")
+    df = pl.DataFrame(rows)
+    df.write_csv(os.path.join(outdir, "tables", "test_2__per_split.csv"))
+    agg = {k: float(df[k].mean()) for k in ("frac_sig", "mean_lfc", "mean_abs_lfc", "lambda_gc", "ks_p_uniform")}
+    agg["lambda_gc_sd"] = float(df["lambda_gc"].std()) if df.height > 1 else 0.0
+    qq_plot(np.concatenate(pooled), os.path.join(outdir, "plots", "test_2_qq.png"),
+            "Test 2 — control-control null (stratified split)")
+    verdict, flags = verdict_from_null(agg, cfg)
+    if np.isfinite(agg["lambda_gc_sd"]) and agg["lambda_gc_sd"] > 0.05:
+        flags.append(f"split-to-split SD(λ_GC)={fmt(agg['lambda_gc_sd'])} > 0.05 (residual confounding?)")
+        if verdict == "PASS":
+            verdict = "WARN"
+    reason = _null_reason(verdict, agg)
+    return TestResult("test_2", "Control-Control Split Null", verdict, metrics=agg, flags=flags,
+                      pvalues={"ks_p_uniform_mean": agg["ks_p_uniform"], "lambda_gc": agg["lambda_gc"]},
+                      plot="plots/test_2_qq.png", reason=reason)
+
+
+def _null_reason(verdict, agg):
+    lam, frac, ksp = agg.get("lambda_gc"), agg.get("frac_sig"), agg.get("ks_p_uniform")
+    if verdict == "PASS":
+        return f"PASS: well-calibrated (λ_GC={fmt(lam)}, frac_sig={fmt(frac)}, p-values ~Uniform)"
+    if verdict == "FAIL":
+        return f"FAIL: anti-conservative (λ_GC={fmt(lam)}, frac_sig={fmt(frac)})"
+    # WARN
+    if np.isfinite(lam) and lam < 0.9:
+        return (f"WARN: deflated/under-powered null (λ_GC={fmt(lam)}<0.9, ks_p_uniform={fmt(ksp)}); "
+                "no false positives but p-values are not calibrated")
+    if np.isfinite(ksp) and ksp < 0.05:
+        return f"WARN: p-values not Uniform[0,1] (ks_p_uniform={fmt(ksp)}); frac_sig={fmt(frac)}"
+    return f"WARN: mild inflation (λ_GC={fmt(lam)}, frac_sig={fmt(frac)})"
+
+
+def _signal_metric(de: pl.DataFrame, cfg: dict) -> float:
+    lfc = de["log2_fold_change"].to_numpy().astype(float)
+    fdr = de["fdr"].to_numpy().astype(float)
+    sig = _sig_mask(lfc, fdr, cfg)
+    tgt = de["target"].to_numpy().astype(str)
+    fr = []
+    for t in np.unique(tgt):
+        msk = tgt == t
+        fr.append(sig[msk].sum() / max(msk.sum(), 1))
+    return float(np.mean(fr)) if fr else float("nan")
+
+
+def test_3(adata, cfg, outdir, de_true=None):
+    pc = cfg["pert_col"]
+    perts = perts_in_use(adata, cfg)
+    keep = adata[adata.obs[pc].astype(str).isin(perts + [cfg["control_pert"]])].copy()
+    if de_true is None:
+        de_true = run_de(keep, cfg, groupby=pc, reference=cfg["control_pert"])
+    true_metric = _signal_metric(de_true, cfg)
+    rng = np.random.default_rng(cfg["seed"] + 3)
+    blocks = [c for c in cfg["block_cols"] if c in keep.obs.columns]
+    perm_metrics = []
+    labels0 = keep.obs[pc].astype(str).to_numpy()
+    is_ctrl = labels0 == cfg["control_pert"]
+    for r in range(cfg["n_resamples"]):
+        lab = labels0.copy()
+        if blocks:
+            grp = keep.obs.groupby(blocks, observed=True, sort=False).indices.values()
+        else:
+            grp = [np.arange(len(lab))]
+        for idx in grp:
+            idx = np.asarray(idx, dtype=int)
+            nc = idx[~is_ctrl[idx]]
+            if nc.size > 1:
+                perm = nc.copy()
+                rng.shuffle(perm)
+                lab[nc] = lab[perm]
+        s = keep.copy()
+        s.obs["_perm"] = lab
+        try:
+            de_p = run_de(s, cfg, groupby="_perm", reference=cfg["control_pert"])
+            perm_metrics.append(_signal_metric(de_p, cfg))
+        except Exception as e:  # noqa: BLE001
+            log.warning("test3 perm%d: %s", r, e)
+    if len(perm_metrics) < 2:
+        return TestResult("test_3", "Label Permutation Null", "SKIP", flags=["not enough permutations"],
+                          reason="SKIP: <2 permutations succeeded"), de_true
+    pm = np.array(perm_metrics, dtype=float)
+    sep = (true_metric - pm.mean()) / pm.std(ddof=1) if pm.std(ddof=1) > 0 else float("inf")
+    perm_p = float((pm >= true_metric).mean())
+    pl.DataFrame({"perm_signal": pm}).write_csv(os.path.join(outdir, "tables", "test_3__permutations.csv"))
+    if not np.isfinite(sep):
+        verdict = "PASS" if true_metric > pm.max() else "WARN"
+    elif sep > 2:
+        verdict = "PASS"
+    elif sep > 1:
+        verdict = "WARN"
+    else:
+        verdict = "FAIL"
+    reason = (f"{verdict}: true signal {fmt(true_metric)} vs shuffled {fmt(float(pm.mean()))} "
+              f"(separation z={fmt(float(sep))}, perm_p={fmt(perm_p)})")
+    return TestResult("test_3", "Label Permutation Null", verdict,
+                      metrics={"true_signal": true_metric, "perm_mean": float(pm.mean()),
+                               "perm_sd": float(pm.std(ddof=1)), "separation_z": float(sep)},
+                      flags=[], pvalues={"perm_p": perm_p, "separation_z": float(sep)}, reason=reason), de_true
+
+
+def test_4(adata, cfg, outdir):
+    pc, sg, mcg = cfg["pert_col"], cfg.get("sgrna_col"), cfg["min_cells_per_group"]
+    if not sg:
+        return TestResult("test_4", "Same-sgRNA Split Reproducibility", "SKIP", flags=["no sgrna_col"],
+                          reason="SKIP: no sgrna_col")
+    perts = perts_in_use(adata, cfg)
+    tg = adata.obs[pc].astype(str)
+    guides = sorted(adata.obs[sg].astype(str)[tg.isin(perts)].unique())
+    rows = []
+    for guide in guides:
+        gmask = (adata.obs[sg].astype(str) == guide).to_numpy()
+        cmask = (tg == cfg["control_pert"]).to_numpy()
+        if gmask.sum() < 2 * mcg:
+            continue
+        gobs = adata.obs[gmask]
+        arm = stratified_split(gobs, cfg["block_cols"], cfg["seed"] + 4)
+        if (arm == "A").sum() < mcg or (arm == "B").sum() < mcg:
+            continue
+        des = {}
+        for a in ("A", "B"):
+            keepmask = cmask.copy()
+            sel = np.where(gmask)[0][arm == a]
+            keepmask[sel] = True
+            s = adata[keepmask].copy()
+            lab = np.where((s.obs[pc].astype(str) == cfg["control_pert"]).to_numpy(), cfg["control_pert"], guide)
+            s.obs["_g"] = lab
+            try:
+                des[a] = run_de(s, cfg, groupby="_g", reference=cfg["control_pert"])
+            except Exception as e:  # noqa: BLE001
+                log.warning("test4 %s arm%s: %s", guide, a, e)
+        if "A" in des and "B" in des:
+            cmp = compare_signatures(des["A"], des["B"], cfg)
+            if cmp:
+                cmp["guide"] = guide
+                rows.append(cmp)
+    if not rows:
+        return TestResult("test_4", "Same-sgRNA Split Reproducibility", "SKIP",
+                          flags=["no guide had enough cells for an A/B split"],
+                          reason="SKIP: no guide had ≥2×min_cells_per_group cells")
+    df = pl.DataFrame(rows)
+    df.write_csv(os.path.join(outdir, "tables", "test_4__per_guide.csv"))
+    metrics = {"n_guides": df.height, "median_lfc_spearman": float(df["lfc_spearman"].median()),
+               "median_jaccard": float(df["sig_jaccard"].median()),
+               "median_direction": float(df["direction_agreement"].median())}
+    verdict, reason, flags = verdict_test_4(metrics, cfg)  # harmonized tiers (same as Test 1)
+    return TestResult("test_4", "Same-sgRNA Split Reproducibility", verdict, metrics=metrics,
+                      flags=flags, reason=reason)
+
+
+def test_5(adata, cfg, outdir):
+    pc, sg, mcg = cfg["pert_col"], cfg.get("sgrna_col"), cfg["min_cells_per_group"]
+    if not sg:
+        return TestResult("test_5", "Same-Gene Independent sgRNA Reproducibility", "SKIP", flags=["no sgrna_col"],
+                          reason="SKIP: no sgrna_col")
+    perts = perts_in_use(adata, cfg)
+    tg = adata.obs[pc].astype(str)
+    sgv = adata.obs[sg].astype(str)
+    gene2guides = {}
+    for gene in perts:
+        gs = sorted(sgv[tg == gene].unique())
+        if len(gs) >= 2:
+            gene2guides[gene] = gs
+    if not gene2guides:
+        return TestResult("test_5", "Same-Gene Independent sgRNA Reproducibility", "SKIP",
+                          flags=["no gene with >=2 guides among selected conditions"],
+                          reason="SKIP: no gene has ≥2 guides")
+    allg = sorted({g for gs in gene2guides.values() for g in gs})
+    cmask = (tg == cfg["control_pert"]).to_numpy()
+    de_by_guide = {}
+    for guide in allg:
+        gmask = (sgv == guide).to_numpy()
+        if gmask.sum() < mcg:
+            continue
+        keepmask = cmask | gmask
+        s = adata[keepmask].copy()
+        lab = np.where((s.obs[pc].astype(str) == cfg["control_pert"]).to_numpy(), cfg["control_pert"], guide)
+        s.obs["_g"] = lab
+        try:
+            de_by_guide[guide] = run_de(s, cfg, groupby="_g", reference=cfg["control_pert"])
+        except Exception as e:  # noqa: BLE001
+            log.warning("test5 %s: %s", guide, e)
+    same, bg = [], []
+    for gene, gs in gene2guides.items():
+        gs = [g for g in gs if g in de_by_guide]
+        for i in range(len(gs)):
+            for j in range(i + 1, len(gs)):
+                c = compare_signatures(de_by_guide[gs[i]], de_by_guide[gs[j]], cfg)
+                if c:
+                    same.append(c["lfc_spearman"])
+    glist = list(de_by_guide)
+    rng = np.random.default_rng(cfg["seed"] + 5)
+    guide_gene = {g: gene for gene, gs in gene2guides.items() for g in gs}
+    tries = 0
+    while len(bg) < max(len(same), 3) and tries < 200 and len(glist) >= 2:
+        tries += 1
+        a, b = rng.choice(glist, size=2, replace=False)
+        if guide_gene.get(a) == guide_gene.get(b):
+            continue
+        c = compare_signatures(de_by_guide[a], de_by_guide[b], cfg)
+        if c:
+            bg.append(c["lfc_spearman"])
+    if not same or not bg:
+        return TestResult("test_5", "Same-Gene Independent sgRNA Reproducibility", "SKIP",
+                          flags=["insufficient same-gene or background pairs"],
+                          reason="SKIP: insufficient same-gene or background pairs")
+    same, bg = np.array(same), np.array(bg)
+    sep = (same.mean() - bg.mean()) / bg.std(ddof=1) if bg.std(ddof=1) > 0 else float("inf")
+    pl.DataFrame({"same_gene_rho": np.pad(same, (0, max(0, len(bg) - len(same))), constant_values=np.nan)[:len(bg)]
+                  if len(bg) >= len(same) else same}).write_csv(os.path.join(outdir, "tables", "test_5__pairs.csv"))
+    metrics = {"n_genes": len(gene2guides), "n_same_pairs": int(len(same)),
+               "same_gene_mean_rho": float(same.mean()), "background_mean_rho": float(bg.mean()),
+               "separation_z": float(sep)}
+    verdict, reason, flags = verdict_test_5(metrics, cfg)
+    return TestResult("test_5", "Same-Gene Independent sgRNA Reproducibility", verdict,
+                      metrics=metrics, flags=flags, pvalues={"separation_z": float(sep)}, reason=reason)
+
+
+def test_6(adata, cfg, outdir, de_true=None):
+    pc = cfg["pert_col"]
+    perts = perts_in_use(adata, cfg)
+    if de_true is None:
+        keep = adata[adata.obs[pc].astype(str).isin(perts + [cfg["control_pert"]])].copy()
+        de_true = run_de(keep, cfg, groupby=pc, reference=cfg["control_pert"])
+    genes_present = set(de_true["feature"].cast(str).unique().to_list())
+    rows = []
+    for pert in perts:
+        target = pert
+        if target not in genes_present:
+            continue
+        d = de_true.filter(pl.col("target").cast(str) == pert)
+        if d.height == 0:
+            continue
+        n = d.height
+        d = d.with_columns(
+            pl.col("p_value").rank("ordinal").alias("rk_p"),
+            pl.col("log2_fold_change").abs().rank("ordinal", descending=True).alias("rk_lfc"),
+        )
+        row = d.filter(pl.col("feature").cast(str) == target)
+        if row.height == 0:
+            continue
+        rr = row.row(0, named=True)
+        rows.append({
+            "condition": pert, "target_gene": target,
+            "lfc_target": float(rr["log2_fold_change"]), "padj_target": float(rr["fdr"]),
+            "pval_rank": float(rr["rk_p"]) / n, "lfc_rank": float(rr["rk_lfc"]) / n,
+            "detected": bool(rr["fdr"] <= cfg["fdr_threshold"]),
+            "correct_direction": bool(rr["log2_fold_change"] < 0),
+        })
+    if not rows:
+        return TestResult("test_6", "Target Gene Knockdown Recovery", "SKIP", flags=["no target genes found"],
+                          reason="SKIP: no target genes found in var_names"), de_true
+    df = pl.DataFrame(rows)
+    df.write_csv(os.path.join(outdir, "tables", "test_6__per_target.csv"))
+    rec = float(df["detected"].mean())
+    dirr = float(df["correct_direction"].mean())
+    if rec > 0.5 and dirr > 0.8:
+        verdict = "PASS"
+    elif rec < 0.2 or dirr < 0.6:
+        verdict = "FAIL"
+    else:
+        verdict = "WARN"
+    reason = (f"{verdict}: recovery_rate={fmt(rec)}, direction_rate={fmt(dirr)} over {df.height} target "
+              "genes (one DE per perturbation/gene, not per guide; also reflects assay/guide quality, "
+              "not the metric alone)")
+    return TestResult("test_6", "Target Gene Knockdown Recovery", verdict,
+                      metrics={"n_targets": df.height, "recovery_rate": rec, "direction_rate": dirr,
+                               "median_pval_rank": float(df["pval_rank"].median()),
+                               "median_lfc_rank": float(df["lfc_rank"].median())},
+                      flags=[], pvalues={"median_padj_target": float(df["padj_target"].median())},
+                      reason=reason), de_true
+
+
+# --------------------------------------------------------------------------- #
+# plain-language docs + glossary
+# --------------------------------------------------------------------------- #
+TEST_DOC = {
+    "test_0": "Spike a known log2 fold-change into a known fraction of genes in a control-vs-control "
+              "split, then measure how many injected genes we recover (TPR) and how many untouched "
+              "genes are wrongly called (FPR) across effect sizes. This separates a genuinely "
+              "calibrated null from a pipeline that simply finds nothing, and tells you the smallest "
+              "effect the metric can resolve.",
+    "test_1": "REPRODUCIBILITY. Split each perturbation's cells into halves A and B and run each vs "
+              "control (DE_A, DE_B) — both carry the real perturbation signal. The question is whether "
+              "the two independent half-signatures AGREE (DE_A ≈ DE_B): median split-half Spearman LFC "
+              "ρ (PASS>0.6 strong / 0.3–0.6 moderate / <0.3 low). Run under two control-assignment "
+              "scenarios — no_match (split control halves) vs matched (1:1 batch-matched controls) — to "
+              "see whether batch matching improves reproducibility. (Secondary sanity check: the direct "
+              "A_pert-vs-B_pert contrast, same perturbation, should be ≈null.)",
+    "test_2": "CALIBRATION / NULL. Split only control cells into A and B (a stratified random split "
+              "balanced within batch; same population ⇒ true null) and run DE between them: a calibrated "
+              "pipeline should produce Uniform[0,1] p-values (λ_GC≈1, frac_sig≈α). Inflation (λ_GC>1) = "
+              "false positives; deflation (λ_GC<1) = under-powered (cell-level pseudoreplication).",
+    "test_3": "Shuffle the perturbation labels (within batch) and recompute. Real biological signal "
+              "should sit far outside the shuffled distribution (high separation z); if not, the "
+              "metric cannot tell signal from noise.",
+    "test_4": "Split each guide's cells in two and compare each half vs control. Agreement between "
+              "the halves is the reproducibility ceiling — no model can score higher on a perturbation "
+              "than the data agrees with itself.",
+    "test_5": "Do two different guides for the same gene agree more than two unrelated guides? Note "
+              "that guides for the same gene often differ in knockdown efficacy, so only modest "
+              "concordance is expected; a low score with few guide pairs is power-limited, not proof "
+              "of off-target activity.",
+    "test_6": "Is the targeted gene itself knocked down (negative LFC, significant)? Computed per target "
+              "gene (one DE per perturbation, pooling that gene's guides — not per individual guide). "
+              "High recovery is reassuring, but it partly reflects assay and guide quality, not the "
+              "metric alone.",
+    "composition": "Do perturbations shift cell-type / cluster / cell-cycle proportions vs control? "
+                   "Such shifts make cross-population DE read composition change as expression change. "
+                   "Requires a cell-state annotation in obs.",
+}
+
+# Per-test tier thresholds, rendered inline in each test's result section.
+TIER_DOC = {
+    "test_0": "**Tiers** — null FPR (δ=0): ≤ α PASS · > 2α FAIL (anti-conservative). max TPR across δ: "
+              "> 0.5 = resolves effects · < 0.5 WARN (under-powered). FPR-by-class at high δ: ≈ null "
+              "FPR = clean · ≫ null FPR = compositional coupling (worst in HighlyExpr/AnchorCorr, "
+              "spares LowlyExpr).",
+    "test_1": "**Tiers** (per metric, strong/moderate/low) — LFC Spearman ρ (verdict driver): > 0.6 "
+              "PASS · 0.3–0.6 WARN · < 0.3 FAIL. DEG Jaccard: > 0.3 · 0.1–0.3 · < 0.1. Direction "
+              "agreement: > 0.7 · 0.6–0.7 · ≈ 0.5. Low ρ = the two half-signatures disagree → ceiling "
+              "for downstream metrics. (Secondary difference-is-null should be ≈null: λ_GC≈1, p uniform.)",
+    "test_2": "**Tiers** — λ_GC: ≈ 1 calibrated · 1.05–1.10 or < 0.9 WARN · > 1.10 FAIL (anti-"
+              "conservative). frac_sig: ≈ α good · ≫ α FAIL. ks_p_uniform: > 0.05 good · < 0.05 WARN "
+              "(p-values not Uniform[0,1]). Arms are a stratified control-control split (true null).",
+    "test_3": "**Tiers** — separation z (true signal vs permuted null): > 2 PASS · 1–2 WARN · ≤ 1 FAIL "
+              "(metric cannot tell signal from noise).",
+    "test_4": "**Tiers** (same as Test 1) — LFC Spearman ρ: > 0.6 strong/PASS · 0.3–0.6 moderate/WARN · "
+              "< 0.3 low/FAIL. DEG Jaccard: > 0.3 · 0.1–0.3 · < 0.1. Direction: > 0.7 · 0.6–0.7 · ≈ 0.5. "
+              "This is the empirical reproducibility ceiling for downstream metrics.",
+    "test_5": "**Tiers** — separation (same-gene vs background guide agreement): > 1.5 PASS · 1.0–1.5 "
+              "WARN · < 1.0 FAIL. With < ~5 guide pairs the result is power-limited ⇒ WARN (cannot "
+              "conclude), never FAIL.",
+    "test_6": "**Tiers** — recovery_rate (targets detected as DE): > 0.5 PASS · 0.2–0.5 WARN · < 0.2 "
+              "FAIL. direction_rate (knocked down in expected direction): > 0.8 PASS · 0.6–0.8 WARN · "
+              "< 0.6 FAIL. (Also reflects assay/guide quality, not the metric alone.)",
+    "composition": "**Tiers** — per-perturbation total-variation distance (TVD) of cell-state "
+                   "proportions vs control: > 0.10 ⇒ flagged (its DE may be partly compositional). "
+                   "SKIP when no cell-state column exists.",
+}
+
+GLOSSARY = [
+    ("unit of analysis", "Whether each *cell* (pdex/Wilcoxon) or each *replicate/sample* (pseudobulk "
+     "DESeq2) is one observation. Cell-level tests treat correlated cells from one sample as "
+     f"independent (pseudoreplication), distorting null p-values — see {SQUAIR}."),
+    ("arm", "One side of the two-group split that DE compares (clinical-trial term: reference arm vs "
+     "treatment arm). In the null/injection tests both arms are drawn from the same cells; arm B is "
+     "the pretend-perturbation (and receives the injected effect in Test 0), arm A is the reference, "
+     "and DE is run B vs A."),
+    ("stratified split (block_cols)", "Cells are divided into arms separately within each level of "
+     "block_cols (e.g. each batch) and then pooled, so both arms have the same batch composition. "
+     "This prevents technical structure (batch effects) from masquerading as signal; it is why the "
+     "per-arm counts are slightly uneven (odd-sized batches can't halve exactly)."),
+    ("λ_GC (genomic inflation)", "Median observed χ² statistic / its null median. ≈1 well-calibrated; "
+     ">1 inflated (false positives); <1 deflated (conservative, under-powered)."),
+    ("ks_p_uniform", "KS-test p-value that the per-gene p-values are Uniform[0,1] as a true null "
+     "requires. Small (<0.05) ⇒ the p-value distribution is mis-shaped."),
+    ("frac_sig", "Fraction of genes called significant (FDR≤threshold AND |LFC|≥threshold). Under a "
+     "true null this is the empirical false-positive rate; it should be ≈α."),
+    ("mean_abs_lfc", "Mean |log2 fold-change| across genes — magnitude inflation under the null."),
+    ("TPR / FPR (Test 0)", "Of injected genes, the fraction recovered (true-positive rate); of "
+     "untouched genes, the fraction wrongly called (false-positive rate)."),
+    ("max_TPR / min resolvable δ (Test 0)", "max_TPR = the highest TPR across the injected δ tiers — "
+     "the sensitivity ceiling (best-case recovery of true effects). min resolvable δ = the smallest "
+     "injected log2FC that reaches TPR ≥ 0.5, i.e. the smallest real effect the metric reliably "
+     "detects. A max_TPR well below 1 means even strong real effects are partly missed (false negatives)."),
+    ("separation z (Tests 3,5)", "(observed − null mean) / null SD. >2 means the true signal is clearly "
+     "outside the permuted/background null."),
+    ("LFC Spearman ρ / Jaccard (Tests 1, 4)", "Rank correlation of fold-changes / overlap of "
+     "significant gene sets between two split halves — the empirical reproducibility ceiling."),
+]
+
+
+# --------------------------------------------------------------------------- #
+# report
+# --------------------------------------------------------------------------- #
+def global_verdict(results):
+    gates = {r.name: r.verdict for r in results if r.name in ("test_0", "test_1", "test_2", "test_3")}
+    if any(v == "FAIL" for v in gates.values()):
+        return "FAIL"
+    if any(v == "WARN" for v in gates.values()):
+        return "WARN"
+    return "PASS"
+
+
+def global_reason(results):
+    """One-line summary enumerating EVERY distinct gate failure mode (so the headline matches the body)."""
+    by = {r.name: r for r in results}
+    modes = []
+    t0 = by.get("test_0")
+    if t0 and t0.verdict in ("WARN", "FAIL"):
+        if any("compositional coupling" in f for f in t0.flags):
+            modes.append("effect-driven FPR inflation (compositional coupling under strong/broad perturbation)")
+        if t0.metrics.get("max_TPR", 1) < 0.5:
+            modes.append("under-powered effect detection")
+        if t0.metrics.get("null_FPR", 0) > 0.1:
+            modes.append("anti-conservative null")
+    for n in ("test_1", "test_2"):
+        r = by.get(n)
+        if r and r.verdict in ("WARN", "FAIL"):
+            lam = r.metrics.get("lambda_gc", float("nan"))
+            if np.isfinite(lam) and lam < 0.9:
+                modes.append(f"deflated/under-powered cell-level null ({n}: λ_GC={fmt(lam)})")
+            elif np.isfinite(lam) and lam > 1.05:
+                modes.append(f"inflated null ({n}: λ_GC={fmt(lam)})")
+            else:
+                modes.append(f"non-uniform null p-values ({n})")
+    t3 = by.get("test_3")
+    if t3 and t3.verdict in ("WARN", "FAIL"):
+        modes.append(f"weak signal/permutation separation ({fmt(t3.metrics.get('separation_z'))})")
+    # de-duplicate while preserving order
+    seen, uniq = set(), []
+    for m in modes:
+        if m not in seen:
+            seen.add(m); uniq.append(m)
+    return "; ".join(uniq) if uniq else "all validity gates clean"
+
+
+VERDICT_EMOJI = {"PASS": "✅", "WARN": "⚠️", "FAIL": "❌", "SKIP": "⏭️"}
+
+
+def _unit_of_analysis(cfg):
+    if cfg["de_method"] == "pdex":
+        return ("individual cell (Wilcoxon rank-sum)",
+                "Each cell is one observation, so cells from the same sample/batch are treated as "
+                f"independent — **pseudoreplication** ({SQUAIR}). Expect the null-split tests to be "
+                "deflated/under-powered and p-values non-uniform even when there are no false "
+                "positives. For calibrated significance on raw counts, prefer the pseudobulk "
+                "`pydeseq2` backend; here pdex output is best read as a *ranking*, not calibrated FDR.")
+    if cfg["de_method"] == "pydeseq2":
+        return ("pseudobulk replicate / sample (DESeq2 Wald)",
+                "Counts are aggregated to replicate-level pseudobulk samples before testing, which "
+                "respects the true unit of replication and avoids pseudoreplication.")
+    return (cfg["de_method"], "")
+
+
+def write_report(results, cfg, power, fp, outdir):
+    gv = global_verdict(results)
+    scale = "full (all conditions)" if not cfg.get("max_conditions") else f"max_conditions={cfg['max_conditions']}"
+    unit, unit_caveat = _unit_of_analysis(cfg)
+    by = {r.name: r for r in results}
+    L = [f"# Robustness report — {os.path.basename(os.path.abspath(outdir))}", ""]
+
+    # ---- global verdict (top, with one-line reason) ----
+    L += [f"## Global verdict: {VERDICT_EMOJI.get(gv,'')} **{gv}**", "",
+          "Validity gates (Tests 0–3) must hold before the sensitivity diagnostics (Tests 4–6) are "
+          "interpretable.", ""]
+    gate_lines = [f"- {VERDICT_EMOJI.get(by[n].verdict,'')} **{by[n].name}** — {by[n].reason}"
+                  for n in ("test_0", "test_1", "test_2", "test_3") if n in by]
+    L += gate_lines + [""]
+    greason = global_reason(results)
+    if gv == "FAIL":
+        L += [f"> ❌ A validity gate FAILED — **do not interpret the biology** until the pipeline is fixed. "
+              f"Failure mode(s): {greason}.", ""]
+    elif gv == "WARN":
+        L += [f"> ⚠️ Validity gates WARNed — results are usable but **read the caveats first**. Distinct "
+              f"issues found: {greason}. With a cell-level test, treat pdex output as a **gene ranking, "
+              "not calibrated FDR**.", ""]
+
+    # ---- dataset & experimental context (FIRST, per reviewer) ----
+    L += ["## 1. Dataset & experimental context", ""]
+    L += [f"- **file**: `{cfg['adata_path']}`",
+          f"- **size**: {fp['n_cells']:,} cells × {fp['n_genes']:,} genes; layers={fp['layers'] or 'none'}",
+          f"- **perturbations**: {fp['n_perturbations']} + control `{fp['control_label']}` "
+          f"({fp['n_control_cells']:,} control cells)",
+          f"- **cells per perturbation**: min {fp['cells_per_pert_min']}, median {fp['cells_per_pert_median']}, "
+          f"max {fp['cells_per_pert_max']}",
+          f"- **guides**: {fp['n_guides']} total; **{fp['genes_with_ge2_guides']} gene(s) have ≥2 guides** "
+          "(limits Test 5)",
+          f"- **obs columns**: " + ", ".join(f"`{c}`(n={n})" for c, n in fp["obs_columns"].items()),
+          f"- **.X**: raw-integer={fp['X_raw_integer']}, min/max/mean="
+          f"{fmt(fp['X_min'])}/{fmt(fp['X_max'])}/{fmt(fp['X_mean'])}", ""]
+    # explicit "what context is missing" so the reviewer doesn't have to guess
+    missing = []
+    if not fp["has_celltype_col"]:
+        missing.append("cell type / cluster")
+    if not fp["has_cellcycle_col"]:
+        missing.append("cell-cycle phase")
+    for want in ("donor", "patient", "sex", "tissue", "timepoint"):
+        if not any(want in c.lower() for c in fp["obs_columns"]):
+            missing.append(want)
+    L += [f"- **structural covariates present**: {fp['present_covariate_like_cols'] or 'only the columns above'}",
+          f"- **NOT available in this dataset** (assumed absent, interpret accordingly): "
+          f"{', '.join(missing) if missing else 'none'}", ""]
+
+    # ---- how DE was run (method + unit of analysis + correction state) ----
+    L += ["## 2. How DE was computed", "",
+          f"- **DE backend**: `{cfg['de_method']}`",
+          f"- **unit of analysis**: **{unit}**",
+          f"- **covariate correction of .X**: **{cfg.get('covariate_correction','none')}** "
+          "(this run evaluates the metric on this state of the data)",
+          f"- **input scaling**: normalize_if_raw={cfg.get('normalize_if_raw')}, allow_discrete="
+          f"{cfg['allow_discrete']} (pdex is_log1p={not cfg['allow_discrete']})",
+          f"- **stratification / blocking**: {cfg.get('block_cols')}",
+          f"- **scale**: {scale}, n_resamples={cfg['n_resamples']}, seed={cfg['seed']}", ""]
+    if unit_caveat:
+        L += [f"> **Unit-of-analysis caveat.** {unit_caveat}", ""]
+    L += ["> **Correction note.** Many groups regress out batch / cell-cycle before DE. An ideal "
+          "perturbation metric is insensitive to this, but real ones are not — evaluate on **both "
+          "corrected and uncorrected** data. This run is "
+          f"**{cfg.get('covariate_correction','none')}**; set `covariate_correction` and re-run to "
+          "compare.", ""]
+
+    # ---- at-a-glance summary ----
+    L += ["## 3. At-a-glance", "",
+          "**What each test is for** (validity gates 0–3 must hold before the sensitivity diagnostics "
+          "4–6 are interpretable):", "",
+          "| test | role | the question it answers |", "|---|---|---|",
+          "| test_0 | gate — calibration + power | Inject a known effect: what false-positive rate at "
+          "the null, and what effect size can the metric resolve (TPR vs δ)? |",
+          "| test_1 | **reproducibility** | Split a perturbation in half vs control — do the two "
+          "half-signatures agree (DE_A≈DE_B)? Is it improved by 1:1 batch-matched controls? |",
+          "| test_2 | gate — null calibration | Split control cells into A/B (stratified, true null) — "
+          "are the p-values Uniform[0,1] (λ_GC≈1, frac_sig≈α)? |",
+          "| test_3 | gate — signal vs noise | Shuffle perturbation labels — is real signal far outside "
+          "the permuted null (separation z)? |",
+          "| test_4 | sensitivity — ceiling | Same-guide split reproducibility — the empirical ceiling "
+          "for any downstream metric. |",
+          "| test_5 | sensitivity | Do independent guides for the same gene agree more than unrelated "
+          "guides? (power-limited with few guides) |",
+          "| test_6 | sensitivity | Is the targeted gene itself knocked down in the right direction? "
+          "(also reflects assay/guide quality) |",
+          "| composition | confounder | Do perturbations shift cell-state proportions vs control? "
+          "(needs a cell-type column) |", "",
+          "| test | verdict | what it tells you (local reason) |", "|---|---|---|"]
+    for r in results:
+        L.append(f"| **{r.name}** — {r.title} | {VERDICT_EMOJI.get(r.verdict,'')} {r.verdict} | {r.reason} |")
+    L.append("")
+    if cfg.get("emit_multiqc"):
+        L += ["_This verdict table is also exported as a **MultiQC** custom-content file "
+              "(`multiqc/cell_eval_robustness_mqc.txt`) — run `multiqc .` in this folder to render an "
+              "interactive HTML report that integrates with downstream single-cell pipelines._", ""]
+
+    # ---- per-test detail ----
+    L += ["## 4. Per-test detail", ""]
+    for r in results:
+        L.append(f"### {r.name} — {r.title}  {VERDICT_EMOJI.get(r.verdict,'')} {r.verdict}")
+        L.append("")
+        if r.name in TEST_DOC:
+            L.append(f"*What this tests.* {TEST_DOC[r.name]}")
+            L.append("")
+        if r.name in TIER_DOC:
+            L.append(TIER_DOC[r.name])
+            L.append("")
+        if r.name == "test_0" and r.verdict != "SKIP" and r.metrics:
+            m = r.metrics
+            n_inj = m.get("n_injected_genes")
+            frac = m.get("frac_genes_injected")
+            n_expr = m.get("n_expressed_genes") or (round(n_inj / frac) if (n_inj and frac) else None)
+            n_tot = m.get("n_total_genes") or fp.get("n_genes")
+            cpa = m.get("cells_per_arm")
+            cused = m.get("control_cells_used") or (2 * cpa if cpa else None)
+            deltas = cfg.get("injection_deltas")
+            nctrl = fp.get("n_control_cells")
+            pct = f"{100*frac:.0f}%" if isinstance(frac, (int, float)) else "?"
+            cap = cfg.get("injection_max_cells_per_arm")
+            n_lo, n_mid, n_hi = m.get("n_injected_low_expr"), m.get("n_injected_mid_expr"), m.get("n_injected_high_expr")
+            L.append(
+                "*Injection design (ground truth).* An **arm** is one side of the two-group split that "
+                "differential expression compares (term borrowed from clinical trials: a reference arm "
+                "vs a treatment arm). Here **both arms are control cells** (so they are truly identical) "
+                "— **arm A** is the reference and **arm B** is the pretend-perturbation that receives the "
+                "injected effect; DE is run as *B vs A*.")
+            L.append("")
+            L.append(
+                f"From the **{nctrl:,} `{cfg.get('control_pert')}` control cells**, "
+                f"{('a random ~' + format(cused, ',') + ' were subsampled and ') if cused else ''}"
+                f"split into the two arms of **~{cpa:,} cells each**, stratified within "
+                f"`{cfg.get('block_cols')}` (the per-arm count is capped at "
+                f"`injection_max_cells_per_arm`={cap} for speed/memory — DE is re-run for every δ tier — "
+                "and is slightly under the cap because the split halves each batch with integer "
+                "rounding; raise the cap to use more of the available control cells). "
+                f"**{n_inj:,} genes ({pct} of the {n_expr:,} expressed genes; {n_tot:,} genes total)** "
+                "were chosen as the *injected* (**anchor**) set, **stratified across the expression "
+                "(detection) spectrum** — equal shares from the low / mid / high mean-expression tertiles "
+                f"(**{n_lo} low · {n_mid} mid · {n_hi} high**) — because detectability is dominated by "
+                "expression level, so this makes the TPR-vs-δ curve readable *per tier* (the smallest "
+                "resolvable δ for sparse vs typical vs abundant genes) rather than an artifact of the mix. "
+                "In arm B their "
+                f"{'raw counts were multiplied' if not cfg.get('normalize_if_raw') else 'expression was scaled'} "
+                f"by 2^δ for each effect size **δ ∈ {deltas}** (log2 fold-change; δ=0 = untouched null). "
+                f"The other {(n_expr - n_inj):,} expressed genes are the *untouched* set used to measure "
+                "the false-positive rate. TPR is recovery of the injected/anchor set (reported per "
+                "expression tier); FPR is false calls among the untouched set (reported per gene class).")
+            L.append("")
+            L.append(
+                "*Gene-class FPR breakdown.* The untouched-gene FPR is broken down into gene classes — "
+                "**AnchorCorr** (genes most correlated with the injected anchors — the easiest/upper-bound "
+                "case and the one most exposed to compositional coupling), **HighlyExpr** (abundant, high "
+                "signal), **LowlyExpr** (sparse, zero-dominated, hard), **HouseKeeping** (constitutive — "
+                "should be predictable; watch for memorization), **Marker** (cell-type identity genes — "
+                "the biologically interesting case; N/A without a cell-type annotation), **HighlyVarG** "
+                "(high-variance complement to the anchors), and **Random** (unbiased baseline). All class "
+                "memberships are computed **deterministically over all control cells** (a fixed function "
+                "of the h5ad), independent of the DE cell subsample.")
+            L.append("")
+        L.append(f"**Verdict reason:** {r.reason}")
+        L.append("")
+        # Test 1: scenario comparison (no_match vs matched) × two statistics — render as a clean table
+        if r.name == "test_1" and any(k.startswith(("no_match__", "matched__")) for k in r.metrics):
+            m = r.metrics
+            present = [mode for mode in ("no_match", "matched") if f"{mode}__repro_lfc_spearman" in m]
+            L.append("**What this compares.** Split each perturbation's cells into two halves A and B "
+                     "and run each half against control (`DE_A`, `DE_B`). The **primary** question is "
+                     "*reproducibility* — do the two independent half-signatures agree (`DE_A ≈ DE_B`)? "
+                     "— under two control-assignment scenarios: **no_match** (1.a — controls split into "
+                     "two halves, cell-eval pdex, no 1:1 matching) vs **matched** (2.a — perturbed cells "
+                     "1:1 batch-matched to controls, then split into perturb–control pairs). The "
+                     "comparison answers: *does 1:1 batch matching improve reproducibility?* A "
+                     "**secondary** difference-is-null stat (direct `A_pert vs B_pert`, the same "
+                     "perturbation ⇒ should be ≈null) is reported as a sanity check.")
+            L.append("")
+            L.append("| statistic | " + " | ".join(present) + " |")
+            L.append("|---|" + "|".join("---" for _ in present) + "|")
+            rowdefs = [
+                ("**reproducibility** — median Spearman LFC ρ (PRIMARY)", "repro_lfc_spearman"),
+                ("reproducibility — median DEG Jaccard", "repro_jaccard"),
+                ("reproducibility — median direction agreement", "repro_direction"),
+                ("# perturbations strong (ρ>0.6)", "n_strong_rho_gt0.6"),
+                ("# moderate (0.3–0.6)", "n_moderate_rho_0.3_0.6"),
+                ("# low (<0.3)", "n_low_rho_lt0.3"),
+                ("(2°) difference-is-null λ_GC", "diffnull_lambda_gc"),
+                ("(2°) difference-is-null frac_sig", "diffnull_frac_sig"),
+                ("(2°) difference-is-null ks_p_uniform", "diffnull_ks_p_uniform"),
+                ("# perturbations tested", "n_conditions"),
+            ]
+            tier_key = {"repro_lfc_spearman": "lfc_spearman", "repro_jaccard": "sig_jaccard",
+                        "repro_direction": "direction_agreement"}
+            for lbl, key in rowdefs:
+                cells = []
+                for mode in present:
+                    v = m.get(f"{mode}__{key}")
+                    if key in tier_key and isinstance(v, (int, float)):
+                        cells.append(f"{fmt(v)} ({metric_tier(tier_key[key], v)})")
+                    else:
+                        cells.append(fmt(v))
+                L.append(f"| {lbl} | " + " | ".join(cells) + " |")
+            L.append("")
+            L.append(f"_Tiers (strong/moderate/low) per metric: {REPRO_LEGEND} The matched "
+                     "(batch-controlled) scenario's LFC ρ drives the verdict. difference-is-null: A and "
+                     "B are the same perturbation, so a calibrated pipeline calls ≈α (λ_GC≈1, p uniform)._")
+            L.append("")
+        elif r.metrics:
+            L.append("| metric | value |")
+            L.append("|---|---|")
+            for k, v in r.metrics.items():
+                L.append(f"| `{k}` | {fmt(v)} |")
+            L.append("")
+        # Test 0: show the full δ-by-δ calibration curve inline (the λ_GC blow-up is the headline number)
+        if r.name == "test_0":
+            ccsv = os.path.join(outdir, "tables", "test_0__calibration_curve.csv")
+            if os.path.exists(ccsv):
+                cdf = pl.read_csv(ccsv)
+                L.append("Calibration curve (injected δ in log2FC; δ=0 is the null FPR baseline):")
+                L.append("")
+                L.append("| δ (log2FC) | TPR (injected) | FPR (untouched) | median obs LFC | λ_GC |")
+                L.append("|---|---|---|---|---|")
+                for row in cdf.iter_rows(named=True):
+                    L.append(f"| {fmt(row['delta_log2fc'])} | {fmt(row['TPR'])} | {fmt(row['FPR'])} | "
+                             f"{fmt(row['median_observed_lfc_injected'])} | {fmt(row['lambda_gc'])} |")
+                L.append("")
+                L.append("_FPR and λ_GC climb steeply as δ grows — the compositional-coupling artifact "
+                         "(false DE in untouched genes from library-size renormalization under strong, "
+                         "widespread injected effects)._")
+                L.append("")
+                # per-gene-class FPR (untouched genes) by δ
+                grp_cols = [(c, f"FPR_{c}") for c in ("AnchorCorr", "HighlyExpr", "LowlyExpr",
+                            "HouseKeeping", "Marker", "HighlyVarG", "Random")
+                            if f"FPR_{c}" in cdf.columns]
+                if grp_cols:
+                    L.append("FPR by gene class (false calls among **untouched** genes; anchors = injected):")
+                    L.append("")
+                    L.append("| δ (log2FC) | " + " | ".join(c for c, _ in grp_cols) + " |")
+                    L.append("|---|" + "|".join("---" for _ in grp_cols) + "|")
+                    for rr in cdf.iter_rows(named=True):
+                        L.append(f"| {fmt(rr['delta_log2fc'])} | "
+                                 + " | ".join(fmt(rr[col]) for _, col in grp_cols) + " |")
+                    L.append("")
+                    L.append("_Compare classes: AnchorCorr/HighlyExpr/HighlyVarG should inflate first under "
+                             "coupling; LowlyExpr stays low (zero-dominated); Random is the baseline; "
+                             "HouseKeeping flags memorization; Marker is N/A without cell-type labels._")
+                    L.append("")
+                tpr_cols = [(f"{t} expr", f"TPR_{t}expr") for t in ("high", "mid", "low")
+                            if f"TPR_{t}expr" in cdf.columns]
+                if tpr_cols:
+                    L.append("TPR by **injected-gene expression tier** (recovery of the anchors; detection "
+                             "power is dominated by expression level):")
+                    L.append("")
+                    L.append("| δ (log2FC) | " + " | ".join(c for c, _ in tpr_cols) + " |")
+                    L.append("|---|" + "|".join("---" for _ in tpr_cols) + "|")
+                    for rr in cdf.iter_rows(named=True):
+                        L.append(f"| {fmt(rr['delta_log2fc'])} | "
+                                 + " | ".join(fmt(rr[col]) for _, col in tpr_cols) + " |")
+                    L.append("")
+                    mtr = {t: m.get(f"min_resolvable_delta_{t}expr") for t in ("high", "mid", "low")}
+                    L.append(f"_min resolvable δ (TPR≥0.5): high-expr={fmt(mtr['high'])}, "
+                             f"mid={fmt(mtr['mid'])}, low={fmt(mtr['low'])}. Abundant genes are easiest "
+                             "to recover; sparse (low-expr) genes are the conservative floor — the real "
+                             "limit on what the metric can resolve._")
+                    L.append("")
+        if r.pvalues:
+            L.append("**Verification p-values:** " + ", ".join(f"`{k}`={fmt(v)}" for k, v in r.pvalues.items()))
+            L.append("")
+        if r.flags:
+            for f in r.flags:
+                L.append(f"- ⚠️ {f}")
+            L.append("")
+        if r.plot:
+            L.append(f"![{r.name}]({r.plot})")
+            L.append("")
+        L.append(f"_Full per-gene/per-split numbers: `tables/{r.name}__*.csv`_")
+        L.append("")
+
+
+    # ---- thresholds ----
+    L += ["## 5. Verification parameters & thresholds", "",
+          "| parameter | value | source |", "|---|---|---|",
+          f"| de_method / unit | {cfg['de_method']} / {unit} | config |",
+          f"| covariate_correction | {cfg.get('covariate_correction','none')} | config |",
+          f"| fdr_threshold | {cfg['fdr_threshold']} | config |",
+          f"| lfc_threshold | {cfg['lfc_threshold']} | config |",
+          f"| lambda_gc_warn / fail | {cfg['lambda_gc_warn']} / {cfg['lambda_gc_fail']} | TEST_PLAN.md |",
+          "| λ_GC deflation WARN / ks_p_uniform WARN | < 0.90 / < 0.05 | skill notes |",
+          f"| injection δ tiers (log2FC) | {cfg['injection_deltas']} | config |",
+          f"| injection fraction of genes | {cfg['injection_frac_genes']} | config |",
+          f"| n_resamples / min_cells_per_group / seed | {cfg['n_resamples']} / "
+          f"{cfg['min_cells_per_group']} / {cfg['seed']} | config |",
+          f"| max_conditions / block_cols | {cfg.get('max_conditions')} / {cfg.get('block_cols')} | config |",
+          "| test-0 null FPR FAIL | > 2×α | skill notes |",
+          "| test-3 separation PASS / WARN | > 2 / 1–2 | TEST_PLAN.md |",
+          "| test-4 LOW-REPRODUCIBILITY flag | median LFC ρ < 0.2 | TEST_PLAN.md |",
+          "| test-5 separation PASS / WARN | > 1.5 / 1.0–1.5 | TEST_PLAN.md |",
+          "| test-6 recovery / direction PASS | > 0.5 / > 0.8 | TEST_PLAN.md |", ""]
+
+    # ---- glossary ----
+    L += ["## 6. Glossary", ""]
+    for term, definition in GLOSSARY:
+        L.append(f"- **{term}** — {definition}")
+    L.append("")
+
+    # ---- limitations / next steps ----
+    L += ["## 7. Known limitations & recommended next steps", "",
+          "- **Single dataset / modality.** Metric behaviour is partly experiment-dependent; validate "
+          "on ≥2 datasets/modalities (e.g. a CRISPRi Perturb-seq screen and a chemical/Tahoe-style "
+          "screen) before trusting thresholds.",
+          "- **Cell-level unit of analysis.** With pdex, null p-values are not calibrated (see §2). "
+          "Re-run with `de_method: pydeseq2` for a pseudobulk comparison.",
+          "- **Composition not assessed** when no cell-state column is present (see the Composition "
+          "test). Proliferation/differentiation shifts can masquerade as expression change.",
+          "- **Corrected vs uncorrected.** Evaluate the metric on both; this run is "
+          f"`{cfg.get('covariate_correction','none')}`.",
+          "- Gene-set / pathway enrichment metrics are intentionally **not** included: enrichment is "
+          "unsolved (databases disagree; many effects need multi-gene perturbations) and would be a "
+          "noisy gate.", ""]
+
+    # ---- appendix: full test plan (LAST) ----
+    L += ["## Appendix — embedded TEST_PLAN.md", ""]
+    plan = os.path.join(outdir, "TEST_PLAN.md")
+    if os.path.exists(plan):
+        with open(plan) as fh:
+            for ln in fh.read().splitlines():
+                L.append(("#" + ln) if ln.startswith("#") else ln)
+    md = "\n".join(L)
+    with open(os.path.join(outdir, "robustness_report.md"), "w") as fh:
+        fh.write(md)
+    return md
+
+
+def write_summary(results, cfg, power, fp, outdir):
+    summary = {"config": cfg, "global_verdict": global_verdict(results), "power": power,
+               "fingerprint": fp,
+               "tests": [asdict(r) for r in results]}
+    with open(os.path.join(outdir, "robustness_summary.json"), "w") as fh:
+        json.dump(summary, fh, indent=2, default=str)
+
+
+def write_multiqc(results, cfg, outdir):
+    """Emit a MultiQC custom-content table (experimental — github.com/MultiQC/MultiQC)."""
+    if not cfg.get("emit_multiqc"):
+        return
+    d = os.path.join(outdir, "multiqc")
+    os.makedirs(d, exist_ok=True)
+    header = [
+        "# id: 'cell_eval_robustness'",
+        "# section_name: 'cell-eval metric robustness'",
+        f"# description: 'DE backend {cfg['de_method']}; global verdict "
+        f"{global_verdict(results)}. Validity gates 0-3 must pass before sensitivity tests 4-6.'",
+        "# plot_type: 'table'",
+        "# pconfig:",
+        "#     namespace: 'cell-eval robustness'",
+        "test\tverdict\treason",
+    ]
+    lines = header + [f"{r.name} — {r.title}\t{r.verdict}\t{r.reason}" for r in results]
+    with open(os.path.join(d, "cell_eval_robustness_mqc.txt"), "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def render_pdf(md_path, pdf_path):
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import inch
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+        from reportlab.lib.utils import ImageReader
+        import re
+
+        base, bold = "Helvetica", "Helvetica-Bold"
+        try:
+            import matplotlib as mpl
+            fd = os.path.join(os.path.dirname(mpl.__file__), "mpl-data", "fonts", "ttf")
+            pdfmetrics.registerFont(TTFont("DejaVu", os.path.join(fd, "DejaVuSans.ttf")))
+            pdfmetrics.registerFont(TTFont("DejaVu-Bold", os.path.join(fd, "DejaVuSans-Bold.ttf")))
+            base, bold = "DejaVu", "DejaVu-Bold"
+        except Exception:
+            pass
+        ss = getSampleStyleSheet()
+        body = ParagraphStyle("b", parent=ss["BodyText"], fontName=base, fontSize=8.5, leading=11)
+        h1 = ParagraphStyle("h1", parent=ss["Title"], fontName=bold, fontSize=15)
+        h2 = ParagraphStyle("h2", parent=ss["Heading2"], fontName=bold, fontSize=11, textColor=colors.HexColor("#1a3c6e"))
+        h3 = ParagraphStyle("h3", parent=ss["Heading3"], fontName=bold, fontSize=9.5, textColor=colors.HexColor("#333333"))
+        cell = ParagraphStyle("cell", fontName=base, fontSize=7.3, leading=8.8)
+        cell_hdr = ParagraphStyle("cellh", fontName=bold, fontSize=7.5, leading=9, textColor=colors.white)
+        USABLE = 7.1 * inch
+
+        def inline(s: str) -> str:
+            s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
+            s = re.sub(r"`(.+?)`", r"<font face='Courier'>\1</font>", s)
+            return s
+
+        def split_row(line: str):
+            return [c.strip() for c in line.strip().strip("|").split("|")]
+
+        def is_sep(line: str) -> bool:
+            s = line.strip()
+            return s.startswith("|") and bool(re.fullmatch(r"[|:\-\s]+", s)) and "-" in s
+
+        def make_table(header, rows):
+            ncol = len(header)
+            rows = [r + [""] * (ncol - len(r)) if len(r) < ncol else r[:ncol] for r in rows]
+            plain = lambda c: re.sub(r"[*`]", "", c)
+            maxlens = [max(1, len(plain(header[j])), *(len(plain(r[j])) for r in rows)) for j in range(ncol)]
+            tot = sum(maxlens)
+            widths = [max(0.42 * inch, USABLE * ml / tot) for ml in maxlens]
+            sc = USABLE / sum(widths)
+            widths = [w * sc for w in widths]
+            data = [[Paragraph(inline(c), cell_hdr) for c in header]]
+            data += [[Paragraph(inline(c), cell) for c in r] for r in rows]
+            t = Table(data, colWidths=widths, repeatRows=1)
+            t.setStyle(TableStyle([
+                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#c7ced8")),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1a3c6e")),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#eef2f8")]),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4), ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 2.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
+            ]))
+            return t
+
+        md_dir = os.path.dirname(os.path.abspath(md_path))
+        lines = open(md_path).read().splitlines()
+        flow = []
+        i, n = 0, len(lines)
+        while i < n:
+            ln = lines[i]
+            stripped = ln.strip()
+            # markdown table block: a "| ... |" header followed by a |---| separator
+            if (stripped.startswith("|") and i + 1 < n and is_sep(lines[i + 1])
+                    and not is_sep(ln)):
+                header = split_row(ln)
+                j = i + 2
+                rows = []
+                while j < n and lines[j].strip().startswith("|") and not is_sep(lines[j]):
+                    rows.append(split_row(lines[j]))
+                    j += 1
+                flow.append(Spacer(1, 3))
+                flow.append(make_table(header, rows))
+                flow.append(Spacer(1, 5))
+                i = j
+                continue
+            img = re.match(r"!\[.*?\]\((.+?)\)", stripped)
+            if img:
+                p = os.path.join(md_dir, img.group(1))
+                if os.path.exists(p):
+                    iw, ih = ImageReader(p).getSize()           # preserve aspect ratio
+                    scale = min(6.9 * inch / iw, 3.6 * inch / ih)
+                    flow += [Spacer(1, 4), Image(p, width=iw * scale, height=ih * scale), Spacer(1, 4)]
+            elif stripped.startswith("```"):
+                pass  # skip code-fence markers
+            elif ln.startswith("### "):
+                flow.append(Paragraph(inline(ln[4:]), h3))
+            elif ln.startswith("## "):
+                flow.append(Paragraph(inline(ln[3:]), h2))
+            elif ln.startswith("# "):
+                flow.append(Paragraph(inline(ln[2:]), h1))
+            elif stripped:
+                flow.append(Paragraph(inline(ln), body))
+            else:
+                flow.append(Spacer(1, 3))
+            i += 1
+        SimpleDocTemplate(pdf_path, pagesize=letter, topMargin=0.6 * inch, bottomMargin=0.6 * inch,
+                          leftMargin=0.7 * inch, rightMargin=0.7 * inch).build(flow)
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("PDF render failed: %s", e)
+        return False
+
+
+def _results_from_summary(summary):
+    return [TestResult(**t) for t in summary["tests"]]
+
+
+# --------------------------------------------------------------------------- #
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="config.yaml")
+    ap.add_argument("--report-only", action="store_true",
+                    help="Re-render report/PDF/MultiQC from cached robustness_summary.json (no DE recompute)")
+    args = ap.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    cfg = load_cfg(args.config)
+    seed_everything(int(cfg.get("seed", 0)))  # full determinism: same seed -> identical report
+    outdir = cfg["outdir"]
+    os.makedirs(os.path.join(outdir, "tables"), exist_ok=True)
+    os.makedirs(os.path.join(outdir, "plots"), exist_ok=True)
+
+    if args.report_only:
+        with open(os.path.join(outdir, "robustness_summary.json")) as fh:
+            summary = json.load(fh)
+        results = _results_from_summary(summary)
+        cfg = summary.get("config", cfg)
+        cfg.setdefault("n_resamples", cfg.get("n_permutations", 10))  # backward-compat for old summaries
+        power = summary.get("power", {})
+        fp = summary.get("fingerprint", {})
+        # Re-apply current verdict rules to cached metrics (no DE recompute) for tests whose verdict
+        # is a pure function of their metrics — keeps --report-only consistent with rule updates.
+        rederive = {"test_0": verdict_test_0, "test_4": verdict_test_4, "test_5": verdict_test_5}
+        for r in results:
+            if r.name in rederive and r.verdict != "SKIP" and r.metrics:
+                v, reason, flags = rederive[r.name](r.metrics, cfg)
+                r.verdict, r.reason, r.flags = v, reason, flags
+        # rewrite summary so cached verdicts stay in sync with the report
+        write_summary(results, cfg, power, fp, outdir)
+        write_report(results, cfg, power, fp, outdir)
+        write_multiqc(results, cfg, outdir)
+        ok = render_pdf(os.path.join(outdir, "robustness_report.md"), os.path.join(outdir, "report.pdf"))
+        print(f"[report-only] re-rendered report.md + {'report.pdf' if ok else '(PDF FAILED)'} in {os.path.abspath(outdir)}")
+        return 0
+
+    log.info("Loading %s", cfg["adata_path"])
+    adata = ad.read_h5ad(cfg["adata_path"])
+    log.info("Loaded %d cells x %d genes", adata.n_obs, adata.n_vars)
+
+    fp = fingerprint(adata, cfg)
+    with open(os.path.join(outdir, "inspect.txt"), "w") as fh:
+        fh.write(json.dumps(fp, indent=2, default=str))
+
+    want = set(cfg.get("tests") or
+               ["test_0", "test_1", "test_2", "test_3", "test_4", "test_5", "test_6", "composition"])
+    results = []
+    de_true = None
+
+    # Test 0 runs on RAW counts (before global normalization)
+    if "test_0" in want:
+        log.info("=== test_0 (injection) ===")
+        results.append(test_0_injection(adata, cfg, outdir))
+
+    # compute raw QC features (total_counts / n_genes_by_counts) BEFORE normalization, so Test 2's
+    # batch-matched control arms can pair cells on raw depth/complexity. Deterministic (no RNG).
+    if not {"total_counts", "n_genes_by_counts"}.issubset(adata.obs.columns):
+        try:
+            adata.var["mt"] = adata.var_names.str.upper().str.startswith("MT-")
+            sc.pp.calculate_qc_metrics(adata, qc_vars=["mt"], percent_top=None, log1p=False, inplace=True)
+            log.info("Computed raw QC metrics (total_counts, n_genes_by_counts) for Test-2 matching")
+        except Exception as e:  # noqa: BLE001
+            log.warning("QC metric computation failed (%s); Test 2 batch-matched mode will be skipped", e)
+
+    # pdex expects log-normalized input; match cell-eval run's normalize_total + log1p
+    maybe_normalize(adata, cfg)
+
+    if "composition" in want:
+        log.info("=== composition ==="); results.append(composition_diagnostic(adata, cfg, outdir))
+    if "test_1" in want:
+        log.info("=== test_1 ==="); results.append(test_1(adata, cfg, outdir))
+    if "test_2" in want:
+        log.info("=== test_2 ==="); results.append(test_2(adata, cfg, outdir))
+    if "test_3" in want:
+        log.info("=== test_3 ==="); r3, de_true = test_3(adata, cfg, outdir); results.append(r3)
+    if "test_4" in want:
+        log.info("=== test_4 ==="); results.append(test_4(adata, cfg, outdir))
+    if "test_5" in want:
+        log.info("=== test_5 ==="); results.append(test_5(adata, cfg, outdir))
+    if "test_6" in want:
+        log.info("=== test_6 ==="); r6, de_true = test_6(adata, cfg, outdir, de_true=de_true); results.append(r6)
+
+    # order results for the report: gates first (0-3), then sensitivity (4-6), then composition
+    order = {"test_0": 0, "test_1": 1, "test_2": 2, "test_3": 3, "test_4": 4, "test_5": 5,
+             "test_6": 6, "composition": 7}
+    results.sort(key=lambda r: order.get(r.name, 99))
+
+    power = {}  # power/sample-size calculation removed
+
+    write_summary(results, cfg, power, fp, outdir)
+    write_report(results, cfg, power, fp, outdir)
+    write_multiqc(results, cfg, outdir)
+    ok = render_pdf(os.path.join(outdir, "robustness_report.md"), os.path.join(outdir, "report.pdf"))
+    gv = global_verdict(results)
+    print("\n==== RESULTS ====")
+    for r in results:
+        print(f"  {r.name:11s} {r.verdict:5s} {r.title}")
+    print(f"  GLOBAL: {gv}")
+    print(f"  report.md + {'report.pdf' if ok else '(PDF FAILED)'} in {os.path.abspath(outdir)}")
+    return 1 if gv == "FAIL" else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
