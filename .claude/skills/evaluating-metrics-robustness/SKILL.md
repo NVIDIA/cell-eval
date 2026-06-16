@@ -104,7 +104,7 @@ specified there (formulas, expected behaviour, verdict rules):
 
 | TEST_PLAN.md test | role | how to run it |
 |---|---|---|
-| 0 — Controlled Effect-Size Injection | gate | on control cells: split A/B, spike known log2FC into a known fraction of genes in B at several δ tiers (incl. δ=0) → same DE → FPR-at-null + TPR-vs-δ curve; flag compositional coupling (FPR rising at large δ) |
+| 0 — Controlled Effect-Size Injection | gate | on control cells: split A/B, spike known log2FC into a **small number (~a dozen) of genes** in B at several δ tiers (incl. δ=0), pooled over several random draws → same DE → FPR-at-null + TPR-vs-δ curve. Injecting few genes (not a large fraction) is faithful to a real perturbation and avoids the library-size shift that artificially induces compositional coupling. (Legacy large-fraction stress: `injection_n_genes: null` + `injection_frac_genes`.) |
 | 1 — Within-Condition Direct Split Null | gate | per condition: `n_resamples` stratified A/B splits → `build_de_frame` A-vs-B → null metrics (`frac_sig`, `mean_lfc`, `mean_abs_lfc`, `ks_p_uniform`, `λ_GC`, QQ) |
 | 2 — Control-Control Split Null | gate | split control cells into pseudo-pert vs reference → same null metrics + check downstream cell-metrics collapse to chance |
 | 3 — Label Permutation Null | gate | true metrics vs `n_resamples` within-`block_cols` label shuffles → separation z-score / empirical p |
@@ -188,8 +188,9 @@ verdict reason, the rounded metric table, the verification p-values, flags, and 
   only HVG / only HEG / only LEG.
 - **Test 0 MUST also state its injection design in plain prose** so the section is self-describing:
   define **what an "arm" is** (one side of the two-group split; arm B receives the injected effect,
-  arm A is the reference, DE = B vs A), and give the concrete setup — **how many genes were injected**
-  (count + fraction + of how many *expressed* and *total* genes), **cells per arm** (and that this is
+  arm A is the reference, DE = B vs A), and give the concrete setup — **how many genes were injected
+  per draw** (a small number, ~a dozen) and **how many random draws were pooled** (and the total
+  injected-gene observations across low/mid/high expression tiers), **cells per arm** (and that this is
   capped by `injection_max_cells_per_arm` for speed/memory, so it's below the control-cell total and
   slightly uneven due to the stratified split), the **δ tiers**, and which population the cells came
   from. A reader must not have to ask "how many genes were injected?" or "what is an arm?".
@@ -291,8 +292,10 @@ Use **AskUserQuestion** to confirm — never assume:
    the report can label it. Also **`celltype_cols`** for the composition diagnostic (empty if none).
 7. **knobs**: `n_resamples` (TEST_PLAN.md default 10), `min_cells_per_group` (20),
    `fdr_threshold` (0.05), `lfc_threshold` (0.1), `seed`, `max_conditions` (cap for smoke runs), and
-   the **Test 0 injection** params (`injection_deltas` e.g. `[0,0.25,0.5,1,2]`, `injection_frac_genes`
-   e.g. `0.10`, `injection_max_cells_per_arm` e.g. `3000`).
+   the **Test 0 injection** params (`injection_deltas` e.g. `[0,0.25,0.5,1,2]`, `injection_n_genes`
+   e.g. `12` = realistic # of perturbed genes, `injection_n_repeats` e.g. `10` random draws pooled,
+   `injection_max_cells_per_arm` e.g. `3000`). Leave `injection_n_genes: null` and set
+   `injection_frac_genes` only for the legacy large-fraction coupling stress.
 
 Record the confirmed values — in Phase B (Step 3) they are frozen into **`$RUN_DIR/config.yaml`**
 with `outdir: .` so the experiment folder is portable.
@@ -319,7 +322,9 @@ seed: 0
 max_conditions: null          # null = all perturbations; set an int for a quick smoke run
 # Test 0 — effect-size injection / calibration curve
 injection_deltas: [0.0, 0.25, 0.5, 1.0, 2.0]   # log2FC tiers; 0.0 = null FPR baseline
-injection_frac_genes: 0.10
+injection_n_genes: 12          # realistic: ~a dozen genes per draw (NOT a large fraction)
+injection_n_repeats: 10        # pool TPR/FPR over this many random gene-draws for stable rates
+injection_frac_genes: null     # legacy large-fraction stress only (set n_genes: null to use)
 injection_max_cells_per_arm: 3000
 emit_multiqc: true            # also emit a MultiQC custom-content table
 outdir: .                     # outputs land in this experiment folder (portable)

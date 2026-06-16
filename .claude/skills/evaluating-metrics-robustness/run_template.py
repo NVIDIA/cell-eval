@@ -100,10 +100,11 @@ def load_cfg(path: str) -> dict:
     cfg.setdefault("covariate_correction", "none")        # what (if anything) was regressed out of .X
     cfg.setdefault("celltype_cols", [])                   # obs cols to use for composition control
     cfg.setdefault("injection_deltas", [0.0, 0.25, 0.5, 1.0, 2.0])
-    cfg.setdefault("injection_frac_genes", 0.10)
+    cfg.setdefault("injection_n_genes", 12)          # realistic: a perturbation moves ~a dozen genes
+    cfg.setdefault("injection_n_repeats", 10)        # pool TPR/FPR over this many random gene-draws
+    cfg.setdefault("injection_frac_genes", None)     # legacy large-fraction stress (used only if n_genes is null)
     cfg.setdefault("injection_max_cells_per_arm", 3000)
     cfg.setdefault("injection_n_hvg", 2000)          # # highly variable genes flagged for stratification
-    cfg.setdefault("injection_hvg_max_frac", 0.5)    # cap injected HVGs at this fraction of all HVGs
     cfg.setdefault("emit_multiqc", True)
     # `n_resamples` = # independent stratified-split repeats (Tests 0/1/2/4) or label permutations
     # (Test 3). Backward-compatible with the old name `n_permutations`.
@@ -438,7 +439,7 @@ def verdict_test_0(m: dict, cfg: dict) -> tuple[str, str, list]:
     fpr_hi = m.get("FPR_at_max_delta", float("nan"))
     delta_hi = m.get("max_delta_log2fc", float("nan"))
     min_delta = m.get("min_resolvable_delta_log2fc", float("nan"))
-    frac = m.get("frac_genes_injected", float("nan"))
+    regime = m.get("injection_regime", "")
     flags, verdict = [], "PASS"
     if np.isfinite(fpr_null) and fpr_null > 2 * cfg["fdr_threshold"]:
         verdict = "FAIL"
@@ -450,13 +451,13 @@ def verdict_test_0(m: dict, cfg: dict) -> tuple[str, str, list]:
     coupling = np.isfinite(fpr_hi) and np.isfinite(fpr_null) and fpr_hi > max(2 * cfg["fdr_threshold"], fpr_null + 0.05)
     if coupling:
         flags.append(
-            f"FPR rises to {fmt(fpr_hi)} at δ={delta_hi} (vs null {fmt(fpr_null)}) — strong perturbations "
+            f"FPR rises to {fmt(fpr_hi)} at δ={delta_hi} (vs null {fmt(fpr_null)}) — strong injected effects "
             "induce false DE in UNTOUCHED genes via library-size renormalization (compositional coupling). "
-            f"This is a worst-case stress (δ={delta_hi} log2FC injected into {fmt(frac)} of genes); the "
-            "effect scales with the fraction × magnitude of truly perturbed genes, so broad/strong "
-            "perturbations risk contaminating the REAL analysis with false hits. Test 6 shows strong real "
-            "knockdowns are present here, so this is a live risk: prefer median-of-ratios / pseudobulk "
-            "DESeq2 (or spike-in normalization) before interpreting non-target hits.")
+            f"Injection regime: {regime}. This artifact scales with the FRACTION × magnitude of perturbed "
+            "genes; it is a live risk only for broad/strong perturbations (a handful of perturbed genes "
+            "barely shifts the library size). Appearing in the realistic small-N regime would be notable — "
+            "prefer median-of-ratios / pseudobulk DESeq2 (or spike-in normalization) before interpreting "
+            "non-target hits.")
         if verdict == "PASS":
             verdict = "WARN"
     if np.isfinite(fpr_null) and fpr_null <= cfg["fdr_threshold"] and verdict == "PASS":
@@ -509,9 +510,12 @@ def verdict_test_5(m: dict, cfg: dict) -> tuple[str, str, list]:
 # TEST 0 — effect-size injection / calibration curve (NEW)
 # --------------------------------------------------------------------------- #
 def test_0_injection(adata_raw, cfg, outdir):
-    """Inject known log2FC into a known fraction of genes in a control-vs-control split; measure
-    FPR-at-null and TPR-vs-effect-size. Distinguishes 'null=null' from 'pipeline dead' and reports
-    the smallest effect the metric can resolve. Operates on RAW counts (before global normalization)."""
+    """Inject known log2FC into a SMALL number of genes (~a dozen, the scale of a real perturbation) in
+    a control-vs-control split, pooled over several random gene-draws; measure FPR-at-null and
+    TPR-vs-effect-size. Distinguishes 'null=null' from 'pipeline dead' and reports the smallest effect
+    the metric can resolve. Operates on RAW counts (before global normalization). Injecting a small
+    NUMBER (not a large fraction) avoids the library-size shift that artificially creates compositional
+    coupling, so it is faithful to how few genes a real perturbation actually moves."""
     pc, ctrl = cfg["pert_col"], cfg["control_pert"]
     mcg = cfg["min_cells_per_group"]
     cmask = (adata_raw.obs[pc].astype(str) == ctrl).to_numpy()
@@ -521,8 +525,8 @@ def test_0_injection(adata_raw, cfg, outdir):
                           flags=["too few control cells for an injection split"],
                           reason="SKIP: insufficient control cells")
     deltas = list(cfg.get("injection_deltas", [0.0, 0.25, 0.5, 1.0, 2.0]))
-    frac = float(cfg.get("injection_frac_genes", 0.10))
-    hvg_max_frac = float(cfg.get("injection_hvg_max_frac", 0.5))
+    n_genes_cfg = cfg.get("injection_n_genes", 12)    # REALISTIC: a real perturbation moves ~a dozen genes
+    frac_cfg = cfg.get("injection_frac_genes", None)  # legacy large-fraction stress (used only if n_genes is null)
     n_hvg = int(cfg.get("injection_n_hvg", 2000))
     G = ctrl_full.n_vars
     feats = np.asarray(ctrl_full.var_names)
@@ -547,66 +551,57 @@ def test_0_injection(adata_raw, cfg, outdir):
         log.warning("test0 HVG computation failed (%s); treating all genes as non-HVG", e)
         hvg_bool = np.zeros(G, dtype=bool)
 
-    # --- EXPRESSION-STRATIFIED injection selection (ANCHORS): equal share from low/mid/high mean-
-    #     expression tertiles. Detectability is dominated by expression level, so injecting evenly
-    #     across the detection spectrum makes the TPR-vs-δ curve interpretable PER tier (the smallest
-    #     resolvable δ for sparse vs typical vs abundant genes), instead of an artifact of the mix. ---
-    n_inj = max(1, int(frac * expressed.size))
-    rng_sel = np.random.default_rng(cfg["seed"] + 8)
+    # --- EXPRESSION tertiles (static): low = sparse/hard ... high = abundant/easy. Anchors are drawn
+    #     evenly across tiers so the TPR-vs-δ curve is interpretable PER tier (the smallest resolvable δ
+    #     for sparse vs typical vs abundant genes), instead of an artifact of the mix. ---
     ee = mean_expr[expressed]
     t33, t67 = float(np.quantile(ee, 1.0 / 3)), float(np.quantile(ee, 2.0 / 3))
-    EXPR_TIERS = ("low", "mid", "high")  # low = sparse/hard ... high = abundant/easy
+    EXPR_TIERS = ("low", "mid", "high")
     expr_tier_all = np.full(G, "none", dtype=object)
     expr_tier_all[expressed] = np.where(mean_expr[expressed] <= t33, "low",
                                         np.where(mean_expr[expressed] >= t67, "high", "mid"))
-    per = max(1, n_inj // 3)
-    inj_parts = []
-    for t in EXPR_TIERS:
-        pool = np.where(expr_tier_all == t)[0]
-        if pool.size:
-            inj_parts.append(rng_sel.choice(pool, size=min(per, pool.size), replace=False))
-    inj_idx = np.sort(np.concatenate(inj_parts).astype(int)) if inj_parts else np.array([], int)
-    inj_feats = set(feats[inj_idx].tolist())
-    inj_mask_all = np.zeros(G, dtype=bool)
-    inj_mask_all[inj_idx] = True
-    n_inj_tier = {t: int((expr_tier_all[inj_idx] == t).sum()) for t in EXPR_TIERS}
-    log.info("test0 injected (anchors) %d genes across expression tertiles: low=%d mid=%d high=%d",
-             inj_idx.size, n_inj_tier["low"], n_inj_tier["mid"], n_inj_tier["high"])
 
-    # --- |Pearson r| of every gene with the anchor signature, over ALL controls (sparse, exact) ---
-    s = np.asarray(Xn[:, inj_idx].mean(1)).ravel()             # per-cell mean of anchor genes (log-norm)
-    mean_g = mean_expr
+    # --- REALISM: inject a SMALL fixed NUMBER of genes (~a dozen, the scale of a real perturbation),
+    #     repeated over several independent random draws and POOLED, so the rates are stable while each
+    #     DE stays realistic. Compositional coupling (false DE in untouched genes via library-size
+    #     renormalization) only appears when a large FRACTION of genes is perturbed and the per-cell
+    #     total shifts; a dozen genes barely move it, so this is the faithful test. The legacy fraction
+    #     mode (set injection_n_genes: null + injection_frac_genes) is kept as a large-fraction stress. ---
+    if n_genes_cfg is not None:
+        n_inj = max(3, int(n_genes_cfg))
+        n_repeats = max(1, int(cfg.get("injection_n_repeats", 10)))
+        regime = f"{n_inj} genes × {n_repeats} draws (realistic small-perturbation regime)"
+    else:
+        n_inj = max(1, int(float(frac_cfg or 0.10) * expressed.size))
+        n_repeats = 1
+        regime = f"{n_inj} genes (= {float(frac_cfg or 0.10):.0%} of expressed; large-fraction stress)"
+
+    # --- per-gene moments reused for the per-draw anchor correlation ---
     sumsq_g = np.asarray(Xn.multiply(Xn).sum(0)).ravel()
-    var_g = np.clip(sumsq_g / n_c - mean_g ** 2, 0.0, None)
-    e_gs = np.asarray(Xn.T.dot(s)).ravel() / n_c
-    cov = e_gs - mean_g * s.mean()
-    anchor_corr = np.abs(cov / (np.sqrt(var_g) * s.std() + 1e-12))
-    del Xn
+    var_g = np.clip(sumsq_g / n_c - mean_expr ** 2, 0.0, None)
 
-    # --- gene-class group masks for the UNTOUCHED-gene FPR breakdown (anchors = injected genes) ---
+    # --- static FPR gene-class masks (draw-independent); AnchorCorr is added per-draw inside the loop ---
     expressed_mask = np.zeros(G, dtype=bool)
     expressed_mask[expressed] = True
     hk_mask = np.array([g in HOUSEKEEPING for g in feats])
     marker_set = set(cfg.get("injection_marker_genes", []) or [])
     marker_mask = np.array([g in marker_set for g in feats])
-    expr_e = mean_expr[expressed]
-    heg_hi, leg_lo = float(np.quantile(expr_e, 0.80)), float(np.quantile(expr_e, 0.20))
+    heg_hi, leg_lo = float(np.quantile(ee, 0.80)), float(np.quantile(ee, 0.20))
     rng_grp = np.random.default_rng(cfg["seed"] + 9)
     random_mask = np.zeros(G, dtype=bool)
     random_mask[rng_grp.choice(G, size=max(1, int(0.10 * G)), replace=False)] = True
-    GROUPS = {  # diagnostic lenses (may overlap); FPR is measured over UNTOUCHED genes in each
-        "AnchorCorr": anchor_corr >= float(np.quantile(anchor_corr, 0.90)),  # correlated w/ anchors -> easy/upper-bound
-        "HighlyExpr": expressed_mask & (mean_expr >= heg_hi),                # abundant -> high signal, easy
-        "LowlyExpr": expressed_mask & (mean_expr <= leg_lo),                 # sparse -> hard, zero-dominated
-        "HouseKeeping": hk_mask,                                             # constitutive -> predictable, watch memorization
-        "Marker": marker_mask,                                              # cell-type identity (N/A without annotation)
-        "HighlyVarG": hvg_bool,                                              # high-variance complement to anchors
-        "Random": random_mask,                                              # unbiased baseline across detection spectrum
+    STATIC_GROUPS = {  # diagnostic lenses (may overlap); FPR is measured over UNTOUCHED genes in each
+        "HighlyExpr": expressed_mask & (mean_expr >= heg_hi),    # abundant -> high signal, easy
+        "LowlyExpr": expressed_mask & (mean_expr <= leg_lo),     # sparse -> hard, zero-dominated
+        "HouseKeeping": hk_mask,                                 # constitutive -> predictable, watch memorization
+        "Marker": marker_mask,                                   # cell-type identity (N/A without annotation)
+        "HighlyVarG": hvg_bool,                                  # high-variance complement to anchors
+        "Random": random_mask,                                   # unbiased baseline across detection spectrum
     }
-    GROUP_NAMES = list(GROUPS.keys())
+    GROUP_NAMES = ["AnchorCorr"] + list(STATIC_GROUPS.keys())    # AnchorCorr depends on the per-draw anchors
     pos = {f: i for i, f in enumerate(feats.tolist())}
 
-    # ===== DE cell subsample (only the arms are subsampled, for speed; gene classes above are not) =====
+    # ===== DE cell subsample (fixed once; the question is about gene injection, not split luck) =====
     cap = int(cfg.get("injection_max_cells_per_arm", 3000))
     rng = np.random.default_rng(cfg["seed"] + 7)
     order = np.arange(ctrl_full.n_obs)
@@ -616,50 +611,95 @@ def test_0_injection(adata_raw, cfg, outdir):
     bmask = arm == "B"
     base = sub.X
     base = base.toarray().astype(np.float64) if sp.issparse(base) else np.asarray(base, float)
-
     normalize = bool(cfg.get("normalize_if_raw"))  # pdex path normalizes; pydeseq2 consumes raw counts
+
+    # ===== pool TPR/FPR over n_repeats independent small gene-draws (accumulate COUNTS, not rates) =====
+    acc = {float(d): {"tpr_n": 0, "tpr_d": 0, "fpr_n": 0, "fpr_d": 0,
+                      "tier_n": {t: 0 for t in EXPR_TIERS}, "tier_d": {t: 0 for t in EXPR_TIERS},
+                      "grp_n": {g: 0 for g in GROUP_NAMES}, "grp_d": {g: 0 for g in GROUP_NAMES},
+                      "lfc_inj": [], "pvals": []} for d in deltas}
+    n_inj_tier_tot = {t: 0 for t in EXPR_TIERS}
+    draws_done = 0
+    for rep in range(n_repeats):
+        rng_sel = np.random.default_rng(cfg["seed"] + 8 + rep)
+        per = max(1, n_inj // 3)
+        inj_parts = []
+        for t in EXPR_TIERS:
+            pool = np.where(expr_tier_all == t)[0]
+            if pool.size:
+                inj_parts.append(rng_sel.choice(pool, size=min(per, pool.size), replace=False))
+        inj_idx = np.sort(np.concatenate(inj_parts).astype(int)) if inj_parts else np.array([], int)
+        if inj_idx.size == 0:
+            continue
+        inj_mask_all = np.zeros(G, dtype=bool)
+        inj_mask_all[inj_idx] = True
+        for t in EXPR_TIERS:
+            n_inj_tier_tot[t] += int((expr_tier_all[inj_idx] == t).sum())
+        # |Pearson r| of every gene with THIS draw's anchor signature, over ALL controls (sparse, exact)
+        sgn = np.asarray(Xn[:, inj_idx].mean(1)).ravel()
+        e_gs = np.asarray(Xn.T.dot(sgn)).ravel() / n_c
+        cov = e_gs - mean_expr * sgn.mean()
+        anchor_corr = np.abs(cov / (np.sqrt(var_g) * sgn.std() + 1e-12))
+        groups = dict(STATIC_GROUPS)
+        groups["AnchorCorr"] = anchor_corr >= float(np.quantile(anchor_corr, 0.90))
+        for d in deltas:
+            Xd = base.copy()
+            if d > 0:
+                Xd[np.ix_(np.where(bmask)[0], inj_idx)] *= 2.0 ** d
+            if not normalize:
+                Xd = np.rint(Xd)  # keep integer counts for pseudobulk DESeq2
+            sad = ad.AnnData(X=Xd.astype(np.float32), obs=sub.obs.copy(), var=sub.var.copy())
+            sad.obs["_arm"] = arm.astype(str)
+            if normalize:
+                sc.pp.normalize_total(sad, inplace=True)
+                sc.pp.log1p(sad)
+            try:
+                de = run_de(sad, cfg, groupby="_arm", reference="A")  # target = B (anchors injected up)
+            except Exception as e:  # noqa: BLE001
+                log.warning("test0 rep=%d delta=%s: %s", rep, d, e)
+                continue
+            feat_arr = de["feature"].cast(str).to_numpy()
+            fpos = np.array([pos[f] for f in feat_arr])           # map DE rows -> gene-axis positions
+            lfc = de["log2_fold_change"].to_numpy().astype(float)
+            fdr = de["fdr"].to_numpy().astype(float)
+            pvl = de["p_value"].to_numpy().astype(float)
+            sig = _sig_mask(lfc, fdr, cfg)
+            is_inj = inj_mask_all[fpos]
+            A = acc[float(d)]
+            A["tpr_n"] += int(sig[is_inj].sum()); A["tpr_d"] += int(is_inj.sum())
+            A["fpr_n"] += int(sig[~is_inj].sum()); A["fpr_d"] += int((~is_inj).sum())
+            A["lfc_inj"].extend(lfc[is_inj].tolist())
+            A["pvals"].extend(pvl.tolist())
+            tier_at = expr_tier_all[fpos]
+            for t in EXPR_TIERS:
+                mt = is_inj & (tier_at == t)
+                A["tier_n"][t] += int(sig[mt].sum()); A["tier_d"][t] += int(mt.sum())
+            for g in GROUP_NAMES:
+                unt = (~is_inj) & groups[g][fpos]
+                A["grp_n"][g] += int(sig[unt].sum()); A["grp_d"][g] += int(unt.sum())
+        draws_done += 1
+    del Xn
+    log.info("test0 injected anchors: %s; pooled over %d draw(s) [low=%d mid=%d high=%d genes total]",
+             regime, draws_done, n_inj_tier_tot["low"], n_inj_tier_tot["mid"], n_inj_tier_tot["high"])
+
     rows = []
     for d in deltas:
-        Xd = base.copy()
-        if d > 0:
-            Xd[np.ix_(np.where(bmask)[0], inj_idx)] *= 2.0 ** d
-        if not normalize:
-            Xd = np.rint(Xd)  # keep integer counts for pseudobulk DESeq2
-        s = ad.AnnData(X=Xd.astype(np.float32), obs=sub.obs.copy(), var=sub.var.copy())
-        s.obs["_arm"] = arm.astype(str)
-        if normalize:
-            sc.pp.normalize_total(s, inplace=True)
-            sc.pp.log1p(s)
-        try:
-            de = run_de(s, cfg, groupby="_arm", reference="A")  # target = B (anchors injected up)
-        except Exception as e:  # noqa: BLE001
-            log.warning("test0 delta=%s: %s", d, e)
+        A = acc[float(d)]
+        if A["tpr_d"] == 0:
             continue
-        feat_arr = de["feature"].cast(str).to_numpy()
-        fpos = np.array([pos[f] for f in feat_arr])             # map DE rows -> gene-axis positions
-        lfc = de["log2_fold_change"].to_numpy().astype(float)
-        fdr = de["fdr"].to_numpy().astype(float)
-        pvl = de["p_value"].to_numpy().astype(float)
-        sig = _sig_mask(lfc, fdr, cfg)
-        is_inj = inj_mask_all[fpos]
-        tpr = float(sig[is_inj].mean()) if is_inj.sum() else float("nan")
-        fpr = float(sig[~is_inj].mean()) if (~is_inj).sum() else float("nan")
-        med_obs = float(np.nanmedian(lfc[is_inj])) if is_inj.sum() else float("nan")
-        row = {"delta_log2fc": float(d), "n_injected": int(is_inj.sum()),
-               "TPR": tpr, "FPR": fpr, "median_observed_lfc_injected": med_obs,
-               "lambda_gc": lambda_gc(pvl)}
+        row = {"delta_log2fc": float(d), "n_injected": int(A["tpr_d"]),
+               "TPR": A["tpr_n"] / A["tpr_d"] if A["tpr_d"] else float("nan"),
+               "FPR": A["fpr_n"] / A["fpr_d"] if A["fpr_d"] else float("nan"),
+               "median_observed_lfc_injected": float(np.nanmedian(A["lfc_inj"])) if A["lfc_inj"] else float("nan"),
+               "lambda_gc": lambda_gc(np.asarray(A["pvals"])) if A["pvals"] else float("nan")}
         # FPR among UNTOUCHED genes, broken down by the diagnostic gene classes (lenses)
-        for gname in GROUP_NAMES:
-            gm = GROUPS[gname][fpos]
-            unt = (~is_inj) & gm
-            row[f"FPR_{gname}"] = float(sig[unt].mean()) if unt.sum() else float("nan")
-            row[f"n_untouched_{gname}"] = int(unt.sum())
+        for g in GROUP_NAMES:
+            row[f"FPR_{g}"] = A["grp_n"][g] / A["grp_d"][g] if A["grp_d"][g] else float("nan")
+            row[f"n_untouched_{g}"] = int(A["grp_d"][g])
         # TPR among INJECTED/anchor genes, broken down by EXPRESSION TIER (detection power)
-        tier_at = expr_tier_all[fpos]
         for t in EXPR_TIERS:
-            inj_t = is_inj & (tier_at == t)
-            row[f"TPR_{t}expr"] = float(sig[inj_t].mean()) if inj_t.sum() else float("nan")
-            row[f"n_injected_{t}expr"] = int(inj_t.sum())
+            row[f"TPR_{t}expr"] = A["tier_n"][t] / A["tier_d"][t] if A["tier_d"][t] else float("nan")
+            row[f"n_injected_{t}expr"] = int(A["tier_d"][t])
         rows.append(row)
     if not rows:
         return TestResult("test_0", "Effect-Size Injection / Calibration Curve", "SKIP",
@@ -710,11 +750,12 @@ def test_0_injection(adata_raw, cfg, outdir):
     hi_row = pos.filter(pl.col("delta_log2fc") == delta_hi) if pos.height else df.head(0)
     metrics = {"null_FPR": fpr_null, "max_TPR": tpr_max, "min_resolvable_delta_log2fc": min_delta,
                "FPR_at_max_delta": fpr_hi, "max_delta_log2fc": delta_hi,
-               "n_injected_genes": int(inj_idx.size),
-               "n_injected_low_expr": n_inj_tier["low"], "n_injected_mid_expr": n_inj_tier["mid"],
-               "n_injected_high_expr": n_inj_tier["high"], "injection_stratified_by": "expression tertile",
+               "n_injected_genes_per_draw": int(n_inj), "n_draws": int(draws_done),
+               "n_injected_total": int(sum(n_inj_tier_tot.values())),
+               "n_injected_low_expr": int(n_inj_tier_tot["low"]), "n_injected_mid_expr": int(n_inj_tier_tot["mid"]),
+               "n_injected_high_expr": int(n_inj_tier_tot["high"]), "injection_stratified_by": "expression tertile",
+               "injection_regime": regime,
                "n_expressed_genes": int(expressed.size), "n_total_genes": int(G),
-               "frac_genes_injected": frac,
                "control_cells_used": int(sub.n_obs), "cells_per_arm": int(min(bmask.sum(), (~bmask).sum()))}
     # per-gene-class FPR (untouched) + per-expression-tier TPR (injected) at the largest injected δ
     for c in GROUP_NAMES:
@@ -1377,9 +1418,12 @@ def test_6(adata, cfg, outdir, de_true=None):
 # plain-language docs + glossary
 # --------------------------------------------------------------------------- #
 TEST_DOC = {
-    "test_0": "Spike a known log2 fold-change into a known fraction of genes in a control-vs-control "
-              "split, then measure how many injected genes we recover (TPR) and how many untouched "
-              "genes are wrongly called (FPR) across effect sizes. This separates a genuinely "
+    "test_0": "Spike a known log2 fold-change into a SMALL number of genes (~a dozen, the scale of a "
+              "real perturbation), pooled over several random gene-draws, in a control-vs-control split; "
+              "then measure how many injected genes we recover (TPR) and how many untouched genes are "
+              "wrongly called (FPR) across effect sizes. Injecting a small NUMBER (not a large fraction) "
+              "is faithful to real biology and avoids the library-size shift that artificially induces "
+              "false DE in untouched genes (compositional coupling). This separates a genuinely "
               "calibrated null from a pipeline that simply finds nothing, and tells you the smallest "
               "effect the metric can resolve.",
     "test_1": "REPRODUCIBILITY. Split each perturbation's cells into halves A and B and run each vs "
@@ -1646,15 +1690,16 @@ def write_report(results, cfg, power, fp, outdir):
             L.append("")
         if r.name == "test_0" and r.verdict != "SKIP" and r.metrics:
             m = r.metrics
-            n_inj = m.get("n_injected_genes")
-            frac = m.get("frac_genes_injected")
-            n_expr = m.get("n_expressed_genes") or (round(n_inj / frac) if (n_inj and frac) else None)
+            n_per = m.get("n_injected_genes_per_draw")
+            n_draws = m.get("n_draws")
+            n_inj_tot = m.get("n_injected_total")
+            regime = m.get("injection_regime", "")
+            n_expr = m.get("n_expressed_genes")
             n_tot = m.get("n_total_genes") or fp.get("n_genes")
             cpa = m.get("cells_per_arm")
             cused = m.get("control_cells_used") or (2 * cpa if cpa else None)
             deltas = cfg.get("injection_deltas")
             nctrl = fp.get("n_control_cells")
-            pct = f"{100*frac:.0f}%" if isinstance(frac, (int, float)) else "?"
             cap = cfg.get("injection_max_cells_per_arm")
             n_lo, n_mid, n_hi = m.get("n_injected_low_expr"), m.get("n_injected_mid_expr"), m.get("n_injected_high_expr")
             L.append(
@@ -1672,18 +1717,23 @@ def write_report(results, cfg, power, fp, outdir):
                 f"`injection_max_cells_per_arm`={cap} for speed/memory — DE is re-run for every δ tier — "
                 "and is slightly under the cap because the split halves each batch with integer "
                 "rounding; raise the cap to use more of the available control cells). "
-                f"**{n_inj:,} genes ({pct} of the {n_expr:,} expressed genes; {n_tot:,} genes total)** "
-                "were chosen as the *injected* (**anchor**) set, **stratified across the expression "
-                "(detection) spectrum** — equal shares from the low / mid / high mean-expression tertiles "
-                f"(**{n_lo} low · {n_mid} mid · {n_hi} high**) — because detectability is dominated by "
-                "expression level, so this makes the TPR-vs-δ curve readable *per tier* (the smallest "
-                "resolvable δ for sparse vs typical vs abundant genes) rather than an artifact of the mix. "
-                "In arm B their "
+                f"On **each draw, only {n_per} genes** ({n_per:,} of the {n_expr:,} expressed; {n_tot:,} "
+                "total) were chosen as the *injected* (**anchor**) set — a deliberately **small number, "
+                "the scale of a real perturbation**. Injecting a handful of genes (rather than a large "
+                "*fraction*) barely shifts the per-cell library size, so it does **not** artificially "
+                "induce false DE in untouched genes via renormalization (compositional coupling) — the "
+                "faithful test. To get stable rates from so few genes per draw, the injection is **repeated "
+                f"over {n_draws} independent random draws and pooled** ({n_inj_tot:,} injected-gene "
+                f"observations total: **{n_lo} low · {n_mid} mid · {n_hi} high** expression). Anchors are "
+                "**stratified across the expression (detection) spectrum** (equal shares from the low / mid "
+                "/ high mean-expression tertiles) because detectability is dominated by expression level, "
+                "so this makes the TPR-vs-δ curve readable *per tier* (the smallest resolvable δ for sparse "
+                "vs typical vs abundant genes). In arm B their "
                 f"{'raw counts were multiplied' if not cfg.get('normalize_if_raw') else 'expression was scaled'} "
                 f"by 2^δ for each effect size **δ ∈ {deltas}** (log2 fold-change; δ=0 = untouched null). "
-                f"The other {(n_expr - n_inj):,} expressed genes are the *untouched* set used to measure "
-                "the false-positive rate. TPR is recovery of the injected/anchor set (reported per "
-                "expression tier); FPR is false calls among the untouched set (reported per gene class).")
+                "The remaining (untouched) genes on each draw are used to measure the false-positive rate. "
+                "TPR is recovery of the injected/anchor set (reported per expression tier); FPR is false "
+                f"calls among the untouched set (reported per gene class). Regime: *{regime}*.")
             L.append("")
             L.append(
                 "*Gene-class FPR breakdown.* The untouched-gene FPR is broken down into gene classes — "
@@ -1761,9 +1811,19 @@ def write_report(results, cfg, power, fp, outdir):
                     L.append(f"| {fmt(row['delta_log2fc'])} | {fmt(row['TPR'])} | {fmt(row['FPR'])} | "
                              f"{fmt(row['median_observed_lfc_injected'])} | {fmt(row['lambda_gc'])} |")
                 L.append("")
-                L.append("_FPR and λ_GC climb steeply as δ grows — the compositional-coupling artifact "
-                         "(false DE in untouched genes from library-size renormalization under strong, "
-                         "widespread injected effects)._")
+                _fn, _fh = r.metrics.get("null_FPR"), r.metrics.get("FPR_at_max_delta")
+                _coupled = (isinstance(_fn, (int, float)) and isinstance(_fh, (int, float))
+                            and _fh > max(2 * cfg["fdr_threshold"], _fn + 0.05))
+                if _coupled:
+                    L.append("_FPR (and often λ_GC) climbs steeply as δ grows — the compositional-coupling "
+                             "artifact (false DE in untouched genes from library-size renormalization under "
+                             "strong, widespread injected effects). Note this realistic regime injects only "
+                             "~a dozen genes, so coupling here is notable._")
+                else:
+                    L.append("_FPR stays flat near the null as δ grows — **no compositional coupling**: "
+                             "injecting only ~a dozen genes barely shifts the per-cell library size, so "
+                             "untouched genes are not renormalized into false positives. The TPR ramp with δ "
+                             "is the resolving-power curve._")
                 L.append("")
                 # per-gene-class FPR (untouched genes) by δ
                 grp_cols = [(c, f"FPR_{c}") for c in ("AnchorCorr", "HighlyExpr", "LowlyExpr",
@@ -1778,9 +1838,10 @@ def write_report(results, cfg, power, fp, outdir):
                         L.append(f"| {fmt(rr['delta_log2fc'])} | "
                                  + " | ".join(fmt(rr[col]) for _, col in grp_cols) + " |")
                     L.append("")
-                    L.append("_Compare classes: AnchorCorr/HighlyExpr/HighlyVarG should inflate first under "
-                             "coupling; LowlyExpr stays low (zero-dominated); Random is the baseline; "
-                             "HouseKeeping flags memorization; Marker is N/A without cell-type labels._")
+                    L.append("_Compare classes: if compositional coupling were present, "
+                             "AnchorCorr/HighlyExpr/HighlyVarG would inflate first; LowlyExpr stays low "
+                             "(zero-dominated); Random is the baseline; HouseKeeping flags memorization; "
+                             "Marker is N/A without cell-type labels._")
                     L.append("")
                 tpr_cols = [(f"{t} expr", f"TPR_{t}expr") for t in ("high", "mid", "low")
                             if f"TPR_{t}expr" in cdf.columns]
@@ -1824,7 +1885,9 @@ def write_report(results, cfg, power, fp, outdir):
           f"| lambda_gc_warn / fail | {cfg['lambda_gc_warn']} / {cfg['lambda_gc_fail']} | TEST_PLAN.md |",
           "| λ_GC deflation WARN / ks_p_uniform WARN | < 0.90 / < 0.05 | skill notes |",
           f"| injection δ tiers (log2FC) | {cfg['injection_deltas']} | config |",
-          f"| injection fraction of genes | {cfg['injection_frac_genes']} | config |",
+          (f"| injection genes/draw × draws | {cfg.get('injection_n_genes')} × {cfg.get('injection_n_repeats')} | config |"
+           if cfg.get('injection_n_genes') is not None
+           else f"| injection fraction of genes | {cfg.get('injection_frac_genes')} | config (legacy frac mode) |"),
           f"| n_resamples / min_cells_per_group / seed | {cfg['n_resamples']} / "
           f"{cfg['min_cells_per_group']} / {cfg['seed']} | config |",
           f"| max_conditions / block_cols | {cfg.get('max_conditions')} / {cfg.get('block_cols')} | config |",
