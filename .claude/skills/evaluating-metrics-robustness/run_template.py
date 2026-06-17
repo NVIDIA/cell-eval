@@ -113,6 +113,10 @@ def load_cfg(path: str) -> dict:
     cfg.setdefault("n_resamples", 10)
     if "test1_n_resamples" not in cfg and "test1_n_permutations" in cfg:
         cfg["test1_n_resamples"] = cfg["test1_n_permutations"]
+    cfg.setdefault("test1_wellpowered_min_cells", 200)   # ≥200 total ≈ ≥100 cells per split-half
+    # Test 3 (Label Permutation Null) p-value diagnostics:
+    cfg.setdefault("test3_n_cellcount_strata", 3)        # # of cell-count strata (tertiles) for facets
+    cfg.setdefault("test3_pooled_pval_subsample", 40000) # deterministic cap on pooled p-values for ECDF/QQ
     return cfg
 
 
@@ -319,7 +323,12 @@ def compare_signatures(de_a: pl.DataFrame, de_b: pl.DataFrame, cfg: dict) -> dic
     union = int((sa | sb).sum())
     inter = int((sa & sb).sum())
     spear = float(stats.spearmanr(la[ok], lb[ok]).statistic) if ok.sum() >= 5 else float("nan")
+    # additional: Spearman restricted to the UNION OF DE GENES (where the real signal lives) — the
+    # all-genes ρ above is diluted by ~18k near-zero-effect genes; this isolates responsive genes.
+    deg = (sa | sb) & ok
+    spear_deg = float(stats.spearmanr(la[deg], lb[deg]).statistic) if int(deg.sum()) >= 5 else float("nan")
     direction = float(np.mean(np.sign(la[sa | sb]) == np.sign(lb[sa | sb]))) if union else float("nan")
+    direction_all = float(np.mean(np.sign(la[ok]) == np.sign(lb[ok]))) if int(ok.sum()) else float("nan")
     auc = float("nan")
     if sb.sum() > 0 and (~sb).sum() > 0:
         try:
@@ -329,8 +338,11 @@ def compare_signatures(de_a: pl.DataFrame, de_b: pl.DataFrame, cfg: dict) -> dic
             auc = float("nan")
     return {
         "lfc_spearman": spear,
+        "lfc_spearman_deg": spear_deg,
+        "n_deg_union": int((sa | sb).sum()),
         "sig_jaccard": float(inter / union) if union else float("nan"),
         "direction_agreement": direction,
+        "direction_agreement_all": direction_all,
         "auc_recovery": auc,
         "n_sig_a": int(sa.sum()),
         "n_sig_b": int(sb.sum()),
@@ -352,44 +364,6 @@ def stratified_split(obs, strat_cols, seed: int) -> np.ndarray:
         out[idx[:half]] = "A"
         out[idx[half:]] = "B"
     return out.astype(str)
-
-
-def matched_arms_within_batch(obs, feature_cols, block_cols, seed):
-    """1:1 BATCH-CONTROLLED arm assignment: within each batch, split cells into two halves and
-    optimally pair them on standardized log1p QC features (scipy linear_sum_assignment). Returns
-    (a_pos, b_pos) integer positions into `obs` for the matched pairs, or None if features missing.
-    Self-contained (no scmetrics dependency); deterministic given the seed."""
-    from scipy.optimize import linear_sum_assignment
-
-    cols = [c for c in feature_cols if c in obs.columns]
-    if not cols:
-        return None
-    rng = np.random.default_rng(seed)
-    posarr = np.arange(len(obs))
-    bcols = [c for c in block_cols if c in obs.columns]
-    if bcols:
-        groups = obs.groupby(bcols, observed=True, sort=True).indices.values()
-    else:
-        groups = [np.arange(len(obs))]
-    feat = obs[cols].to_numpy(dtype=float)
-    a_pos, b_pos = [], []
-    for idx in sorted([np.asarray(g, dtype=int) for g in groups], key=lambda a: (a.size, a.min() if a.size else -1)):
-        idx = idx.copy()
-        rng.shuffle(idx)
-        half = idx.size // 2
-        if half < 1:
-            continue
-        ia, ib = idx[:half], idx[half:2 * half]
-        Fa, Fb = np.log1p(np.clip(feat[ia], 0, None)), np.log1p(np.clip(feat[ib], 0, None))
-        pooled = np.vstack([Fa, Fb])
-        mu, sd = pooled.mean(0), pooled.std(0)
-        sd[sd < 1e-8] = 1.0
-        Fa, Fb = (Fa - mu) / sd, (Fb - mu) / sd
-        cost = ((Fa[:, None, :] - Fb[None, :, :]) ** 2).sum(-1)
-        r, c = linear_sum_assignment(cost)
-        a_pos.extend(posarr[ia[r]].tolist())
-        b_pos.extend(posarr[ib[c]].tolist())
-    return (np.asarray(a_pos, dtype=int), np.asarray(b_pos, dtype=int)) if a_pos else None
 
 
 # --------------------------------------------------------------------------- #
@@ -846,48 +820,6 @@ def _de_two(adata, pos1, pos2, cfg, lab1="G1", lab2="G2"):
     return run_de(s, cfg, groupby="_g", reference=lab2)
 
 
-def _match_pert_ctrl(pert_obs, ctrl_obs, feat_cols, block_cols, seed):
-    """1:1-match perturbed cells to control cells WITHIN batch on QC features. Prefers scmetrics
-    (_match_controls); else an inline optimal-assignment matcher. Returns (pert_pos, ctrl_pos)
-    positions within pert_obs / ctrl_obs of the matched pairs (or None)."""
-    feat = [c for c in feat_cols if c in pert_obs.columns and c in ctrl_obs.columns]
-    if not feat:
-        return None
-    grp = tuple(c for c in block_cols if c in pert_obs.columns and c in ctrl_obs.columns)
-    pmap = {str(n): i for i, n in enumerate(pert_obs.index.astype(str))}
-    cmap = {str(n): i for i, n in enumerate(ctrl_obs.index.astype(str))}
-    try:
-        from scmetrics.matchers import _match_controls
-        mp, mc, _ = _match_controls(pert_obs, ctrl_obs, feature_cols=tuple(feat), group_cols=grp or None)
-        pp = np.array([pmap[str(n)] for n in mp], int)
-        cp = np.array([cmap[str(n)] for n in mc], int)
-        return (pp, cp) if pp.size else None
-    except Exception as e:  # noqa: BLE001
-        log.warning("scmetrics matcher unavailable (%s); using inline matcher", e)
-    from scipy.optimize import linear_sum_assignment
-    pf = np.log1p(np.clip(pert_obs[feat].to_numpy(float), 0, None))
-    cf = np.log1p(np.clip(ctrl_obs[feat].to_numpy(float), 0, None))
-    if grp:
-        pb = pert_obs[list(grp)].astype(str).agg("|".join, axis=1).to_numpy()
-        cb = ctrl_obs[list(grp)].astype(str).agg("|".join, axis=1).to_numpy()
-    else:
-        pb = np.zeros(len(pert_obs), dtype=int).astype(str)
-        cb = np.zeros(len(ctrl_obs), dtype=int).astype(str)
-    pp, cp = [], []
-    for b in sorted(set(pb.tolist())):
-        pi, ci = np.where(pb == b)[0], np.where(cb == b)[0]
-        if pi.size == 0 or ci.size == 0:
-            continue
-        pooled = np.vstack([pf[pi], cf[ci]])
-        mu, sd = pooled.mean(0), pooled.std(0)
-        sd[sd < 1e-8] = 1.0
-        cost = (((pf[pi] - mu) / sd)[:, None, :] - ((cf[ci] - mu) / sd)[None, :, :]) ** 2
-        r, c = linear_sum_assignment(cost.sum(-1))
-        pp.extend(pi[r].tolist())
-        cp.extend(ci[c].tolist())
-    return (np.array(pp, int), np.array(cp, int)) if pp else None
-
-
 # Reproducibility verdict tiers (Tests 1 & 4) — strong/moderate/low thresholds per metric.
 # (LFC ρ drives the verdict; Jaccard/direction are tiered too, from TEST_PLAN §Test 4 "Expected Behaviour".)
 REPRO_PASS, REPRO_WARN = 0.6, 0.3
@@ -944,27 +876,154 @@ def verdict_test_4(m: dict, cfg: dict) -> tuple[str, str, list]:
     return verdict, reason, flags
 
 
+# Reproducibility metrics shown vs cell count, one panel each. (rdf column, panel title, tier key into
+# REPRO_METRIC_TIERS, y-limits). NOTE: Jaccard's value is independent of the gene universe (it is the
+# overlap of the two SIGNIFICANT sets), so "all-genes Jaccard" ≡ "DEG Jaccard" — shown once.
+REPRO_PANELS = [
+    ("lfc_spearman",            "Spearman LFC — ALL genes",        "lfc_spearman",        (-0.25, 1.0)),
+    ("lfc_spearman_deg",        "Spearman LFC — DE genes",         "lfc_spearman",        (-0.25, 1.0)),
+    ("sig_jaccard",             "DEG-set Jaccard (≡ all-genes)",   "sig_jaccard",         (0.0, 1.0)),
+    ("direction_agreement_all", "Direction agreement — ALL genes", "direction_agreement", (0.0, 1.02)),
+    ("direction_agreement",     "Direction agreement — DE genes",  "direction_agreement", (0.0, 1.02)),
+]
+
+
+def repro_vs_ncells(rdf, cfg):
+    """Per-condition reproducibility (median over reps) vs the condition's CELL COUNT — ONE POINT PER
+    PERTURBATION (no binning), for EVERY reproducibility statistic in REPRO_PANELS. Separates 'the method
+    is low-reproducibility' from 'this perturbation just didn't have enough cells': values that climb with
+    cell count and plateau => power-limited; values that stay low even at high cell counts => a genuine
+    method limitation. Returns (per_pert_df[condition, n_cells, <metric cols>], primary_trend_metrics,
+    trends_df[metric, spearman_ncells, well/under medians])."""
+    if rdf is None or "n_pert_cells" not in rdf.columns:
+        return None, {}, None
+    metric_cols = [c for c, *_ in REPRO_PANELS if c in rdf.columns]
+    aggs = [pl.col(c).median().alias(c) for c in metric_cols] + [pl.col("n_pert_cells").first().alias("n_cells")]
+    for sc in ("n_sig_a", "n_sig_b", "n_deg_union"):  # for the DEG-count point encoding
+        if sc in rdf.columns:
+            aggs.append(pl.col(sc).median().alias(sc))
+    pc = rdf.group_by("condition").agg(aggs).drop_nulls(["n_cells"]).sort("n_cells")
+    # n_deg = # DE genes in the UNION of split A & B (the set the DEG metrics use). Prefer the exact union
+    # count (n_deg_union); fall back to the mean of the two arms' significant counts if union isn't present.
+    if "n_deg_union" in pc.columns:
+        pc = pc.with_columns(pl.col("n_deg_union").alias("n_deg"))
+    elif "n_sig_a" in pc.columns and "n_sig_b" in pc.columns:
+        pc = pc.with_columns(((pl.col("n_sig_a") + pl.col("n_sig_b")) / 2.0).alias("n_deg"))
+    nc = pc["n_cells"].to_numpy().astype(float)
+    wp_min = int(cfg.get("test1_wellpowered_min_cells", 200))   # >=200 total ~ >=100 cells per half
+    tm = {"wellpowered_min_cells": wp_min}
+    trows = []
+    for c in metric_cols:
+        v = pc[c].to_numpy().astype(float)
+        ok = np.isfinite(v) & np.isfinite(nc)
+        if ok.sum() >= 3:
+            vo, nco = v[ok], nc[ok]
+            tr = float(stats.spearmanr(nco, vo).correlation) if vo.size > 2 else float("nan")
+            wp, up = vo[nco >= wp_min], vo[nco < wp_min]
+            wpm = float(np.median(wp)) if wp.size else float("nan")
+            upm = float(np.median(up)) if up.size else float("nan")
+            nwp, nup = int(wp.size), int(up.size)
+        else:
+            tr = wpm = upm = float("nan"); nwp = nup = 0
+        trows.append({"metric": c, "spearman_ncells": tr, "wellpowered_median": wpm,
+                      "underpowered_median": upm, "n_wellpowered": nwp, "n_underpowered": nup})
+        if c == "lfc_spearman":  # primary -> canonical keys used by the verdict flag + report summary
+            tm.update({"rho_vs_ncells_spearman": tr, "repro_rho_wellpowered": wpm,
+                       "repro_rho_underpowered": upm, "n_wellpowered": nwp, "n_underpowered": nup})
+    return pc, tm, (pl.DataFrame(trows) if trows else None)
+
+
+def plot_repro_vs_ncells(modes, path, cfg):
+    """modes: {mode: {"_pc": per_pert_df}}. A GRID of scatter panels — one per reproducibility statistic
+    in REPRO_PANELS — each with one point PER PERTURBATION (x = cell count, log). The 'is it power or the
+    method?' figure, now for every statistic."""
+    if not modes:
+        return
+    panels = [p for p in REPRO_PANELS
+              if any((d.get("_pc") is not None and p[0] in d["_pc"].columns) for d in modes.values())]
+    if not panels:
+        return
+    ncol = 3
+    nrow = int(np.ceil(len(panels) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(4.3 * ncol, 3.5 * nrow), squeeze=False)
+    colors = {"no_match": "#1a3c6e"}
+    wp_min = int(cfg.get("test1_wellpowered_min_cells", 200))
+    allnc = [d["_pc"]["n_cells"].to_numpy().astype(float) for d in modes.values()
+             if d.get("_pc") is not None and d["_pc"].height]
+    allnc = np.concatenate(allnc) if allnc else np.array([])
+    cand = [100, 150, 200, 300, 500, 700, 1000, 1500, 2000, 3000, 5000, 7000]
+    ticks = [t for t in cand if allnc.size and allnc.min() * 0.9 <= t <= allnc.max() * 1.1]
+    # marker AREA encodes the # of DE genes in the UNION of split A and B (the gene set the DEG-restricted
+    # metrics are computed over), sqrt-scaled so a wide range stays readable.
+    def sz(nd):
+        return np.clip(6.0 + 5.5 * np.sqrt(np.clip(np.asarray(nd, float), 0, None)), 6, 240)
+    have_ndeg = any(d.get("_pc") is not None and "n_deg" in d["_pc"].columns for d in modes.values())
+    for i, (col_name, title, tk, yl) in enumerate(panels):
+        ax = axes[i // ncol][i % ncol]
+        for mode, d in modes.items():
+            pcd = d.get("_pc")
+            if pcd is None or col_name not in pcd.columns:
+                continue
+            nc = pcd["n_cells"].to_numpy().astype(float)
+            v = pcd[col_name].to_numpy().astype(float)
+            col = colors.get(mode, "#444444")
+            s = sz(pcd["n_deg"].to_numpy()) if "n_deg" in pcd.columns else 20
+            ax.scatter(nc, v, s=s, alpha=0.55, color=col, edgecolor="white", linewidth=0.3,
+                       label=f"median={fmt(float(np.nanmedian(v)))}")
+        if tk in REPRO_METRIC_TIERS:
+            for thr in REPRO_METRIC_TIERS[tk][1:3]:
+                ax.axhline(thr, ls="--", color="0.6", lw=0.8)
+        ax.axvline(wp_min, ls=":", color="0.5", lw=0.8)
+        ax.set_xscale("log"); ax.set_ylim(*yl)
+        if len(ticks) >= 2:
+            ax.set_xticks(ticks); ax.set_xticklabels([f"{t:,}" for t in ticks], rotation=45, fontsize=6)
+            ax.minorticks_off()
+        ax.set_title(title, fontsize=8); ax.tick_params(labelsize=6.5)
+        ax.legend(fontsize=6, loc="lower right")
+        if i % ncol == 0:
+            ax.set_ylabel("per-perturbation value", fontsize=7)
+    for j in range(len(panels), nrow * ncol):
+        axes[j // ncol][j % ncol].axis("off")
+    # DE-gene size legend — figure-level (bottom), always shown regardless of grid layout
+    if have_ndeg:
+        allnd = np.concatenate([d["_pc"]["n_deg"].to_numpy().astype(float) for d in modes.values()
+                                if d.get("_pc") is not None and "n_deg" in d["_pc"].columns])
+        allnd = allnd[np.isfinite(allnd)]
+        refs = [r for r in (10, 50, 100, 500, 1000, 2000, 5000)
+                if allnd.size and allnd.min() <= r <= allnd.max()] or ([int(np.median(allnd))] if allnd.size else [])
+        h0 = axes[0][0]
+        handles, labels = [], []
+        for r in refs:
+            handles.append(h0.scatter([], [], s=float(sz(r)), color="#1a3c6e", alpha=0.55, edgecolor="white",
+                                      linewidth=0.3))
+            labels.append(f"{r:,}")
+        fig.legend(handles, labels, title="marker size = # DE genes (union of split A & B)",
+                   loc="lower center", ncol=max(1, len(labels)), fontsize=7, title_fontsize=7, frameon=True,
+                   columnspacing=1.4, handletextpad=0.4)
+    fig.suptitle("Test 1 — reproducibility vs cell count, one point per perturbation (x = cell count, log)\n"
+                 "point size = # DE genes (union of split A & B) · dotted = well-powered cutoff · "
+                 "dashed = tier cutoffs", fontsize=9)
+    fig.tight_layout(rect=[0, 0.07, 1, 0.93]); fig.savefig(path, dpi=120); plt.close(fig)
+
+
 def test_1(adata, cfg, outdir):
     """Test 1 — within-condition REPRODUCIBILITY (NOT a uniformity null; that is Test 2).
 
-    For each perturbation, split its cells into A and B (batch-stratified) and run two independent
-    perturbation-vs-control DEs (DE_A, DE_B) — each carries the REAL perturbation signal (not uniform).
-    The test asks whether the two half-signatures AGREE: DE_A ≈ DE_B. Two scenarios for control assignment:
-      • no_match (1.a): controls split into two halves; DE_A = A vs ctrl_half_A, DE_B = B vs ctrl_half_B
-        (cell-eval pdex, NO 1:1 matching) — each DE uses half of the total control cells.
-      • matched (2.a): 1:1-match perturbed cells to controls within batch (scmetrics); split the matched
-        perturb–control PAIRS into A/B; DE_A = A_pert vs A_matched_ctrl, DE_B = B_pert vs B_matched_ctrl.
+    For each perturbation, split its cells into halves A and B (batch-stratified) and run two
+    independent perturbation-vs-control DEs (DE_A, DE_B) — each carries the REAL perturbation signal
+    (not uniform). The test asks whether the two half-signatures AGREE: DE_A ≈ DE_B. Controls are split
+    into two halves: DE_A = A vs ctrl_half_A, DE_B = B vs ctrl_half_B (cell-eval DE, NO 1:1 cell
+    matching) — each DE uses half of the total control cells.
 
     Reproducibility = median over perturbations of Spearman(LFC_A, LFC_B) (+ DEG Jaccard, direction).
-    Verdict tiers (on median ρ): PASS > 0.6, WARN 0.3–0.6, FAIL < 0.3. Verdict from the matched
-    scenario; both scenarios reported side by side (does 1:1 batch matching improve reproducibility?)."""
+    Verdict tiers (on median ρ): PASS > 0.6, WARN 0.3–0.6, FAIL < 0.3. Also reported per perturbation
+    against cell count (separates a low-reproducibility method from undersampled conditions)."""
     pc, mcg = cfg["pert_col"], cfg["min_cells_per_group"]
     ctrl_lab = cfg["control_pert"]
     perts = perts_in_use(adata, cfg)
     labels = adata.obs[pc].astype(str).to_numpy()
     pos_C_all = np.where(labels == ctrl_lab)[0]
     ctrl_obs_all = adata.obs.iloc[pos_C_all]
-    feat_cols = [c for c in ("total_counts", "n_genes_by_counts") if c in adata.obs.columns]
     nperm = int(cfg.get("test1_n_resamples", min(3, cfg["n_resamples"])))
 
     def scenario(mode):
@@ -977,26 +1036,14 @@ def test_1(adata, cfg, outdir):
             pert_obs = adata.obs.iloc[pos_P]
             for r in range(nperm):
                 seed = cfg["seed"] + 1000 + pi_ * 17 + r
-                if mode == "matched":
-                    mm = _match_pert_ctrl(pert_obs, ctrl_obs_all, feat_cols, cfg["block_cols"], seed)
-                    if mm is None:
-                        continue
-                    pp, cp = mm
-                    arm = stratified_split(pert_obs.iloc[pp], cfg["block_cols"], seed + 1)
-                    ai, bi = np.where(arm == "A")[0], np.where(arm == "B")[0]
-                    if ai.size < mcg or bi.size < mcg:
-                        continue
-                    A_pert, A_ctrl = pos_P[pp[ai]], pos_C_all[cp[ai]]
-                    B_pert, B_ctrl = pos_P[pp[bi]], pos_C_all[cp[bi]]
-                else:
-                    arm = stratified_split(pert_obs, cfg["block_cols"], seed)
-                    ai, bi = np.where(arm == "A")[0], np.where(arm == "B")[0]
-                    carm = stratified_split(ctrl_obs_all, cfg["block_cols"], seed + 7)
-                    cai, cbi = np.where(carm == "A")[0], np.where(carm == "B")[0]
-                    if min(ai.size, bi.size, cai.size, cbi.size) < mcg:
-                        continue
-                    A_pert, B_pert = pos_P[ai], pos_P[bi]
-                    A_ctrl, B_ctrl = pos_C_all[cai], pos_C_all[cbi]
+                arm = stratified_split(pert_obs, cfg["block_cols"], seed)
+                ai, bi = np.where(arm == "A")[0], np.where(arm == "B")[0]
+                carm = stratified_split(ctrl_obs_all, cfg["block_cols"], seed + 7)
+                cai, cbi = np.where(carm == "A")[0], np.where(carm == "B")[0]
+                if min(ai.size, bi.size, cai.size, cbi.size) < mcg:
+                    continue
+                A_pert, B_pert = pos_P[ai], pos_P[bi]
+                A_ctrl, B_ctrl = pos_C_all[cai], pos_C_all[cbi]
                 try:
                     de_A = _de_two(adata, A_pert, A_ctrl, cfg, "pert", "ctrl")
                     de_B = _de_two(adata, B_pert, B_ctrl, cfg, "pert", "ctrl")
@@ -1007,6 +1054,8 @@ def test_1(adata, cfg, outdir):
                 rep = compare_signatures(de_A, de_B, cfg)
                 if rep:
                     rep["condition"] = pert
+                    rep["n_pert_cells"] = int(pos_P.size)       # total cells this perturbation has
+                    rep["cells_per_arm"] = int(min(ai.size, bi.size))
                     repro_rows.append(rep)
                 nm = null_metrics(de_AB, cfg)
                 nm["condition"] = pert
@@ -1021,8 +1070,17 @@ def test_1(adata, cfg, outdir):
             ndf.write_csv(os.path.join(outdir, "tables", f"test_1__difference_null_{mode}.csv"))
         rhos = rdf["lfc_spearman"].to_numpy().astype(float)
         rhos = rhos[np.isfinite(rhos)]
-        return {
+        # reproducibility vs cell count, one point PER PERTURBATION, for EVERY statistic
+        pp_df, trend, trends_df = repro_vs_ncells(rdf, cfg)
+        if pp_df is not None:
+            pp_df.write_csv(os.path.join(outdir, "tables", f"test_1__repro_vs_ncells_{mode}.csv"))
+        if trends_df is not None:
+            trends_df.write_csv(os.path.join(outdir, "tables", f"test_1__repro_vs_ncells_trends_{mode}.csv"))
+        rhos_deg = rdf["lfc_spearman_deg"].to_numpy().astype(float)
+        rhos_deg = rhos_deg[np.isfinite(rhos_deg)]
+        ag = {
             "repro_lfc_spearman": float(np.median(rhos)) if rhos.size else float("nan"),
+            "repro_lfc_spearman_deg": float(np.median(rhos_deg)) if rhos_deg.size else float("nan"),
             "repro_jaccard": float(rdf["sig_jaccard"].median()),
             "repro_direction": float(rdf["direction_agreement"].median()),
             "n_strong_rho_gt0.6": int((rhos > REPRO_PASS).sum()),
@@ -1033,31 +1091,28 @@ def test_1(adata, cfg, outdir):
             "diffnull_frac_sig": float(ndf["frac_sig"].mean()) if ndf is not None else float("nan"),
             "diffnull_ks_p_uniform": float(ndf["ks_p_uniform"].mean()) if ndf is not None else float("nan"),
             "n_conditions": int(rdf["condition"].n_unique()), "skipped": skipped,
-            "_rhos": rhos,
+            "_rhos": rhos, "_pc": pp_df,
             "_pooled_p": np.concatenate(pooled) if pooled else np.array([]),
         }
+        ag.update(trend)
+        return ag
 
     out = {}
-    for mode in ("matched", "no_match"):
-        if mode == "matched" and not feat_cols:
-            continue
-        ag = scenario(mode)
-        if ag is not None:
-            out[mode] = ag
+    ag = scenario("no_match")
+    if ag is not None:
+        out["no_match"] = ag
     if not out:
         return TestResult("test_1", "Within-Condition Reproducibility", "SKIP",
                           flags=["no condition had enough cells for an A/B split"],
                           reason="SKIP: insufficient cells")
-    primary = "matched" if "matched" in out else "no_match"
+    primary = "no_match"
     a = out[primary]
     # plot: (left) per-perturbation reproducibility ρ distribution; (right) difference-is-null QQ
     # (A_pert vs B_pert, primary scenario) with the exact Beta(i,G-i+1) 95% envelope.
     png = os.path.join(outdir, "plots", "test_1_reproducibility.png")
     fig, (axl, axr) = plt.subplots(1, 2, figsize=(9.6, 4.0))
-    for mode, col in (("no_match", "#b22222"), ("matched", "#1a3c6e")):
-        if mode in out:
-            axl.hist(out[mode]["_rhos"], bins=20, range=(-1, 1), alpha=0.55, color=col,
-                     label=f"{mode} (median ρ={fmt(out[mode]['repro_lfc_spearman'])})")
+    axl.hist(a["_rhos"], bins=20, range=(-1, 1), alpha=0.65, color="#1a3c6e",
+             label=f"median ρ={fmt(a['repro_lfc_spearman'])} (n={a['n_conditions']})")
     for thr in (REPRO_WARN, REPRO_PASS):
         axl.axvline(thr, ls="--", color="0.5", lw=1)
     axl.set_xlabel("split-half Spearman LFC ρ (per perturbation)")
@@ -1088,14 +1143,22 @@ def test_1(adata, cfg, outdir):
     fig.suptitle("Test 1 — within-condition reproducibility + difference-is-null", fontsize=11)
     fig.tight_layout(); fig.savefig(png, dpi=110); plt.close(fig)
 
+    # reproducibility-vs-cell-count figure (method vs undersampling separator)
+    plot_repro_vs_ncells(out, os.path.join(outdir, "plots", "test_1_undersampling.png"), cfg)
+
     verdict = verdict_reproducibility(a["repro_lfc_spearman"])
     tier = {"PASS": "strong", "WARN": "moderate", "FAIL": "low", "SKIP": "n/a"}[verdict]
     flags = []
-    if "matched" in out and "no_match" in out:
-        flags.append(f"median split-half LFC ρ — matched (batch-controlled)={fmt(out['matched']['repro_lfc_spearman'])} "
-                     f"vs no-match={fmt(out['no_match']['repro_lfc_spearman'])} "
-                     f"(Δ={fmt(out['matched']['repro_lfc_spearman'] - out['no_match']['repro_lfc_spearman'])})")
-    flags.append(f"per-perturbation reproducibility tiers (matched): "
+    wp, up = a.get("repro_rho_wellpowered"), a.get("repro_rho_underpowered")
+    wpn, upn = a.get("n_wellpowered"), a.get("n_underpowered")
+    flags.append(
+        f"reproducibility vs cell count: well-powered (≥{a.get('wellpowered_min_cells')} cells, "
+        f"n={wpn}) median ρ={fmt(wp)} vs under-powered (n={upn}) median ρ={fmt(up)}; "
+        f"Spearman(cell count, ρ)={fmt(a.get('rho_vs_ncells_spearman'))}. "
+        + ("Well-powered ρ ≈ overall ⇒ low reproducibility is a GENUINE method limitation, not undersampling."
+           if (isinstance(wp, float) and np.isfinite(wp) and verdict_reproducibility(wp) == verdict)
+           else "Well-powered perturbations reproduce better ⇒ part of the low score is an undersampling artifact."))
+    flags.append(f"per-perturbation reproducibility tiers: "
                  f"{a['n_strong_rho_gt0.6']} strong / {a['n_moderate_rho_0.3_0.6']} moderate / "
                  f"{a['n_low_rho_lt0.3']} low (of {a['n_conditions']})")
     flags.append("thresholds — " + REPRO_LEGEND)
@@ -1107,7 +1170,7 @@ def test_1(adata, cfg, outdir):
         for k, v in ag.items():
             if not k.startswith("_"):
                 metrics[f"{mode}__{k}"] = v
-    reason = (f"{verdict} [{primary}]: median split-half LFC ρ={fmt(a['repro_lfc_spearman'])} ({tier} "
+    reason = (f"{verdict}: median split-half LFC ρ={fmt(a['repro_lfc_spearman'])} ({tier} "
               f"reproducibility; PASS>{REPRO_PASS}/WARN≥{REPRO_WARN}/FAIL<{REPRO_WARN}); "
               f"Jaccard={fmt(a['repro_jaccard'])}, direction={fmt(a['repro_direction'])}; "
               f"(2°) difference-is-null λ_GC={fmt(a['diffnull_lambda_gc'])}, frac_sig={fmt(a['diffnull_frac_sig'])}")
@@ -1127,10 +1190,19 @@ def test_2(adata, cfg, outdir):
     if ctrl.n_obs < 2 * mcg:
         return TestResult("test_2", "Control-Control Split Null", "SKIP", flags=["too few control cells"],
                           reason="SKIP: too few control cells")
-    rows, pooled = [], []
+    rows, pooled, design = [], [], {}
     for r in range(cfg["n_resamples"]):
         s = ctrl.copy()
         s.obs["_arm"] = stratified_split(ctrl.obs, cfg["block_cols"], cfg["seed"] + 100 + r)
+        if not design:  # capture the sample design once (deterministic across splits)
+            na = int((s.obs["_arm"].astype(str) == "A").sum())
+            nb = int((s.obs["_arm"].astype(str) == "B").sum())
+            design = {"design_n_control_cells": int(ctrl.n_obs), "design_cells_per_arm": int(min(na, nb))}
+            if cfg["de_method"] == "pydeseq2" and cfg.get("replicate_col") in s.obs.columns:
+                rc = cfg["replicate_col"]
+                design["design_n_pseudobulk_samples"] = int(
+                    s.obs.groupby([rc, "_arm"], observed=True).ngroups)
+                design["design_n_replicate_units"] = int(s.obs[rc].nunique())
         try:
             de = run_de(s, cfg, groupby="_arm", reference="B")
         except Exception as e:  # noqa: BLE001
@@ -1147,6 +1219,8 @@ def test_2(adata, cfg, outdir):
     df.write_csv(os.path.join(outdir, "tables", "test_2__per_split.csv"))
     agg = {k: float(df[k].mean()) for k in ("frac_sig", "mean_lfc", "mean_abs_lfc", "lambda_gc", "ks_p_uniform")}
     agg["lambda_gc_sd"] = float(df["lambda_gc"].std()) if df.height > 1 else 0.0
+    agg["design_n_splits"] = int(df.height)
+    agg.update(design)
     qq_plot(np.concatenate(pooled), os.path.join(outdir, "plots", "test_2_qq.png"),
             "Test 2 — control-control null (stratified split)")
     verdict, flags = verdict_from_null(agg, cfg)
@@ -1187,6 +1261,147 @@ def _signal_metric(de: pl.DataFrame, cfg: dict) -> float:
     return float(np.mean(fr)) if fr else float("nan")
 
 
+def _t3_per_pert_pvalues(de: pl.DataFrame, ncells: dict[str, int], cfg: dict, kind: str) -> list[dict]:
+    """Per-perturbation p-value summaries from a DE frame (real or shuffled). Returns one row per
+    `target` (perturbation) with cell count and uniformity/signal summaries. `kind` ∈ {real, shuffled}."""
+    tgt = de["target"].to_numpy().astype(str)
+    pv = de["p_value"].to_numpy().astype(float)
+    lfc = de["log2_fold_change"].to_numpy().astype(float)
+    fdr = de["fdr"].to_numpy().astype(float)
+    rows = []
+    for t in np.unique(tgt):
+        if t == cfg["control_pert"]:
+            continue
+        m = tgt == t
+        p = pv[m]
+        p = p[np.isfinite(p)]
+        if p.size == 0:
+            continue
+        sig = _sig_mask(lfc[m], fdr[m], cfg)
+        rows.append({
+            "perturbation": t,
+            "kind": kind,
+            "n_cells": int(ncells.get(t, 0)),
+            "n_genes": int(p.size),
+            "frac_sig": float(np.nansum(sig) / max(int(m.sum()), 1)),
+            "frac_p_lt_05": float(np.mean(p < 0.05)),
+            "lambda_gc": lambda_gc(p),
+            "ks_p_uniform": float(stats.kstest(p, "uniform").pvalue) if p.size >= 8 else float("nan"),
+        })
+    return rows
+
+
+def _t3_subsample_pooled(pvals: np.ndarray, cap: int, seed: int) -> np.ndarray:
+    """Deterministically subsample a pooled p-value vector to <= cap entries (for ECDF/QQ memory)."""
+    p = pvals[np.isfinite(pvals)]
+    if p.size <= cap:
+        return p
+    idx = np.random.default_rng(seed).choice(p.size, size=cap, replace=False)
+    return p[np.sort(idx)]
+
+
+def _ecdf(p: np.ndarray):
+    s = np.sort(p)
+    return s, np.arange(1, s.size + 1) / s.size
+
+
+def plot_test3_pvalue_diagnostics(real_pooled, shuf_pooled, per_pert_df, strata_pooled, path, cfg):
+    """Diagnostic for Test 3: compare p-value distributions of UNSHUFFLED (real) DE vs SHUFFLED
+    (label-permuted) DE, pooled over all perturbations × tested genes, then stratified by each
+    perturbation's cell count.
+
+    Panels:
+      (A) overlaid p-value ECDF — real should bow ABOVE the diagonal (small-p excess = signal);
+          shuffled should track the diagonal (Uniform = calibrated null).
+      (B) QQ vs Uniform (-log10) — real points rise above the y=x line (signal); shuffled hug it.
+      (C) per-perturbation frac(p<0.05) real vs shuffled scattered against cell count (log-x).
+      (D) ECDF faceted by cell-count stratum (real vs shuffled per stratum) — does the shuffled null
+          stay Uniform, and the real small-p excess hold, for small- vs large-cell-count perturbations?
+    """
+    real_pooled = np.asarray(real_pooled, float)
+    shuf_pooled = np.asarray(shuf_pooled, float)
+    real_pooled = np.clip(real_pooled[np.isfinite(real_pooled)], 1e-300, 1.0)
+    shuf_pooled = np.clip(shuf_pooled[np.isfinite(shuf_pooled)], 1e-300, 1.0)
+    if real_pooled.size < 8 or shuf_pooled.size < 8:
+        return False
+    C_REAL, C_SHUF = "#1a3c6e", "#c0392b"
+    fig, axes = plt.subplots(2, 2, figsize=(10.4, 8.4))
+    axA, axB, axC, axD = axes.ravel()
+
+    # (A) overlaid ECDF
+    for p, lab, col in ((real_pooled, "real (unshuffled)", C_REAL), (shuf_pooled, "shuffled", C_SHUF)):
+        xs, ys = _ecdf(p)
+        if xs.size > 4000:
+            k = np.unique(np.linspace(0, xs.size - 1, 4000).astype(int)); xs, ys = xs[k], ys[k]
+        axA.plot(xs, ys, color=col, lw=1.6,
+                 label=f"{lab} (frac p<0.05={fmt(float(np.mean(p < 0.05)))}, λ_GC={fmt(lambda_gc(p))})")
+    axA.plot([0, 1], [0, 1], "k--", lw=1, label="Uniform")
+    axA.set_xlabel("p-value"); axA.set_ylabel("ECDF")
+    axA.set_title("(A) Pooled p-value ECDF — real vs shuffled\n(real bows above diagonal = signal; "
+                  "shuffled on diagonal = calibrated null)", fontsize=8.5)
+    axA.legend(fontsize=7, loc="lower right")
+
+    # (B) QQ vs Uniform (-log10)
+    for p, lab, col in ((real_pooled, "real", C_REAL), (shuf_pooled, "shuffled", C_SHUF)):
+        sp = np.sort(p); G = sp.size
+        i = np.arange(1, G + 1)
+        exp = -np.log10((i - 0.5) / G); obs = -np.log10(sp)
+        if G > 3000:
+            k = np.unique(np.linspace(0, G - 1, 3000).astype(int)); exp, obs = exp[k], obs[k]
+        axB.scatter(exp, obs, s=5, color=col, label=lab)
+    m = float(max(-np.log10(0.5 / real_pooled.size), -np.log10(0.5 / shuf_pooled.size)))
+    axB.plot([0, m], [0, m], "k--", lw=1)
+    axB.set_xlabel("expected -log10(p) [Uniform]"); axB.set_ylabel("observed -log10(p)")
+    axB.set_title("(B) QQ vs Uniform — pooled\n(real above line = small-p excess; shuffled on line)",
+                  fontsize=8.5)
+    axB.legend(fontsize=7, loc="upper left")
+
+    # (C) per-perturbation frac(p<0.05) vs cell count
+    if per_pert_df is not None and per_pert_df.height:
+        for kind, col in (("real", C_REAL), ("shuffled", C_SHUF)):
+            d = per_pert_df.filter(pl.col("kind") == kind)
+            if d.height:
+                axC.scatter(d["n_cells"].to_numpy(), d["frac_p_lt_05"].to_numpy(),
+                            s=26, alpha=0.7, color=col, edgecolor="white", linewidth=0.4,
+                            label=f"{kind} (median={fmt(float(d['frac_p_lt_05'].median()))})")
+        axC.axhline(0.05, ls=":", color="0.5", lw=1)
+        axC.text(axC.get_xlim()[1], 0.05, " 0.05 (Uniform)", va="center", fontsize=7, color="0.4")
+        axC.set_xscale("log")
+        axC.set_xlabel("perturbation cell count (log scale)")
+        axC.set_ylabel("fraction of genes with p < 0.05")
+        axC.set_title("(C) Per-perturbation small-p fraction vs cell count\n"
+                      "(real >> shuffled = signal; shuffled flat near 0.05 = calibrated)", fontsize=8.5)
+        axC.legend(fontsize=7, loc="upper left")
+
+    # (D) ECDF faceted by cell-count stratum
+    if strata_pooled:
+        strata = sorted(strata_pooled.keys())
+        cmap_real = plt.cm.Blues(np.linspace(0.5, 0.95, len(strata)))
+        cmap_shuf = plt.cm.Reds(np.linspace(0.5, 0.95, len(strata)))
+        for si, sname in enumerate(strata):
+            d = strata_pooled[sname]
+            for kind, cm in (("real", cmap_real), ("shuffled", cmap_shuf)):
+                p = np.clip(np.asarray(d.get(kind, []), float), 1e-300, 1.0)
+                p = p[np.isfinite(p)]
+                if p.size < 8:
+                    continue
+                xs, ys = _ecdf(p)
+                if xs.size > 3000:
+                    k = np.unique(np.linspace(0, xs.size - 1, 3000).astype(int)); xs, ys = xs[k], ys[k]
+                axD.plot(xs, ys, color=cm[si], lw=1.4, ls="-" if kind == "real" else "--",
+                         label=f"{sname} {kind}")
+        axD.plot([0, 1], [0, 1], "k:", lw=1)
+        axD.set_xlabel("p-value"); axD.set_ylabel("ECDF")
+        axD.set_title("(D) p-value ECDF by cell-count stratum\n(solid=real, dashed=shuffled; does the "
+                      "null stay Uniform for small-cell-count perts?)", fontsize=8.5)
+        axD.legend(fontsize=6.5, loc="lower right", ncol=2)
+    fig.suptitle("Test 3 — label-permutation p-value diagnostics (real vs shuffled), "
+                 "stratified by perturbation cell count", fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(path, dpi=115); plt.close(fig)
+    return True
+
+
 def test_3(adata, cfg, outdir, de_true=None):
     pc = cfg["pert_col"]
     perts = perts_in_use(adata, cfg)
@@ -1194,9 +1409,15 @@ def test_3(adata, cfg, outdir, de_true=None):
     if de_true is None:
         de_true = run_de(keep, cfg, groupby=pc, reference=cfg["control_pert"])
     true_metric = _signal_metric(de_true, cfg)
+    # per-perturbation cell counts (from the cells actually used here) for cell-count stratification
+    ncells = keep.obs[pc].astype(str).value_counts().to_dict()
     rng = np.random.default_rng(cfg["seed"] + 3)
     blocks = [c for c in cfg["block_cols"] if c in keep.obs.columns]
     perm_metrics = []
+    # p-value diagnostics: per-pert summaries (real once + every shuffle) and pooled p-values
+    pp_rows = _t3_per_pert_pvalues(de_true, ncells, cfg, "real")
+    real_pooled = de_true["p_value"].to_numpy().astype(float)
+    _t3_shuf_targets = []  # list of (target_array, pvalue_array) per successful permutation
     labels0 = keep.obs[pc].astype(str).to_numpy()
     is_ctrl = labels0 == cfg["control_pert"]
     for r in range(cfg["n_resamples"]):
@@ -1217,6 +1438,11 @@ def test_3(adata, cfg, outdir, de_true=None):
         try:
             de_p = run_de(s, cfg, groupby="_perm", reference=cfg["control_pert"])
             perm_metrics.append(_signal_metric(de_p, cfg))
+            # the shuffled "perturbation" label is arbitrary; tie each shuffled DE row's cell count
+            # to the count of the (shuffled) label group so strata pool comparable group sizes
+            pp_rows += _t3_per_pert_pvalues(de_p, ncells, cfg, "shuffled")
+            _t3_shuf_targets.append((de_p["target"].to_numpy().astype(str),
+                                     de_p["p_value"].to_numpy().astype(float)))
         except Exception as e:  # noqa: BLE001
             log.warning("test3 perm%d: %s", r, e)
     if len(perm_metrics) < 2:
@@ -1226,6 +1452,90 @@ def test_3(adata, cfg, outdir, de_true=None):
     sep = (true_metric - pm.mean()) / pm.std(ddof=1) if pm.std(ddof=1) > 0 else float("inf")
     perm_p = float((pm >= true_metric).mean())
     pl.DataFrame({"perm_signal": pm}).write_csv(os.path.join(outdir, "tables", "test_3__permutations.csv"))
+
+    # ---- cell-count-stratified p-value diagnostics (real vs shuffled) ----
+    diag_metrics, diag_flags = {}, []
+    plot_rel = None
+    pp_df = pl.DataFrame(pp_rows) if pp_rows else None
+    if pp_df is not None and pp_df.height:
+        # assign each perturbation to a cell-count stratum (tertiles by default) from the REAL rows'
+        # distinct perturbation cell counts, so the same edges apply to real and shuffled rows
+        nstr = max(2, int(cfg.get("test3_n_cellcount_strata", 3)))
+        real_nc = (pp_df.filter(pl.col("kind") == "real")
+                        .select(["perturbation", "n_cells"]).unique())
+        ncv = real_nc["n_cells"].to_numpy().astype(float)
+        if ncv.size >= nstr:
+            qs = np.quantile(ncv, np.linspace(0, 1, nstr + 1))
+            def _stratum(n):
+                k = int(np.clip(np.searchsorted(qs, n, side="right") - 1, 0, nstr - 1))
+                lo, hi = qs[k], qs[k + 1]
+                return f"S{k + 1} [{int(round(lo)):,}-{int(round(hi)):,}]"
+            pp_df = pp_df.with_columns(
+                pl.col("n_cells").map_elements(_stratum, return_dtype=pl.Utf8).alias("cellcount_stratum"))
+        else:
+            pp_df = pp_df.with_columns(pl.lit("all").alias("cellcount_stratum"))
+        pp_df.write_csv(os.path.join(outdir, "tables", "test_3__pvalues_by_cellcount.csv"))
+
+        # pooled p-values for ECDF/QQ, deterministically subsampled for memory
+        cap = int(cfg.get("test3_pooled_pval_subsample", 40000))
+        real_p = _t3_subsample_pooled(real_pooled, cap, cfg["seed"] + 31)
+        shuf_all = (np.concatenate([c[1] for c in _t3_shuf_targets]) if _t3_shuf_targets else np.array([]))
+        shuf_p = _t3_subsample_pooled(shuf_all, cap, cfg["seed"] + 32)
+        pl.DataFrame({"kind": ["real"] * real_p.size + ["shuffled"] * shuf_p.size,
+                      "p_value": np.concatenate([real_p, shuf_p]) if (real_p.size or shuf_p.size)
+                      else np.array([])}).write_csv(
+            os.path.join(outdir, "tables", "test_3__pooled_pvalues.csv"))
+
+        # per-stratum pooled p-values (subsampled per stratum/kind) for the faceted ECDF. A perturbation
+        # maps to a cell-count stratum via the REAL per-pert cell counts; the same map is applied to the
+        # shuffled DE rows by (shuffled) label group, so each stratum pools comparable group sizes.
+        strata_pooled = {}
+        if "cellcount_stratum" in pp_df.columns:
+            pert2str = dict(zip(pp_df.filter(pl.col("kind") == "real")["perturbation"].to_list(),
+                                pp_df.filter(pl.col("kind") == "real")["cellcount_stratum"].to_list()))
+            snames = sorted(set(pert2str.values()))
+            per_cap = max(2000, cap // max(len(snames), 1))
+            real_tgt = de_true["target"].to_numpy().astype(str)
+            real_pv = de_true["p_value"].to_numpy().astype(float)
+            real_str = np.array([pert2str.get(t, None) for t in real_tgt], dtype=object)
+            # pool shuffled p-values by stratum across all permutation chunks (label group sizes are the
+            # same control-vs-pert group counts, so the same n_cells/stratum mapping applies)
+            shuf_tgt = (np.concatenate([c[0] for c in _t3_shuf_targets]) if _t3_shuf_targets else np.array([], str))
+            shuf_pv = (np.concatenate([c[1] for c in _t3_shuf_targets]) if _t3_shuf_targets else np.array([]))
+            shuf_str = np.array([pert2str.get(t, None) for t in shuf_tgt], dtype=object)
+            for si, sname in enumerate(snames):
+                strata_pooled[sname] = {
+                    "real": _t3_subsample_pooled(real_pv[real_str == sname], per_cap, cfg["seed"] + 33 + si),
+                    "shuffled": _t3_subsample_pooled(shuf_pv[shuf_str == sname], per_cap,
+                                                     cfg["seed"] + 50 + si),
+                }
+        else:
+            strata_pooled = {}
+
+        plot_path = os.path.join(outdir, "plots", "test_3_pvalue_diagnostics.png")
+        if plot_test3_pvalue_diagnostics(real_p, shuf_p, pp_df, strata_pooled, plot_path, cfg):
+            plot_rel = "plots/test_3_pvalue_diagnostics.png"
+
+        rr = pp_df.filter(pl.col("kind") == "real")
+        ss = pp_df.filter(pl.col("kind") == "shuffled")
+        diag_metrics = {
+            "real_frac_p_lt_05": float(rr["frac_p_lt_05"].median()) if rr.height else float("nan"),
+            "shuffled_frac_p_lt_05": float(ss["frac_p_lt_05"].median()) if ss.height else float("nan"),
+            "real_frac_sig": float(rr["frac_sig"].median()) if rr.height else float("nan"),
+            "shuffled_frac_sig": float(ss["frac_sig"].median()) if ss.height else float("nan"),
+            "real_lambda_gc_pooled": lambda_gc(real_p),
+            "shuffled_lambda_gc_pooled": lambda_gc(shuf_p),
+            "shuffled_ks_p_uniform_median": float(ss["ks_p_uniform"].median()) if ss.height else float("nan"),
+        }
+        diag_flags.append(
+            f"p-value diagnostic (pooled over perturbations × genes): real frac(p<0.05)="
+            f"{fmt(diag_metrics['real_frac_p_lt_05'])} / λ_GC={fmt(diag_metrics['real_lambda_gc_pooled'])} "
+            f"vs shuffled frac(p<0.05)={fmt(diag_metrics['shuffled_frac_p_lt_05'])} / "
+            f"λ_GC={fmt(diag_metrics['shuffled_lambda_gc_pooled'])} "
+            "(real >> shuffled small-p excess = signal; shuffled ≈ Uniform/0.05 = calibrated null). "
+            "Stratified by cell count in plots/test_3_pvalue_diagnostics.png + "
+            "tables/test_3__pvalues_by_cellcount.csv.")
+
     if not np.isfinite(sep):
         verdict = "PASS" if true_metric > pm.max() else "WARN"
     elif sep > 2:
@@ -1236,10 +1546,13 @@ def test_3(adata, cfg, outdir, de_true=None):
         verdict = "FAIL"
     reason = (f"{verdict}: true signal {fmt(true_metric)} vs shuffled {fmt(float(pm.mean()))} "
               f"(separation z={fmt(float(sep))}, perm_p={fmt(perm_p)})")
+    metrics = {"true_signal": true_metric, "perm_mean": float(pm.mean()),
+               "perm_sd": float(pm.std(ddof=1)), "separation_z": float(sep)}
+    metrics.update(diag_metrics)
     return TestResult("test_3", "Label Permutation Null", verdict,
-                      metrics={"true_signal": true_metric, "perm_mean": float(pm.mean()),
-                               "perm_sd": float(pm.std(ddof=1)), "separation_z": float(sep)},
-                      flags=[], pvalues={"perm_p": perm_p, "separation_z": float(sep)}, reason=reason), de_true
+                      metrics=metrics, flags=diag_flags,
+                      pvalues={"perm_p": perm_p, "separation_z": float(sep)},
+                      plot=plot_rel, reason=reason), de_true
 
 
 def test_4(adata, cfg, outdir):
@@ -1427,19 +1740,25 @@ TEST_DOC = {
               "calibrated null from a pipeline that simply finds nothing, and tells you the smallest "
               "effect the metric can resolve.",
     "test_1": "REPRODUCIBILITY. Split each perturbation's cells into halves A and B and run each vs "
-              "control (DE_A, DE_B) — both carry the real perturbation signal. The question is whether "
-              "the two independent half-signatures AGREE (DE_A ≈ DE_B): median split-half Spearman LFC "
-              "ρ (PASS>0.6 strong / 0.3–0.6 moderate / <0.3 low). Run under two control-assignment "
-              "scenarios — no_match (split control halves) vs matched (1:1 batch-matched controls) — to "
-              "see whether batch matching improves reproducibility. (Secondary sanity check: the direct "
-              "A_pert-vs-B_pert contrast, same perturbation, should be ≈null.)",
+              "control (DE_A, DE_B) — both carry the real perturbation signal. Controls are split into "
+              "two halves (DE_A = A vs ctrl_half_A, DE_B = B vs ctrl_half_B; NO 1:1 cell matching). The "
+              "question is whether the two independent half-signatures AGREE (DE_A ≈ DE_B): median "
+              "split-half Spearman LFC ρ (PASS>0.6 strong / 0.3–0.6 moderate / <0.3 low). To separate a "
+              "genuinely low-reproducibility method from merely undersampled perturbations, ρ is also "
+              "plotted PER PERTURBATION against that perturbation's cell count (climbs→plateau = "
+              "power-limited; flat/low at high cell counts = genuine method limitation). (Secondary "
+              "sanity check: the direct A_pert-vs-B_pert contrast, same perturbation, should be ≈null.)",
     "test_2": "CALIBRATION / NULL. Split only control cells into A and B (a stratified random split "
               "balanced within batch; same population ⇒ true null) and run DE between them: a calibrated "
               "pipeline should produce Uniform[0,1] p-values (λ_GC≈1, frac_sig≈α). Inflation (λ_GC>1) = "
               "false positives; deflation (λ_GC<1) = under-powered (cell-level pseudoreplication).",
     "test_3": "Shuffle the perturbation labels (within batch) and recompute. Real biological signal "
               "should sit far outside the shuffled distribution (high separation z); if not, the "
-              "metric cannot tell signal from noise.",
+              "metric cannot tell signal from noise. A diagnostic compares the per-gene p-value "
+              "distributions of the real vs shuffled DE, pooled over all perturbations × genes and "
+              "stratified by each perturbation's cell count: the real run should show a small-p "
+              "excess (signal) while the shuffled run should track Uniform[0,1] (a calibrated null), "
+              "consistently across small- and large-cell-count perturbations.",
     "test_4": "Split each guide's cells in two and compare each half vs control. Agreement between "
               "the halves is the reproducibility ceiling — no model can score higher on a perturbation "
               "than the data agrees with itself.",
@@ -1470,7 +1789,9 @@ TIER_DOC = {
               "conservative). frac_sig: ≈ α good · ≫ α FAIL. ks_p_uniform: > 0.05 good · < 0.05 WARN "
               "(p-values not Uniform[0,1]). Arms are a stratified control-control split (true null).",
     "test_3": "**Tiers** — separation z (true signal vs permuted null): > 2 PASS · 1–2 WARN · ≤ 1 FAIL "
-              "(metric cannot tell signal from noise).",
+              "(metric cannot tell signal from noise). Diagnostic: real p-values should show a small-p "
+              "excess (ECDF above diagonal / QQ above the line) while shuffled p-values track "
+              "Uniform[0,1] (frac(p<0.05)≈0.05, λ_GC≈1) — across all cell-count strata.",
     "test_4": "**Tiers** (same as Test 1) — LFC Spearman ρ: > 0.6 strong/PASS · 0.3–0.6 moderate/WARN · "
               "< 0.3 low/FAIL. DEG Jaccard: > 0.3 · 0.1–0.3 · < 0.1. Direction: > 0.7 · 0.6–0.7 · ≈ 0.5. "
               "This is the empirical reproducibility ceiling for downstream metrics.",
@@ -1655,11 +1976,12 @@ def write_report(results, cfg, power, fp, outdir):
           "| test_0 | gate — calibration + power | Inject a known effect: what false-positive rate at "
           "the null, and what effect size can the metric resolve (TPR vs δ)? |",
           "| test_1 | **reproducibility** | Split a perturbation in half vs control — do the two "
-          "half-signatures agree (DE_A≈DE_B)? Is it improved by 1:1 batch-matched controls? |",
+          "half-signatures agree (DE_A≈DE_B)? And does that agreement depend on cell count? |",
           "| test_2 | gate — null calibration | Split control cells into A/B (stratified, true null) — "
           "are the p-values Uniform[0,1] (λ_GC≈1, frac_sig≈α)? |",
           "| test_3 | gate — signal vs noise | Shuffle perturbation labels — is real signal far outside "
-          "the permuted null (separation z)? |",
+          "the permuted null (separation z)? Diagnostic: do real p-values show a small-p excess while "
+          "shuffled p-values stay Uniform, across cell-count strata? |",
           "| test_4 | sensitivity — ceiling | Same-guide split reproducibility — the empirical ceiling "
           "for any downstream metric. |",
           "| test_5 | sensitivity | Do independent guides for the same gene agree more than unrelated "
@@ -1748,24 +2070,59 @@ def write_report(results, cfg, power, fp, outdir):
             L.append("")
         L.append(f"**Verdict reason:** {r.reason}")
         L.append("")
-        # Test 1: scenario comparison (no_match vs matched) × two statistics — render as a clean table
-        if r.name == "test_1" and any(k.startswith(("no_match__", "matched__")) for k in r.metrics):
+        # Test 1: reproducibility statistics — render as a clean table
+        if r.name == "test_1" and any(k.startswith("no_match__") for k in r.metrics):
             m = r.metrics
-            present = [mode for mode in ("no_match", "matched") if f"{mode}__repro_lfc_spearman" in m]
-            L.append("**What this compares.** Split each perturbation's cells into two halves A and B "
-                     "and run each half against control (`DE_A`, `DE_B`). The **primary** question is "
-                     "*reproducibility* — do the two independent half-signatures agree (`DE_A ≈ DE_B`)? "
-                     "— under two control-assignment scenarios: **no_match** (1.a — controls split into "
-                     "two halves, cell-eval pdex, no 1:1 matching) vs **matched** (2.a — perturbed cells "
-                     "1:1 batch-matched to controls, then split into perturb–control pairs). The "
-                     "comparison answers: *does 1:1 batch matching improve reproducibility?* A "
-                     "**secondary** difference-is-null stat (direct `A_pert vs B_pert`, the same "
-                     "perturbation ⇒ should be ≈null) is reported as a sanity check.")
+            present = ["no_match"]
+            L.append("**What this measures.** Split each perturbation's cells into two halves A and B "
+                     "and run each half against control (`DE_A`, `DE_B`), with the control cells also "
+                     "split into two halves (`DE_A = A vs ctrl_half_A`, `DE_B = B vs ctrl_half_B`; **no "
+                     "1:1 cell matching**). The **primary** question is *reproducibility* — do the two "
+                     "independent half-signatures agree (`DE_A ≈ DE_B`)? A **secondary** difference-is-null "
+                     "stat (direct `A_pert vs B_pert`, the same perturbation ⇒ should be ≈null) is "
+                     "reported as a sanity check.")
             L.append("")
-            L.append("| statistic | " + " | ".join(present) + " |")
-            L.append("|---|" + "|".join("---" for _ in present) + "|")
+            # --- design: what's compared, how DE is defined, thresholds, and per-perturbation cell counts ---
+            de_desc = ("cell-level **Wilcoxon rank-sum** (each cell is a unit; log2FC = "
+                       "log2(mean_perturbed / mean_control), BH-FDR)" if cfg.get("de_method") == "pdex"
+                       else "**pseudobulk DESeq2 Wald** (cells summed per replicate/`%s`, negative-binomial GLM)"
+                       % cfg.get("replicate_col", "batch") if cfg.get("de_method") == "pydeseq2"
+                       else f"`{cfg.get('de_method')}`")
+            nperm_t1 = cfg.get("test1_n_resamples", min(3, cfg.get("n_resamples", 10)))
+            ncond = m.get("no_match__n_conditions")
+            nctrl = fp.get("n_control_cells")
+            ppcsv = os.path.join(outdir, "tables", "test_1__repro_vs_ncells_no_match.csv")
+            cell_txt = ""
+            if os.path.exists(ppcsv):
+                ncv = pl.read_csv(ppcsv)["n_cells"].to_numpy()
+                if ncv.size:
+                    cell_txt = (f" Across the **{ncv.size} tested perturbations**, total cells per "
+                                f"perturbation range **{int(ncv.min()):,}–{int(ncv.max()):,}** "
+                                f"(median {int(np.median(ncv)):,}); each A/B half uses ~half of those "
+                                "(the per-perturbation counts are in the table below / "
+                                "`tables/test_1__repro_vs_ncells_no_match.csv`).")
+            L.append(
+                "*Design (ground truth).* An **arm** is one side of the split DE compares. `DE_A` and "
+                f"`DE_B` are computed with the **same DE method as the main analysis** — {de_desc} — and a "
+                f"gene is called a DEG when **FDR < {cfg.get('fdr_threshold')}** and **|log2FC| > "
+                f"{cfg.get('lfc_threshold')}**. Reproducibility compares the two signatures gene-by-gene: "
+                "**Spearman ρ of their log2FC vectors** (primary), **DEG-set Jaccard**, and **direction "
+                f"agreement**. The split is repeated for **{nperm_t1} draws** (`test1_n_resamples`) per "
+                f"perturbation (each perturbation's reported ρ is the median over its {nperm_t1} draws). "
+                f"Controls ({nctrl:,} cells) are split into two halves (~{nctrl // 2:,} each).{cell_txt}")
+            L.append("")
+            L.append(f"*Thresholds (reproducibility tiers).* split-half LFC Spearman ρ: **PASS > "
+                     f"{REPRO_PASS}** (strong) / **WARN {REPRO_WARN}–{REPRO_PASS}** (moderate) / **FAIL < "
+                     f"{REPRO_WARN}** (low) — this drives the verdict. DEG Jaccard: strong ≥ "
+                     f"{REPRO_METRIC_TIERS['sig_jaccard'][1]} / moderate ≥ {REPRO_METRIC_TIERS['sig_jaccard'][2]}. "
+                     f"Direction agreement: strong ≥ {REPRO_METRIC_TIERS['direction_agreement'][1]} / moderate "
+                     f"≥ {REPRO_METRIC_TIERS['direction_agreement'][2]}.")
+            L.append("")
+            L.append("| statistic | value |")
+            L.append("|---|---|")
             rowdefs = [
-                ("**reproducibility** — median Spearman LFC ρ (PRIMARY)", "repro_lfc_spearman"),
+                ("**reproducibility** — median Spearman LFC ρ, ALL genes (PRIMARY)", "repro_lfc_spearman"),
+                ("reproducibility — median Spearman LFC ρ, DE genes only (2°)", "repro_lfc_spearman_deg"),
                 ("reproducibility — median DEG Jaccard", "repro_jaccard"),
                 ("reproducibility — median direction agreement", "repro_direction"),
                 ("# perturbations strong (ρ>0.6)", "n_strong_rho_gt0.6"),
@@ -1776,8 +2133,8 @@ def write_report(results, cfg, power, fp, outdir):
                 ("(2°) difference-is-null ks_p_uniform", "diffnull_ks_p_uniform"),
                 ("# perturbations tested", "n_conditions"),
             ]
-            tier_key = {"repro_lfc_spearman": "lfc_spearman", "repro_jaccard": "sig_jaccard",
-                        "repro_direction": "direction_agreement"}
+            tier_key = {"repro_lfc_spearman": "lfc_spearman", "repro_lfc_spearman_deg": "lfc_spearman",
+                        "repro_jaccard": "sig_jaccard", "repro_direction": "direction_agreement"}
             for lbl, key in rowdefs:
                 cells = []
                 for mode in present:
@@ -1788,15 +2145,156 @@ def write_report(results, cfg, power, fp, outdir):
                         cells.append(fmt(v))
                 L.append(f"| {lbl} | " + " | ".join(cells) + " |")
             L.append("")
-            L.append(f"_Tiers (strong/moderate/low) per metric: {REPRO_LEGEND} The matched "
-                     "(batch-controlled) scenario's LFC ρ drives the verdict. difference-is-null: A and "
-                     "B are the same perturbation, so a calibrated pipeline calls ≈α (λ_GC≈1, p uniform)._")
+            L.append(f"_Tiers (strong/moderate/low) per metric: {REPRO_LEGEND} The split-half LFC ρ "
+                     "(all genes) drives the verdict. difference-is-null: A and B are the same perturbation, "
+                     "so a calibrated pipeline calls ≈α (λ_GC≈1, p uniform)._")
             L.append("")
+            # which gene set each reproducibility metric uses
+            L.append("*Which genes each metric uses:*")
+            L.append("")
+            L.append("| metric | gene set used |")
+            L.append("|---|---|")
+            L.append("| `lfc_spearman` (primary, verdict driver) | **ALL genes** with a finite log2FC in both "
+                     "halves — the full transcriptome (~all measured genes), no significance filter |")
+            L.append(f"| `lfc_spearman_deg` (additional) | **DE genes only** — Spearman over the *union* of "
+                     f"the two significant sets (FDR below {cfg.get('fdr_threshold')} and abs(log2FC) above "
+                     f"{cfg.get('lfc_threshold')}); isolates the responsive genes, undiluted by near-zero-"
+                     "effect genes |")
+            L.append("| `sig_jaccard` | **DE genes only** — intersection ÷ union of the two significant sets |")
+            L.append("| `direction_agreement` | **DE genes only** — sign concordance over the union of "
+                     "significant genes (significant in A or B) |")
+            L.append("")
+            # Reproducibility vs cell count — is it the method, or undersampling?
+            if any(f"{mode}__rho_vs_ncells_spearman" in m for mode in present):
+                wp_min = next((m.get(f"{mode}__wellpowered_min_cells") for mode in present
+                               if m.get(f"{mode}__wellpowered_min_cells")), 200)
+                L.append("**Reproducibility vs cell count — is it the method, or undersampling?** Splitting a "
+                         "perturbation into halves starves small conditions of cells, so each perturbation is "
+                         "plotted as **one point** (its total cell count vs its median split-half ρ). Points "
+                         "that **climb with cell count and plateau** ⇒ low scores are power-limited (not enough "
+                         "cells); points that **stay low even at high cell counts** ⇒ a genuine method "
+                         f"limitation. Well-powered = ≥{wp_min} total cells (≈≥100 per half).")
+                L.append("")
+                for mode in present:
+                    if f"{mode}__rho_vs_ncells_spearman" not in m:
+                        continue
+                    wp, up = m.get(f"{mode}__repro_rho_wellpowered"), m.get(f"{mode}__repro_rho_underpowered")
+                    wpn, upn = m.get(f"{mode}__n_wellpowered"), m.get(f"{mode}__n_underpowered")
+                    tr = m.get(f"{mode}__rho_vs_ncells_spearman")
+                    overall_mode = m.get(f"{mode}__repro_lfc_spearman")
+                    lifts = (isinstance(wp, (int, float)) and np.isfinite(wp)
+                             and isinstance(overall_mode, (int, float))
+                             and verdict_reproducibility(wp) != verdict_reproducibility(overall_mode))
+                    note = ("→ restricting to well-powered perturbations **lifts** ρ across a tier boundary ⇒ "
+                            "part of the low score is an undersampling artifact." if lifts else
+                            "→ well-powered ρ ≈ this scenario's overall ρ ⇒ the score reflects a **genuine "
+                            "method property**, not undersampling.")
+                    L.append(f"- **{mode}**: well-powered (n={wpn}) median ρ={fmt(wp)} · under-powered "
+                             f"(n={upn}) median ρ={fmt(up)} · Spearman(cell count, ρ)={fmt(tr)} {note}")
+                L.append("")
+                L.append("The figure shows this for **every** reproducibility statistic (one panel each), "
+                         "one point per perturbation:")
+                L.append("")
+                upng = "plots/test_1_undersampling.png"
+                if os.path.exists(os.path.join(outdir, upng)):
+                    L.append(f"![reproducibility vs cell count]({upng})")
+                    L.append("")
+                # per-statistic cell-count trend table (Spearman of cell count vs the metric + well/under medians)
+                tcsv = os.path.join(outdir, "tables", "test_1__repro_vs_ncells_trends_no_match.csv")
+                if os.path.exists(tcsv):
+                    tdf = pl.read_csv(tcsv)
+                    L.append("Per-statistic cell-count dependence (one point per perturbation):")
+                    L.append("")
+                    L.append("| statistic | Spearman(cells, value) | well-powered median | under-powered median |")
+                    L.append("|---|---|---|---|")
+                    nice = {"lfc_spearman": "Spearman LFC — all genes", "lfc_spearman_deg": "Spearman LFC — DE genes",
+                            "sig_jaccard": "DEG-set Jaccard (≡ all-genes)",
+                            "direction_agreement_all": "Direction agreement — all genes",
+                            "direction_agreement": "Direction agreement — DE genes"}
+                    for row in tdf.iter_rows(named=True):
+                        L.append(f"| {nice.get(row['metric'], row['metric'])} | {fmt(row['spearman_ncells'])} | "
+                                 f"{fmt(row['wellpowered_median'])} (n={row['n_wellpowered']}) | "
+                                 f"{fmt(row['underpowered_median'])} (n={row['n_underpowered']}) |")
+                    L.append("")
+                    L.append("_A positive Spearman (cells↑ ⇒ value↑) with a higher well-powered median = "
+                             "power-limited for that statistic; ≈0 / negative with well-powered ≈ overall = a "
+                             "genuine method property. Jaccard is universe-independent, so its all-genes and "
+                             "DE-genes values coincide._")
+                    L.append("")
+                L.append("_Per-perturbation points: `tables/test_1__repro_vs_ncells_no_match.csv`; "
+                         "per-statistic trends: `tables/test_1__repro_vs_ncells_trends_no_match.csv`._")
+                L.append("")
         elif r.metrics:
             L.append("| metric | value |")
             L.append("|---|---|")
             for k, v in r.metrics.items():
                 L.append(f"| `{k}` | {fmt(v)} |")
+            L.append("")
+        # Test 2: state the sample design (cells/arm, # pseudobulk samples, # repeats) in plain prose
+        if r.name == "test_2" and r.verdict != "SKIP" and r.metrics:
+            mm = r.metrics
+            nctrl = mm.get("design_n_control_cells") or fp.get("n_control_cells")
+            cpa = mm.get("design_cells_per_arm")
+            nsplit = mm.get("design_n_splits") or cfg.get("n_resamples")
+            pb = mm.get("design_n_pseudobulk_samples")
+            nbatch = mm.get("design_n_replicate_units")
+            agg_txt = ""
+            if cfg.get("de_method") == "pydeseq2" and pb:
+                agg_txt = (f" For DESeq2 these cells are then **aggregated into ~{pb} pseudobulk samples** "
+                           f"({nbatch} {cfg.get('replicate_col', 'batch')}es × 2 arms), and the Wald test is "
+                           "run on those replicate-level pseudobulk profiles.")
+            L.append(
+                "*Sample design (ground truth).* Both arms are **control cells** (same population ⇒ a true "
+                f"null). All **{nctrl:,} control cells** are used every repeat (no cap/subsampling): each "
+                f"repeat is a fresh batch-stratified random split into two arms of **~{cpa:,} cells each** "
+                f"(balanced within `{cfg.get('block_cols')}`).{agg_txt} The split is repeated for "
+                f"**{nsplit} draws** (`n_resamples`); per-draw λ_GC / frac_sig / ks_p are averaged "
+                "(draw-to-draw SD of λ_GC reported), and all draws' p-values are pooled for the QQ plot.")
+            L.append("")
+        # Test 3: cell-count-stratified p-value diagnostics (real vs shuffled) — how to read them
+        if r.name == "test_3" and r.verdict != "SKIP":
+            m3 = r.metrics
+            nperm_t3 = cfg.get("n_resamples")
+            blk = [c for c in cfg.get("block_cols", []) if c]
+            blk_txt = (f"within `{blk}`" if blk else "globally (no block columns)")
+            L.append(
+                "*Design (ground truth).* The perturbation labels are randomly **shuffled among the "
+                f"non-control cells {blk_txt}** (the control cells keep their label) and the **same DE is "
+                f"re-run** — repeated for **{nperm_t3} permutations** (`n_resamples`). This destroys the "
+                "real perturbation→expression coupling while preserving batch structure, library-size, and "
+                "the number of cells per group, so the shuffled run is a matched **negative control**.")
+            L.append("")
+            L.append(
+                "**How to read the p-value diagnostic** (`plots/test_3_pvalue_diagnostics.png`). Each "
+                "perturbation contributes the per-gene p-values of its perturbation-vs-control DE, pooled "
+                "over **all perturbations × all tested genes**, for the **real (unshuffled)** run and the "
+                "**shuffled** run:\n"
+                "- **(A) ECDF** — the real curve should bow **above** the y=x diagonal (an **excess of "
+                "small p-values** = genuine signal); the shuffled curve should **track the diagonal** "
+                "(p ~ Uniform[0,1] = a calibrated null).\n"
+                "- **(B) QQ vs Uniform** (−log10) — real points rise **above** the y=x line (small-p "
+                "excess); shuffled points **hug** the line if the null is calibrated, or rise above it if "
+                "the pipeline is anti-conservative even with no real signal.\n"
+                "- **(C) per-perturbation** fraction of genes with p<0.05 vs **cell count** (log-x): real "
+                "should sit **well above** shuffled, and shuffled should hover near the 0.05 Uniform "
+                "reference regardless of cell count.\n"
+                "- **(D) ECDF stratified by cell-count tertile** — checks whether the shuffled null stays "
+                "Uniform and the real small-p excess holds for **small- vs large-cell-count** "
+                "perturbations (a cell-count-dependent shuffled curve would flag size-driven miscalibration).")
+            L.append("")
+            L.append(
+                f"**What the numbers say here.** Pooled over perturbations × genes, the **real** run has "
+                f"median frac(p<0.05)={fmt(m3.get('real_frac_p_lt_05'))} (frac_sig={fmt(m3.get('real_frac_sig'))}, "
+                f"pooled λ_GC={fmt(m3.get('real_lambda_gc_pooled'))}) versus the **shuffled** run's "
+                f"frac(p<0.05)={fmt(m3.get('shuffled_frac_p_lt_05'))} "
+                f"(frac_sig={fmt(m3.get('shuffled_frac_sig'))}, pooled λ_GC="
+                f"{fmt(m3.get('shuffled_lambda_gc_pooled'))}, median per-pert ks_p_uniform="
+                f"{fmt(m3.get('shuffled_ks_p_uniform_median'))}). A large real-vs-shuffled gap with a "
+                "near-Uniform shuffled null is the desired outcome; if the shuffled null itself shows a "
+                "small-p excess (frac(p<0.05) ≫ 0.05 or λ_GC ≫ 1), the metric is anti-conservative and "
+                "the separation z above is overstated. Full tidy numbers: "
+                "`tables/test_3__pvalues_by_cellcount.csv` (per-perturbation, per-kind, with stratum) and "
+                "`tables/test_3__pooled_pvalues.csv` (subsampled pooled p-values).")
             L.append("")
         # Test 0: show the full δ-by-δ calibration curve inline (the λ_GC blow-up is the headline number)
         if r.name == "test_0":
@@ -2132,16 +2630,6 @@ def main():
     if "test_0" in want:
         log.info("=== test_0 (injection) ===")
         results.append(test_0_injection(adata, cfg, outdir))
-
-    # compute raw QC features (total_counts / n_genes_by_counts) BEFORE normalization, so Test 2's
-    # batch-matched control arms can pair cells on raw depth/complexity. Deterministic (no RNG).
-    if not {"total_counts", "n_genes_by_counts"}.issubset(adata.obs.columns):
-        try:
-            adata.var["mt"] = adata.var_names.str.upper().str.startswith("MT-")
-            sc.pp.calculate_qc_metrics(adata, qc_vars=["mt"], percent_top=None, log1p=False, inplace=True)
-            log.info("Computed raw QC metrics (total_counts, n_genes_by_counts) for Test-2 matching")
-        except Exception as e:  # noqa: BLE001
-            log.warning("QC metric computation failed (%s); Test 2 batch-matched mode will be skipped", e)
 
     # pdex expects log-normalized input; match cell-eval run's normalize_total + log1p
     maybe_normalize(adata, cfg)

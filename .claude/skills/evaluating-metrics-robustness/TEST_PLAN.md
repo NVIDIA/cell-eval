@@ -238,20 +238,21 @@ with `δ`) is the headline evidence and must not be hidden behind summary scalar
 
 ### Question
 
-When a perturbation's cells are split in half and each half is profiled against control, do the two halves recover the **same** differential-expression signature? And does **1:1 batch-matched** control assignment improve that reproducibility over a plain split?
+When a perturbation's cells are split in half and each half is profiled against control, do the two halves recover the **same** differential-expression signature?
 
 ### Design
 
-For each perturbation with ≥ `2 × min_cells_per_group` cells, in **two scenarios**:
+For each perturbation with ≥ `2 × min_cells_per_group` cells:
 
-- **Scenario 1.a — no_match (baseline, no batch control):** split the perturbed cells into A and B (stratified by `batch_cols`); split the **control** cells into two halves `ctrl_A`, `ctrl_B` (each = half of all controls); compute `DE_A = A vs ctrl_A` and `DE_B = B vs ctrl_B` with cell-eval's DE (**no 1:1 matching**).
-- **Scenario 2.a — matched (batch-controlled):** **1:1-match** the perturbed cells to control cells *within batch* on QC features (`total_counts`, `n_genes_by_counts`) using `scmetrics` (inline fallback); split the matched **perturb–control pairs** into A and B (stratified by batch); compute `DE_A = A_pert vs A_matched_ctrl` and `DE_B = B_pert vs B_matched_ctrl` (Wilcoxon).
+- Split the perturbed cells into A and B (stratified by `batch_cols`); split the **control** cells into two halves `ctrl_A`, `ctrl_B` (each = half of all controls); compute `DE_A = A vs ctrl_A` and `DE_B = B vs ctrl_B` with cell-eval's DE. **No 1:1 cell matching** — each half-perturbation is compared to an independent half of the controls.
 
-Two statistics per scenario:
+Two statistics:
 1. **(PRIMARY) reproducibility** — agreement of `DE_A` and `DE_B`: **median split-half Spearman LFC ρ** (+ DEG Jaccard, direction agreement), over perturbations.
 2. **(secondary) difference-is-null** — the direct `A_pert vs B_pert` contrast (same perturbation ⇒ should be ≈null): `frac_sig` / `λ_GC` / `ks_p_uniform`, as a sanity check.
 
-Average over `test1_n_resamples` seeded splits; report both scenarios side by side (does matching raise reproducibility?).
+Average over `test1_n_resamples` seeded splits.
+
+**Reproducibility vs cell count (method vs undersampling).** Splitting a condition into halves starves small conditions of cells, so low ρ could reflect *undersampling* rather than a poor method. To separate the two, plot **one point per perturbation** — its total cell count (x, log) vs its median split-half ρ (y) — and report `Spearman(cell count, ρ)` plus the median ρ for **well-powered** (≥ `test1_wellpowered_min_cells`, default 200 total ≈ ≥100 per half) vs **under-powered** perturbations. Interpretation: points that **climb with cell count and plateau** ⇒ the low scores are power-limited; points that **stay low even at high cell counts** (well-powered ρ ≈ overall) ⇒ a **genuine method limitation**. Written to `tables/test_1__repro_vs_ncells_no_match.csv` and `plots/test_1_undersampling.png`. (Caveat: in datasets where almost all perturbations are already well-powered there is little dynamic range; a *controlled downsampling* sweep is the way to map the full power curve.)
 
 ### Test Statistic
 
@@ -265,11 +266,11 @@ Average over `test1_n_resamples` seeded splits; report both scenarios side by si
 | Moderate | 0.3–0.6 | 0.6–0.8 |
 | Low / non-reproducible | < 0.3 | ≈ 0.5 |
 
-The matched scenario should reach ρ ≥ the no_match scenario (batch/depth matching removes a nuisance source of disagreement). The secondary difference-is-null should be ≈null (λ_GC≈1, p uniform) by construction.
+The secondary difference-is-null should be ≈null (λ_GC≈1, p uniform) by construction.
 
 ### Verdict Rules
 
-Applied to the **median split-half Spearman LFC ρ** of the **matched** scenario (verdict driver); both scenarios reported.
+Applied to the **median split-half Spearman LFC ρ** across perturbations (the verdict driver).
 
 | Condition | Verdict |
 |---|---|
@@ -346,6 +347,17 @@ Do metrics collapse when perturbation labels are broken?
    b. Recompute DE and all cell-metrics → `perm_metrics[i]`.
 3. Compute separation score between true and permuted distributions.
 
+### Cell-count-stratified p-value diagnostic
+
+In addition to the scalar separation score, collect the **per-gene p-values per perturbation** for both the real (unshuffled) DE and every shuffled DE, together with each perturbation's cell count, and write them tidily to `tables/test_3__pvalues_by_cellcount.csv` (per-perturbation, per-kind ∈ {real, shuffled}: `n_cells`, `cellcount_stratum`, `frac_sig`, `frac_p_lt_05`, `lambda_gc`, `ks_p_uniform`) plus a deterministically subsampled pooled vector in `tables/test_3__pooled_pvalues.csv`. The diagnostic plot `plots/test_3_pvalue_diagnostics.png` has four panels:
+
+- **(A) pooled p-value ECDF** (real vs shuffled): real should bow **above** the diagonal (small-p excess = signal); shuffled should track the diagonal (Uniform[0,1] = calibrated null).
+- **(B) QQ vs Uniform** (−log10): real points rise above y=x; shuffled hug it (or rise above it if anti-conservative even with no signal).
+- **(C) per-perturbation fraction of genes with p<0.05 vs cell count** (log-x): real well above shuffled; shuffled near the 0.05 reference at all cell counts.
+- **(D) p-value ECDF faceted by cell-count tertile** (configurable via `test3_n_cellcount_strata`): checks that the shuffled null stays Uniform and the real small-p excess holds for **small- vs large-cell-count** perturbations.
+
+All subsampling is seeded (`test3_pooled_pval_subsample` cap) so the diagnostic is bit-for-bit reproducible.
+
 ### Separation Score
 
 ```
@@ -365,6 +377,8 @@ perm_p = |{i : perm_metrics[i] ≥ true_metric}| / n_resamples
 | Permuted `frac_sig`, `λ_GC` | Indistinguishable from Test 1/2 null |
 | Separation score for strong metrics | > 2.0 (true signal clearly outside null) |
 | `perm_p` for strong metrics | < 0.05 |
+| Real pooled p-values | small-p excess (ECDF above diagonal / QQ above line); frac(p<0.05) ≫ 0.05 |
+| Shuffled pooled p-values | ≈ Uniform[0,1]: frac(p<0.05) ≈ 0.05, λ_GC ≈ 1, across all cell-count strata |
 
 ### Verdict Rules
 
@@ -602,10 +616,3 @@ Validity gates are Tests **0, 1, 2, 3**.
 
 5. **Determinism (REQUIRED — completely seeded).** The entire run must be **bit-for-bit reproducible**: the same dataset + `config.yaml` + `seed` must produce an identical report and identical per-test tables every time. A single `seed` drives **every** stochastic step — all stratified splits, label permutations, and the Test-0 injection gene-selection/subsampling — via `np.random.default_rng(seed + fixed_offset)` (never an unseeded `default_rng()` / global `np.random`). Call a `seed_everything(seed)` at startup that pins `PYTHONHASHSEED`, `random`, `np.random`, and `scanpy.settings.seed`, and pass `random_state=seed` to any PCA/HVG/neighbors. The DE backends are deterministic given fixed input (pdex Wilcoxon; pydeseq2 DESeq2). Validate by running twice and diffing `robustness_summary.json` / `tables/` — they must be identical.
 
----
-
----
-
-## Power / sample-size analysis — REMOVED
-
-A power / `n_required` / dispersion calculation is intentionally **not** part of this skill (it was removed). Report calibration (Tests 0–3), reproducibility (Tests 1, 4), and recovery (Test 6) directly; do not derive power, `α_empirical`, or required sample sizes.
