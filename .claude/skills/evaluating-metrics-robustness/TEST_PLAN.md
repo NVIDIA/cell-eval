@@ -452,28 +452,35 @@ For each target gene G with ≥ 2 sgRNAs:
    - Query signature: guide i alone.
    - Compare LOGO scores against same-gene pair scores.
 
-### Separation Score (same-gene vs background)
+### Primary statistic — AUC (probability of superiority), gated by Mann-Whitney significance
+
+The primary metric is the **DEG-restricted LFC ρ** (the all-genes ρ is diluted to ≈0 by thousands of non-responsive genes for *both* same-gene and background pairs, so it cannot discriminate gene-specific biology — the signal lives in the DE genes). The headline separation statistic is the **Mann-Whitney common-language effect size**:
 
 ```
-separation = (mean_same_gene_metric − mean_background_metric) / SD(background_metric)
+AUC = U / (n_same_gene_pairs · n_background_pairs)
+    = P(a random same-gene pair is more concordant than a random unrelated pair)
 ```
+
+`AUC = 0.5` ⇒ no separation; `1.0` ⇒ perfect. AUC is **rank-based** (robust to the wide, skewed background distribution that essential-gene screens produce) and **not inflated by sample size** (unlike a raw p-value). It is the effect-size companion to the one-sided **Mann-Whitney U p-value** (significance that same-gene > background), so both are reported: AUC for magnitude, p for significance. The **separation z = (mean_same − mean_bg)/SD(bg)** is still reported as a secondary number, but it is **not** the verdict driver — it is variance-sensitive and understates a real separation whenever the background spread is large.
 
 ### Expected Behaviour
 
 | Metric | Expected |
 |---|---|
-| Same-gene LFC correlation | Substantially higher than background |
-| Same-gene DEG Jaccard | Substantially higher than background |
-| Separation score | > 1.5 for reliable target gene recovery |
+| AUC P(same-gene > unrelated), DEG LFC ρ | > 0.5, ideally ≥ 0.65 for clear discrimination |
+| Same-gene DEG LFC ρ / Jaccard | Higher than background (Mann-Whitney p significant) |
+| Separation z (secondary) | Higher is better, but deflated by a wide background |
 
 ### Verdict Rules
 
 | Condition | Verdict |
 |---|---|
-| **Underpowered: < ~5 genes with ≥2 guides (< ~5 same-gene pairs)** | **WARN (uninformative — cannot conclude)** — too few pairs to carry statistical weight; **never FAIL.** Do NOT read a low score as "guides off-target": same-gene guides genuinely differ in knockdown efficacy, so modest concordance is expected, and with few pairs the separation z is meaningless. |
-| Same-gene pairs score clearly above background (separation > 1.5) | **PASS** |
-| Marginal separation (1.0 < separation ≤ 1.5) | **WARN** — possible off-target effects or weak perturbation |
-| Same-gene pairs indistinguishable from background **and enough pairs to conclude** | **FAIL** — guides may be off-target or inefficacious |
+| **Underpowered: < ~5 genes with ≥2 guides (< ~5 same-gene pairs)** | **WARN (uninformative — cannot conclude)** — too few pairs to carry statistical weight; **never FAIL.** Do NOT read a low score as "guides off-target": same-gene guides genuinely differ in knockdown efficacy, so modest concordance is expected, and with few pairs neither AUC nor the separation z is meaningful. |
+| **AUC ≥ 0.65 and Mann-Whitney p < α** (default 0.05) | **PASS** — same-gene pairs clearly out-concord unrelated pairs |
+| **AUC ≥ 0.55 and Mann-Whitney p < α** | **WARN** — a real but **modest** separation (the metric rewards shared biology only weakly; expected when single-guide signatures are noisy) |
+| **AUC ≈ 0.5 or not significant** (with enough pairs to conclude) | **FAIL** — guides for the same gene are indistinguishable from unrelated guides (possible off-target / inefficacy, or the metric does not capture the shared biology) |
+
+> **Note (effect size vs significance).** With many pairs the Mann-Whitney p can be tiny even when AUC is only ~0.6 — a *real but modest* separation. Reporting AUC alongside p prevents reading "p ≪ 0.05" as a strong result. Conversely a high AUC with a non-significant p (few pairs) is the underpowered case above.
 
 ---
 

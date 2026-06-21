@@ -451,9 +451,14 @@ def verdict_test_0(m: dict, cfg: dict) -> tuple[str, str, list]:
 def verdict_test_5(m: dict, cfg: dict) -> tuple[str, str, list]:
     n_genes = m.get("n_genes", 0)
     n_pairs = m.get("n_same_pairs", 0)
-    same = m.get("same_gene_mean_rho", float("nan"))
-    bg = m.get("background_mean_rho", float("nan"))
+    prim = m.get("primary_metric", "rho")  # default "rho" keeps old summaries (all-genes ρ) working
+    prim_name = {"rho": "LFC ρ (all genes)", "rho_deg": "DEG LFC ρ", "jaccard": "DEG Jaccard",
+                 "direction": "direction agreement"}.get(prim, prim)
+    same = m.get(f"same_gene_mean_{prim}", m.get("same_gene_mean_rho", float("nan")))
+    bg = m.get(f"background_mean_{prim}", m.get("background_mean_rho", float("nan")))
     sep = m.get("separation_z", float("nan"))
+    auc = m.get(f"auc_{prim}", m.get("auc_rho"))            # common-language effect size = P(same > bg)
+    mwu_p = m.get(f"mwu_p_{prim}", m.get("mwu_p_rho"))
     underpowered = (n_genes < 5) or (n_pairs < 5)
     flags = []
     if underpowered:
@@ -463,20 +468,42 @@ def verdict_test_5(m: dict, cfg: dict) -> tuple[str, str, list]:
                 ("≈" if (np.isfinite(same) and np.isfinite(bg)) else "vs")
         flags.append(
             f"UNINFORMATIVE / power-limited: only {n_genes} gene(s) with ≥2 guides ({n_pairs} same-gene "
-            f"pair(s)). Separation z={fmt(sep)} carries essentially no statistical weight, so this is NOT "
-            "evidence that guides are off-target or inefficacious. Same-gene guides also genuinely differ "
-            "in knockdown efficacy, so only modest concordance is expected even with more pairs.")
-        reason = (f"WARN (underpowered, cannot conclude): same-gene ρ={fmt(same)} {trend} background "
-                  f"ρ={fmt(bg)} on only {n_pairs} pair(s)")
+            f"pair(s)). AUC={fmt(auc)} / MWU p={fmt(mwu_p)} carry essentially no statistical weight, so this "
+            "is NOT evidence that guides are off-target or inefficacious. Same-gene guides also genuinely "
+            "differ in knockdown efficacy, so only modest concordance is expected even with more pairs.")
+        reason = (f"WARN (underpowered, cannot conclude): same-gene {prim_name}={fmt(same)} {trend} "
+                  f"background {fmt(bg)} (AUC={fmt(auc)}) on only {n_pairs} pair(s)")
         return verdict, reason, flags
+    # PRIMARY verdict: Mann-Whitney common-language effect size AUC = P(same-gene pair more concordant
+    # than a random unrelated pair), GATED by the MWU significance. AUC is rank-based (robust to the wide,
+    # skewed background that deflates the separation z) and not inflated by sample size (unlike a raw p).
+    if auc is not None and np.isfinite(auc) and mwu_p is not None and np.isfinite(mwu_p):
+        sig = mwu_p < cfg.get("fdr_threshold", 0.05)
+        if auc >= 0.65 and sig:
+            verdict = "PASS"
+        elif auc >= 0.55 and sig:
+            verdict = "WARN"
+        else:
+            verdict = "FAIL"
+        strength = ("clear" if auc >= 0.65 else "modest" if auc >= 0.55 else "no")
+        flags.append(f"AUC={fmt(auc)} = P(a random same-gene pair is more concordant than a random "
+                     f"unrelated pair); 0.5 = no separation. Significance: MWU p={fmt(mwu_p)}. "
+                     f"Tiers: PASS AUC≥0.65 & p<{cfg.get('fdr_threshold', 0.05)} · WARN AUC≥0.55 & sig · "
+                     "FAIL otherwise. (Secondary, for reference: separation z="
+                     f"{fmt(sep)} — z is variance-sensitive and understates a wide-background separation.)")
+        reason = (f"{verdict}: {strength} same-gene separation — AUC={fmt(auc)} "
+                  f"(P[same>unrelated]), MWU p={fmt(mwu_p)}; same-gene {prim_name}={fmt(same)} vs "
+                  f"background {fmt(bg)}; {n_pairs} same-gene pairs (2° separation z={fmt(sep)})")
+        return verdict, reason, flags
+    # fallback (old summaries without AUC): the legacy separation-z rule
     if (not np.isfinite(sep) and np.isfinite(same) and np.isfinite(bg) and same > bg) or sep > 1.5:
         verdict = "PASS"
     elif np.isfinite(sep) and sep > 1.0:
         verdict = "WARN"
     else:
         verdict = "FAIL"
-    reason = (f"{verdict}: same-gene ρ={fmt(same)} vs background ρ={fmt(bg)} "
-              f"(separation z={fmt(sep)}; {n_pairs} same-gene pair(s))")
+    reason = (f"{verdict}: same-gene {prim_name}={fmt(same)} vs background {fmt(bg)} "
+              f"(separation z={fmt(sep)}, MWU p={fmt(mwu_p)}; primary={prim_name}; {n_pairs} pairs)")
     return verdict, reason, flags
 
 
@@ -860,20 +887,9 @@ def verdict_reproducibility(rho: float) -> str:
 
 
 def verdict_test_4(m: dict, cfg: dict) -> tuple[str, str, list]:
-    """Test 4 verdict harmonized with Test 1's reproducibility tiers (was a lenient ρ≥0.2 PASS)."""
-    rho = m.get("median_lfc_spearman", float("nan"))
-    jac = m.get("median_jaccard", float("nan"))
-    dirn = m.get("median_direction", float("nan"))
-    verdict = verdict_reproducibility(rho)
-    tr, tj, td = (metric_tier("lfc_spearman", rho), metric_tier("sig_jaccard", jac),
-                  metric_tier("direction_agreement", dirn))
-    reason = (f"{verdict}: same-sgRNA reproducibility ceiling — median LFC ρ={fmt(rho)} ({tr}), "
-              f"Jaccard={fmt(jac)} ({tj}), direction={fmt(dirn)} ({td})")
-    flags = ["tiers — " + REPRO_LEGEND]
-    if verdict == "FAIL":
-        flags.append(f"LOW REPRODUCIBILITY (median LFC ρ={fmt(rho)} < {REPRO_WARN}) — empirical ceiling "
-                     "is low; downstream cross-model/condition metrics are bounded by this.")
-    return verdict, reason, flags
+    """Test 4 verdict — guide-level reproducibility, identical tiers to Test 1 (delegates to the shared
+    metrics-based verdict so the live run and --report-only stay consistent)."""
+    return _repro_verdict_from_metrics(m, cfg, "guide")
 
 
 # Reproducibility metrics shown vs cell count, one panel each. (rdf column, panel title, tier key into
@@ -933,10 +949,10 @@ def repro_vs_ncells(rdf, cfg):
     return pc, tm, (pl.DataFrame(trows) if trows else None)
 
 
-def plot_repro_vs_ncells(modes, path, cfg):
+def plot_repro_vs_ncells(modes, path, cfg, title_prefix="Test 1", unit_label="perturbation"):
     """modes: {mode: {"_pc": per_pert_df}}. A GRID of scatter panels — one per reproducibility statistic
-    in REPRO_PANELS — each with one point PER PERTURBATION (x = cell count, log). The 'is it power or the
-    method?' figure, now for every statistic."""
+    in REPRO_PANELS — each with one point PER UNIT (perturbation for Test 1, guide for Test 4;
+    x = cell count, log). The 'is it power or the method?' figure, now for every statistic."""
     if not modes:
         return
     panels = [p for p in REPRO_PANELS
@@ -981,7 +997,7 @@ def plot_repro_vs_ncells(modes, path, cfg):
         ax.set_title(title, fontsize=8); ax.tick_params(labelsize=6.5)
         ax.legend(fontsize=6, loc="lower right")
         if i % ncol == 0:
-            ax.set_ylabel("per-perturbation value", fontsize=7)
+            ax.set_ylabel(f"per-{unit_label} value", fontsize=7)
     for j in range(len(panels), nrow * ncol):
         axes[j // ncol][j % ncol].axis("off")
     # DE-gene size legend — figure-level (bottom), always shown regardless of grid layout
@@ -1000,10 +1016,192 @@ def plot_repro_vs_ncells(modes, path, cfg):
         fig.legend(handles, labels, title="marker size = # DE genes (union of split A & B)",
                    loc="lower center", ncol=max(1, len(labels)), fontsize=7, title_fontsize=7, frameon=True,
                    columnspacing=1.4, handletextpad=0.4)
-    fig.suptitle("Test 1 — reproducibility vs cell count, one point per perturbation (x = cell count, log)\n"
-                 "point size = # DE genes (union of split A & B) · dotted = well-powered cutoff · "
-                 "dashed = tier cutoffs", fontsize=9)
+    fig.suptitle(f"{title_prefix} — reproducibility vs cell count, one point per {unit_label} "
+                 "(x = cell count, log)\npoint size = # DE genes (union of split A & B) · dotted = "
+                 "well-powered cutoff · dashed = tier cutoffs", fontsize=9)
     fig.tight_layout(rect=[0, 0.07, 1, 0.93]); fig.savefig(path, dpi=120); plt.close(fig)
+
+
+def _repro_scenario(adata, cfg, outdir, cond_positions, pos_C_all, ctrl_obs_all, tprefix):
+    """Shared Test-1 / Test-4 within-UNIT reproducibility scenario (mode = 'no_match').
+
+    ``cond_positions`` is an ordered dict ``{unit_label: np.ndarray of global cell positions}``. A *unit*
+    is a perturbation/gene for Test 1 and a guide/sgRNA for Test 4 — the design is otherwise identical.
+    For each unit with ≥ 2×min_cells_per_group cells, split its cells into halves A/B (batch-stratified)
+    and run two independent unit-vs-control DEs (DE_A = A vs ctrl_half_A, DE_B = B vs ctrl_half_B; the
+    controls are also split in half, NO 1:1 cell matching) plus the difference-is-null DE_AB = A vs B
+    (same unit ⇒ should be ≈null). Repeated for ``test1_n_resamples`` draws per unit. Writes
+    ``{tprefix}__reproducibility_no_match.csv``, ``__difference_null_no_match.csv``,
+    ``__repro_vs_ncells_no_match.csv`` and ``__repro_vs_ncells_trends_no_match.csv``; returns the
+    aggregate dict (with private ``_rhos`` / ``_pc`` / ``_pooled_p`` for plotting) or ``None``."""
+    mcg = cfg["min_cells_per_group"]
+    nperm = int(cfg.get("test1_n_resamples", min(3, cfg["n_resamples"])))
+    repro_rows, null_rows, pooled, skipped = [], [], [], 0
+    for ci, (cond, pos_P) in enumerate(cond_positions.items()):
+        pos_P = np.asarray(pos_P, int)
+        if pos_P.size < 2 * mcg:
+            skipped += 1
+            continue
+        cond_obs = adata.obs.iloc[pos_P]
+        for r in range(nperm):
+            seed = cfg["seed"] + 1000 + ci * 17 + r
+            arm = stratified_split(cond_obs, cfg["block_cols"], seed)
+            ai, bi = np.where(arm == "A")[0], np.where(arm == "B")[0]
+            carm = stratified_split(ctrl_obs_all, cfg["block_cols"], seed + 7)
+            cai, cbi = np.where(carm == "A")[0], np.where(carm == "B")[0]
+            if min(ai.size, bi.size, cai.size, cbi.size) < mcg:
+                continue
+            A_pert, B_pert = pos_P[ai], pos_P[bi]
+            A_ctrl, B_ctrl = pos_C_all[cai], pos_C_all[cbi]
+            try:
+                de_A = _de_two(adata, A_pert, A_ctrl, cfg, "pert", "ctrl")
+                de_B = _de_two(adata, B_pert, B_ctrl, cfg, "pert", "ctrl")
+                de_AB = _de_two(adata, A_pert, B_pert, cfg, "A", "B")  # difference-is-null
+            except Exception as e:  # noqa: BLE001
+                log.warning("%s %s rep%d: %s", tprefix, cond, r, e)
+                continue
+            rep = compare_signatures(de_A, de_B, cfg)
+            if rep:
+                rep["condition"] = cond
+                rep["n_pert_cells"] = int(pos_P.size)       # total cells this unit has
+                rep["cells_per_arm"] = int(min(ai.size, bi.size))
+                repro_rows.append(rep)
+            nm = null_metrics(de_AB, cfg)
+            nm["condition"] = cond
+            null_rows.append(nm)
+            pooled.append(de_AB["p_value"].to_numpy().astype(float))
+    if not repro_rows:
+        return None
+    rdf = pl.DataFrame(repro_rows)
+    rdf.write_csv(os.path.join(outdir, "tables", f"{tprefix}__reproducibility_no_match.csv"))
+    ndf = pl.DataFrame(null_rows) if null_rows else None
+    if ndf is not None:
+        ndf.write_csv(os.path.join(outdir, "tables", f"{tprefix}__difference_null_no_match.csv"))
+    rhos = rdf["lfc_spearman"].to_numpy().astype(float)
+    rhos = rhos[np.isfinite(rhos)]
+    # reproducibility vs cell count, one point PER UNIT, for EVERY statistic
+    pp_df, trend, trends_df = repro_vs_ncells(rdf, cfg)
+    if pp_df is not None:
+        pp_df.write_csv(os.path.join(outdir, "tables", f"{tprefix}__repro_vs_ncells_no_match.csv"))
+    if trends_df is not None:
+        trends_df.write_csv(os.path.join(outdir, "tables", f"{tprefix}__repro_vs_ncells_trends_no_match.csv"))
+    rhos_deg = rdf["lfc_spearman_deg"].to_numpy().astype(float)
+    rhos_deg = rhos_deg[np.isfinite(rhos_deg)]
+    ag = {
+        "repro_lfc_spearman": float(np.median(rhos)) if rhos.size else float("nan"),
+        "repro_lfc_spearman_deg": float(np.median(rhos_deg)) if rhos_deg.size else float("nan"),
+        "repro_jaccard": float(rdf["sig_jaccard"].median()),
+        "repro_direction": float(rdf["direction_agreement"].median()),
+        "n_strong_rho_gt0.6": int((rhos > REPRO_PASS).sum()),
+        "n_moderate_rho_0.3_0.6": int(((rhos >= REPRO_WARN) & (rhos <= REPRO_PASS)).sum()),
+        "n_low_rho_lt0.3": int((rhos < REPRO_WARN).sum()),
+        # secondary: difference-is-null (A vs B — same unit, should be ≈null)
+        "diffnull_lambda_gc": float(ndf["lambda_gc"].mean()) if ndf is not None else float("nan"),
+        "diffnull_frac_sig": float(ndf["frac_sig"].mean()) if ndf is not None else float("nan"),
+        "diffnull_ks_p_uniform": float(ndf["ks_p_uniform"].mean()) if ndf is not None else float("nan"),
+        "n_conditions": int(rdf["condition"].n_unique()), "skipped": skipped,
+        "_rhos": rhos, "_pc": pp_df,
+        "_pooled_p": np.concatenate(pooled) if pooled else np.array([]),
+    }
+    ag.update(trend)
+    return ag
+
+
+def _plot_repro_main(ag, png, title_prefix, unit_label):
+    """Inline reproducibility figure shared by Test 1 & Test 4: (left) per-unit split-half ρ histogram;
+    (right) difference-is-null QQ (A vs B, the same unit ⇒ ≈null) with the exact Beta(i,G−i+1) 95%
+    envelope. ``unit_label`` is 'perturbation' (Test 1) or 'guide' (Test 4)."""
+    fig, (axl, axr) = plt.subplots(1, 2, figsize=(9.6, 4.0))
+    axl.hist(ag["_rhos"], bins=20, range=(-1, 1), alpha=0.65, color="#1a3c6e",
+             label=f"median ρ={fmt(ag['repro_lfc_spearman'])} (n={ag['n_conditions']})")
+    for thr in (REPRO_WARN, REPRO_PASS):
+        axl.axvline(thr, ls="--", color="0.5", lw=1)
+    axl.set_xlabel(f"split-half Spearman LFC ρ (per {unit_label})")
+    axl.set_ylabel(f"{unit_label}s")
+    axl.set_title("Reproducibility: DE_A vs DE_B (dashed=tier cutoffs 0.3/0.6)", fontsize=8.5)
+    axl.legend(fontsize=7)
+    p = np.sort(ag["_pooled_p"][np.isfinite(ag["_pooled_p"])])
+    if p.size >= 8:
+        p = np.clip(p, 1e-300, 1.0)
+        G = p.size
+        i = np.arange(1, G + 1)
+        exp = -np.log10((i - 0.5) / G)
+        obs = -np.log10(p)
+        lo = -np.log10(stats.beta.ppf(0.975, i, G - i + 1))
+        hi = -np.log10(stats.beta.ppf(0.025, i, G - i + 1))
+        if G > 3000:
+            k = np.unique(np.linspace(0, G - 1, 3000).astype(int))
+            exp, obs, lo, hi = exp[k], obs[k], lo[k], hi[k]
+        axr.fill_between(exp, lo, hi, color="0.85")
+        m = max(exp.max(), obs.max())
+        axr.plot([0, m], [0, m], "r--", lw=1)
+        axr.scatter(exp, obs, s=5, color="#1a3c6e")
+        axr.set_title(f"Difference-is-null QQ: A vs B ({unit_label})\nλ_GC={fmt(ag['diffnull_lambda_gc'])}",
+                      fontsize=8.5)
+    else:
+        axr.set_title("Difference-is-null QQ (insufficient genes)", fontsize=8.5)
+    axr.set_xlabel("expected -log10(p)")
+    axr.set_ylabel("observed -log10(p)")
+    fig.suptitle(f"{title_prefix} — within-{unit_label} reproducibility + difference-is-null", fontsize=11)
+    fig.tight_layout(); fig.savefig(png, dpi=110); plt.close(fig)
+
+
+def _repro_verdict_from_metrics(m, cfg, unit_label):
+    """PURE function of cached/flattened metrics → (verdict, reason, flags) for Test 1 / Test 4. Reads
+    the ``no_match__*`` flattened keys (live + cached), falling back to ``median_*`` for old summaries.
+    Shared by the live path (_finish_repro) and --report-only verdict re-derivation (verdict_test_4)."""
+    def g(k):
+        v = m.get(f"no_match__{k}")
+        return v if v is not None else m.get(k)
+    rho = g("repro_lfc_spearman")
+    rho = m.get("median_lfc_spearman", float("nan")) if rho is None else rho
+    jac = g("repro_jaccard")
+    jac = m.get("median_jaccard", float("nan")) if jac is None else jac
+    dirn = g("repro_direction")
+    dirn = m.get("median_direction", float("nan")) if dirn is None else dirn
+    verdict = verdict_reproducibility(rho)
+    tier = {"PASS": "strong", "WARN": "moderate", "FAIL": "low", "SKIP": "n/a"}[verdict]
+    flags = []
+    wp, up = g("repro_rho_wellpowered"), g("repro_rho_underpowered")
+    wpn, upn = g("n_wellpowered"), g("n_underpowered")
+    flags.append(
+        f"reproducibility vs cell count: well-powered (≥{g('wellpowered_min_cells')} cells, "
+        f"n={wpn}) median ρ={fmt(wp)} vs under-powered (n={upn}) median ρ={fmt(up)}; "
+        f"Spearman(cell count, ρ)={fmt(g('rho_vs_ncells_spearman'))}. "
+        + ("Well-powered ρ ≈ overall ⇒ low reproducibility is a GENUINE method limitation, not undersampling."
+           if (isinstance(wp, float) and np.isfinite(wp) and verdict_reproducibility(wp) == verdict)
+           else f"Well-powered {unit_label}s reproduce better ⇒ part of the low score is an undersampling artifact."))
+    flags.append(f"per-{unit_label} reproducibility tiers: {g('n_strong_rho_gt0.6')} strong / "
+                 f"{g('n_moderate_rho_0.3_0.6')} moderate / {g('n_low_rho_lt0.3')} low "
+                 f"(of {g('n_conditions')})")
+    flags.append("thresholds — " + REPRO_LEGEND)
+    flags.append(f"secondary difference-is-null (A vs B, same {unit_label} ⇒ should be ≈null): "
+                 f"λ_GC={fmt(g('diffnull_lambda_gc'))}, frac_sig={fmt(g('diffnull_frac_sig'))}, "
+                 f"ks_p_uniform={fmt(g('diffnull_ks_p_uniform'))}")
+    reason = (f"{verdict}: median split-half LFC ρ={fmt(rho)} ({tier} reproducibility; "
+              f"PASS>{REPRO_PASS}/WARN≥{REPRO_WARN}/FAIL<{REPRO_WARN}); Jaccard={fmt(jac)}, "
+              f"direction={fmt(dirn)}; (2°) difference-is-null λ_GC={fmt(g('diffnull_lambda_gc'))}, "
+              f"frac_sig={fmt(g('diffnull_frac_sig'))}")
+    return verdict, reason, flags
+
+
+def _finish_repro(out, name, title, cfg, plot_png, unit_label):
+    """Build the TestResult (flattened {mode}__ metrics + shared verdict/flags/reason) for Test 1/Test 4
+    from the scenario aggregate(s) in ``out`` (here only the 'no_match' mode)."""
+    a = out["no_match"]
+    metrics = {"scenario_primary": "no_match"}
+    for mode, ag in out.items():
+        for k, v in ag.items():
+            if not k.startswith("_"):
+                metrics[f"{mode}__{k}"] = v
+    # also expose the canonical median_* keys so verdict_test_4 / --report-only can re-derive cheaply
+    metrics["median_lfc_spearman"] = a["repro_lfc_spearman"]
+    metrics["median_jaccard"] = a["repro_jaccard"]
+    metrics["median_direction"] = a["repro_direction"]
+    metrics["n_guides" if name == "test_4" else "n_conditions"] = a["n_conditions"]
+    verdict, reason, flags = _repro_verdict_from_metrics(metrics, cfg, unit_label)
+    return TestResult(name, title, verdict, metrics=metrics, flags=flags, pvalues={},
+                      plot=plot_png, reason=reason)
 
 
 def test_1(adata, cfg, outdir):
@@ -1024,158 +1222,18 @@ def test_1(adata, cfg, outdir):
     labels = adata.obs[pc].astype(str).to_numpy()
     pos_C_all = np.where(labels == ctrl_lab)[0]
     ctrl_obs_all = adata.obs.iloc[pos_C_all]
-    nperm = int(cfg.get("test1_n_resamples", min(3, cfg["n_resamples"])))
-
-    def scenario(mode):
-        repro_rows, null_rows, pooled, skipped = [], [], [], 0
-        for pi_, pert in enumerate(perts):
-            pos_P = np.where(labels == pert)[0]
-            if pos_P.size < 2 * mcg:
-                skipped += 1
-                continue
-            pert_obs = adata.obs.iloc[pos_P]
-            for r in range(nperm):
-                seed = cfg["seed"] + 1000 + pi_ * 17 + r
-                arm = stratified_split(pert_obs, cfg["block_cols"], seed)
-                ai, bi = np.where(arm == "A")[0], np.where(arm == "B")[0]
-                carm = stratified_split(ctrl_obs_all, cfg["block_cols"], seed + 7)
-                cai, cbi = np.where(carm == "A")[0], np.where(carm == "B")[0]
-                if min(ai.size, bi.size, cai.size, cbi.size) < mcg:
-                    continue
-                A_pert, B_pert = pos_P[ai], pos_P[bi]
-                A_ctrl, B_ctrl = pos_C_all[cai], pos_C_all[cbi]
-                try:
-                    de_A = _de_two(adata, A_pert, A_ctrl, cfg, "pert", "ctrl")
-                    de_B = _de_two(adata, B_pert, B_ctrl, cfg, "pert", "ctrl")
-                    de_AB = _de_two(adata, A_pert, B_pert, cfg, "A", "B")  # difference-is-null
-                except Exception as e:  # noqa: BLE001
-                    log.warning("test1 %s %s rep%d: %s", mode, pert, r, e)
-                    continue
-                rep = compare_signatures(de_A, de_B, cfg)
-                if rep:
-                    rep["condition"] = pert
-                    rep["n_pert_cells"] = int(pos_P.size)       # total cells this perturbation has
-                    rep["cells_per_arm"] = int(min(ai.size, bi.size))
-                    repro_rows.append(rep)
-                nm = null_metrics(de_AB, cfg)
-                nm["condition"] = pert
-                null_rows.append(nm)
-                pooled.append(de_AB["p_value"].to_numpy().astype(float))
-        if not repro_rows:
-            return None
-        rdf = pl.DataFrame(repro_rows)
-        rdf.write_csv(os.path.join(outdir, "tables", f"test_1__reproducibility_{mode}.csv"))
-        ndf = pl.DataFrame(null_rows) if null_rows else None
-        if ndf is not None:
-            ndf.write_csv(os.path.join(outdir, "tables", f"test_1__difference_null_{mode}.csv"))
-        rhos = rdf["lfc_spearman"].to_numpy().astype(float)
-        rhos = rhos[np.isfinite(rhos)]
-        # reproducibility vs cell count, one point PER PERTURBATION, for EVERY statistic
-        pp_df, trend, trends_df = repro_vs_ncells(rdf, cfg)
-        if pp_df is not None:
-            pp_df.write_csv(os.path.join(outdir, "tables", f"test_1__repro_vs_ncells_{mode}.csv"))
-        if trends_df is not None:
-            trends_df.write_csv(os.path.join(outdir, "tables", f"test_1__repro_vs_ncells_trends_{mode}.csv"))
-        rhos_deg = rdf["lfc_spearman_deg"].to_numpy().astype(float)
-        rhos_deg = rhos_deg[np.isfinite(rhos_deg)]
-        ag = {
-            "repro_lfc_spearman": float(np.median(rhos)) if rhos.size else float("nan"),
-            "repro_lfc_spearman_deg": float(np.median(rhos_deg)) if rhos_deg.size else float("nan"),
-            "repro_jaccard": float(rdf["sig_jaccard"].median()),
-            "repro_direction": float(rdf["direction_agreement"].median()),
-            "n_strong_rho_gt0.6": int((rhos > REPRO_PASS).sum()),
-            "n_moderate_rho_0.3_0.6": int(((rhos >= REPRO_WARN) & (rhos <= REPRO_PASS)).sum()),
-            "n_low_rho_lt0.3": int((rhos < REPRO_WARN).sum()),
-            # secondary: difference-is-null (A_pert vs B_pert — same perturbation, should be ≈null)
-            "diffnull_lambda_gc": float(ndf["lambda_gc"].mean()) if ndf is not None else float("nan"),
-            "diffnull_frac_sig": float(ndf["frac_sig"].mean()) if ndf is not None else float("nan"),
-            "diffnull_ks_p_uniform": float(ndf["ks_p_uniform"].mean()) if ndf is not None else float("nan"),
-            "n_conditions": int(rdf["condition"].n_unique()), "skipped": skipped,
-            "_rhos": rhos, "_pc": pp_df,
-            "_pooled_p": np.concatenate(pooled) if pooled else np.array([]),
-        }
-        ag.update(trend)
-        return ag
-
-    out = {}
-    ag = scenario("no_match")
-    if ag is not None:
-        out["no_match"] = ag
-    if not out:
+    cond_positions = {pert: np.where(labels == pert)[0] for pert in perts}
+    ag = _repro_scenario(adata, cfg, outdir, cond_positions, pos_C_all, ctrl_obs_all, "test_1")
+    if ag is None:
         return TestResult("test_1", "Within-Condition Reproducibility", "SKIP",
                           flags=["no condition had enough cells for an A/B split"],
                           reason="SKIP: insufficient cells")
-    primary = "no_match"
-    a = out[primary]
-    # plot: (left) per-perturbation reproducibility ρ distribution; (right) difference-is-null QQ
-    # (A_pert vs B_pert, primary scenario) with the exact Beta(i,G-i+1) 95% envelope.
-    png = os.path.join(outdir, "plots", "test_1_reproducibility.png")
-    fig, (axl, axr) = plt.subplots(1, 2, figsize=(9.6, 4.0))
-    axl.hist(a["_rhos"], bins=20, range=(-1, 1), alpha=0.65, color="#1a3c6e",
-             label=f"median ρ={fmt(a['repro_lfc_spearman'])} (n={a['n_conditions']})")
-    for thr in (REPRO_WARN, REPRO_PASS):
-        axl.axvline(thr, ls="--", color="0.5", lw=1)
-    axl.set_xlabel("split-half Spearman LFC ρ (per perturbation)")
-    axl.set_ylabel("perturbations")
-    axl.set_title("Reproducibility: DE_A vs DE_B (dashed=tier cutoffs 0.3/0.6)", fontsize=8.5)
-    axl.legend(fontsize=7)
-    p = np.sort(a["_pooled_p"][np.isfinite(a["_pooled_p"])])
-    if p.size >= 8:
-        p = np.clip(p, 1e-300, 1.0)
-        G = p.size
-        i = np.arange(1, G + 1)
-        exp = -np.log10((i - 0.5) / G)
-        obs = -np.log10(p)
-        lo = -np.log10(stats.beta.ppf(0.975, i, G - i + 1))
-        hi = -np.log10(stats.beta.ppf(0.025, i, G - i + 1))
-        if G > 3000:
-            k = np.unique(np.linspace(0, G - 1, 3000).astype(int))
-            exp, obs, lo, hi = exp[k], obs[k], lo[k], hi[k]
-        axr.fill_between(exp, lo, hi, color="0.85")
-        m = max(exp.max(), obs.max())
-        axr.plot([0, m], [0, m], "r--", lw=1)
-        axr.scatter(exp, obs, s=5, color="#1a3c6e")
-        axr.set_title(f"Difference-is-null QQ: A_pert vs B_pert ({primary})\nλ_GC={fmt(a['diffnull_lambda_gc'])}", fontsize=8.5)
-    else:
-        axr.set_title("Difference-is-null QQ (insufficient genes)", fontsize=8.5)
-    axr.set_xlabel("expected -log10(p)")
-    axr.set_ylabel("observed -log10(p)")
-    fig.suptitle("Test 1 — within-condition reproducibility + difference-is-null", fontsize=11)
-    fig.tight_layout(); fig.savefig(png, dpi=110); plt.close(fig)
-
-    # reproducibility-vs-cell-count figure (method vs undersampling separator)
-    plot_repro_vs_ncells(out, os.path.join(outdir, "plots", "test_1_undersampling.png"), cfg)
-
-    verdict = verdict_reproducibility(a["repro_lfc_spearman"])
-    tier = {"PASS": "strong", "WARN": "moderate", "FAIL": "low", "SKIP": "n/a"}[verdict]
-    flags = []
-    wp, up = a.get("repro_rho_wellpowered"), a.get("repro_rho_underpowered")
-    wpn, upn = a.get("n_wellpowered"), a.get("n_underpowered")
-    flags.append(
-        f"reproducibility vs cell count: well-powered (≥{a.get('wellpowered_min_cells')} cells, "
-        f"n={wpn}) median ρ={fmt(wp)} vs under-powered (n={upn}) median ρ={fmt(up)}; "
-        f"Spearman(cell count, ρ)={fmt(a.get('rho_vs_ncells_spearman'))}. "
-        + ("Well-powered ρ ≈ overall ⇒ low reproducibility is a GENUINE method limitation, not undersampling."
-           if (isinstance(wp, float) and np.isfinite(wp) and verdict_reproducibility(wp) == verdict)
-           else "Well-powered perturbations reproduce better ⇒ part of the low score is an undersampling artifact."))
-    flags.append(f"per-perturbation reproducibility tiers: "
-                 f"{a['n_strong_rho_gt0.6']} strong / {a['n_moderate_rho_0.3_0.6']} moderate / "
-                 f"{a['n_low_rho_lt0.3']} low (of {a['n_conditions']})")
-    flags.append("thresholds — " + REPRO_LEGEND)
-    flags.append(f"secondary difference-is-null (A_pert vs B_pert, same perturbation ⇒ should be ≈null): "
-                 f"λ_GC={fmt(a['diffnull_lambda_gc'])}, frac_sig={fmt(a['diffnull_frac_sig'])}, "
-                 f"ks_p_uniform={fmt(a['diffnull_ks_p_uniform'])}")
-    metrics = {"scenario_primary": primary}
-    for mode, ag in out.items():
-        for k, v in ag.items():
-            if not k.startswith("_"):
-                metrics[f"{mode}__{k}"] = v
-    reason = (f"{verdict}: median split-half LFC ρ={fmt(a['repro_lfc_spearman'])} ({tier} "
-              f"reproducibility; PASS>{REPRO_PASS}/WARN≥{REPRO_WARN}/FAIL<{REPRO_WARN}); "
-              f"Jaccard={fmt(a['repro_jaccard'])}, direction={fmt(a['repro_direction'])}; "
-              f"(2°) difference-is-null λ_GC={fmt(a['diffnull_lambda_gc'])}, frac_sig={fmt(a['diffnull_frac_sig'])}")
-    return TestResult("test_1", "Within-Condition Reproducibility", verdict, metrics=metrics,
-                      flags=flags, pvalues={}, plot="plots/test_1_reproducibility.png", reason=reason)
+    out = {"no_match": ag}
+    _plot_repro_main(ag, os.path.join(outdir, "plots", "test_1_reproducibility.png"), "Test 1", "perturbation")
+    plot_repro_vs_ncells(out, os.path.join(outdir, "plots", "test_1_undersampling.png"), cfg,
+                         title_prefix="Test 1", unit_label="perturbation")
+    return _finish_repro(out, "test_1", "Within-Condition Reproducibility", cfg,
+                         "plots/test_1_reproducibility.png", "perturbation")
 
 
 def test_2(adata, cfg, outdir):
@@ -1556,55 +1614,153 @@ def test_3(adata, cfg, outdir, de_true=None):
 
 
 def test_4(adata, cfg, outdir):
+    """Test 4 — within-GUIDE reproducibility: Test 1 run at the sgRNA (guide) level.
+
+    Identical design to Test 1 but the *unit* is an individual guide rather than a perturbation/gene.
+    For each guide with ≥ 2×min_cells_per_group cells, split the guide's cells into halves A/B
+    (batch-stratified), split the controls in half, and run DE_A = A vs ctrl_half_A, DE_B = B vs
+    ctrl_half_B (NO 1:1 cell matching) plus the difference-is-null DE_AB = A vs B, repeated for
+    ``test1_n_resamples`` draws. Reproducibility = median over guides of Spearman(LFC_A, LFC_B) (+ DEG
+    Jaccard, direction); same tiers as Test 1 (PASS > 0.6 / WARN 0.3–0.6 / FAIL < 0.3). Also reported
+    per guide against cell count, and as a difference-is-null QQ — the same two plots as Test 1, at the
+    guide level. This is the empirical reproducibility ceiling for any per-guide downstream metric."""
     pc, sg, mcg = cfg["pert_col"], cfg.get("sgrna_col"), cfg["min_cells_per_group"]
     if not sg:
-        return TestResult("test_4", "Same-sgRNA Split Reproducibility", "SKIP", flags=["no sgrna_col"],
-                          reason="SKIP: no sgrna_col")
+        return TestResult("test_4", "Same-sgRNA Split Reproducibility (guide-level Test 1)", "SKIP",
+                          flags=["no sgrna_col"], reason="SKIP: no sgrna_col")
     perts = perts_in_use(adata, cfg)
-    tg = adata.obs[pc].astype(str)
-    guides = sorted(adata.obs[sg].astype(str)[tg.isin(perts)].unique())
-    rows = []
-    for guide in guides:
-        gmask = (adata.obs[sg].astype(str) == guide).to_numpy()
-        cmask = (tg == cfg["control_pert"]).to_numpy()
-        if gmask.sum() < 2 * mcg:
-            continue
-        gobs = adata.obs[gmask]
-        arm = stratified_split(gobs, cfg["block_cols"], cfg["seed"] + 4)
-        if (arm == "A").sum() < mcg or (arm == "B").sum() < mcg:
-            continue
-        des = {}
-        for a in ("A", "B"):
-            keepmask = cmask.copy()
-            sel = np.where(gmask)[0][arm == a]
-            keepmask[sel] = True
-            s = adata[keepmask].copy()
-            lab = np.where((s.obs[pc].astype(str) == cfg["control_pert"]).to_numpy(), cfg["control_pert"], guide)
-            s.obs["_g"] = lab
-            try:
-                des[a] = run_de(s, cfg, groupby="_g", reference=cfg["control_pert"])
-            except Exception as e:  # noqa: BLE001
-                log.warning("test4 %s arm%s: %s", guide, a, e)
-        if "A" in des and "B" in des:
-            cmp = compare_signatures(des["A"], des["B"], cfg)
-            if cmp:
-                cmp["guide"] = guide
-                rows.append(cmp)
-    if not rows:
-        return TestResult("test_4", "Same-sgRNA Split Reproducibility", "SKIP",
-                          flags=["no guide had enough cells for an A/B split"],
-                          reason="SKIP: no guide had ≥2×min_cells_per_group cells")
-    df = pl.DataFrame(rows)
-    df.write_csv(os.path.join(outdir, "tables", "test_4__per_guide.csv"))
-    metrics = {"n_guides": df.height, "median_lfc_spearman": float(df["lfc_spearman"].median()),
-               "median_jaccard": float(df["sig_jaccard"].median()),
-               "median_direction": float(df["direction_agreement"].median())}
-    verdict, reason, flags = verdict_test_4(metrics, cfg)  # harmonized tiers (same as Test 1)
-    return TestResult("test_4", "Same-sgRNA Split Reproducibility", verdict, metrics=metrics,
-                      flags=flags, reason=reason)
+    ctrl_lab = cfg["control_pert"]
+    tg = adata.obs[pc].astype(str).to_numpy()
+    sgv = adata.obs[sg].astype(str).to_numpy()
+    in_use = np.isin(tg, list(perts))                    # guides of perturbations under test (excl. control)
+    pos_C_all = np.where(tg == ctrl_lab)[0]
+    ctrl_obs_all = adata.obs.iloc[pos_C_all]
+    guides = sorted(set(sgv[in_use]))
+    # one unit per guide; only keep guides with enough cells for an A/B split (others are SKIPped inside)
+    cond_positions = {g: np.where((sgv == g) & in_use)[0] for g in guides}
+    cond_positions = {g: p for g, p in cond_positions.items() if p.size >= 2 * mcg}
+    if not cond_positions:
+        return TestResult("test_4", "Same-sgRNA Split Reproducibility (guide-level Test 1)", "SKIP",
+                          flags=[f"no guide had ≥2×min_cells_per_group ({2 * mcg}) cells"],
+                          reason="SKIP: no guide had enough cells for an A/B split")
+    ag = _repro_scenario(adata, cfg, outdir, cond_positions, pos_C_all, ctrl_obs_all, "test_4")
+    if ag is None:
+        return TestResult("test_4", "Same-sgRNA Split Reproducibility (guide-level Test 1)", "SKIP",
+                          flags=["no guide produced a usable A/B split"],
+                          reason="SKIP: no guide produced a usable A/B split")
+    out = {"no_match": ag}
+    _plot_repro_main(ag, os.path.join(outdir, "plots", "test_4_reproducibility.png"), "Test 4", "guide")
+    plot_repro_vs_ncells(out, os.path.join(outdir, "plots", "test_4_undersampling.png"), cfg,
+                         title_prefix="Test 4", unit_label="guide")
+    return _finish_repro(out, "test_4", "Same-sgRNA Split Reproducibility (guide-level Test 1)", cfg,
+                         "plots/test_4_reproducibility.png", "guide")
+
+
+# Test 5 reproducibility metrics carried for the same-gene-vs-background separation (display name,
+# legacy/short label used in metric keys, value range for the distribution plot).
+TEST5_METRICS = [
+    ("lfc_spearman",        "Spearman LFC ρ — all genes", "rho",       (-1.0, 1.0)),
+    ("lfc_spearman_deg",    "Spearman LFC ρ — DE genes",  "rho_deg",   (-1.0, 1.0)),
+    ("sig_jaccard",         "DEG-set Jaccard",            "jaccard",   (0.0, 1.0)),
+    ("direction_agreement", "Direction agreement",        "direction", (0.0, 1.0)),
+]
+
+
+def _separation(same, bg):
+    """(mean_same, mean_bg, sd_bg, z, emp_p, mwu_p, auc) for one metric. ``z`` = (mean_same − mean_bg) /
+    SD(background); ``emp_p`` = fraction of background pairs ≥ the same-gene mean (one-sided); ``mwu_p``
+    = Mann-Whitney U p that same-gene concordance > background; ``auc`` = the Mann-Whitney common-language
+    effect size U/(n_same·n_bg) = P(a random same-gene pair is more concordant than a random background
+    pair), 0.5 = no separation. AUC is the rank-based effect size that pairs with mwu_p (robust to the
+    wide/skewed background that deflates z, and not inflated by sample size like a raw p)."""
+    same = np.asarray([v for v in np.asarray(same, float) if np.isfinite(v)], float)
+    bg = np.asarray([v for v in np.asarray(bg, float) if np.isfinite(v)], float)
+    if same.size == 0 or bg.size == 0:
+        return (float("nan"),) * 7
+    ms, mb = float(same.mean()), float(bg.mean())
+    sd = float(bg.std(ddof=1)) if bg.size > 1 else 0.0
+    z = (ms - mb) / sd if sd > 0 else float("inf")
+    emp_p = float((bg >= ms).mean())
+    try:
+        U = stats.mannwhitneyu(same, bg, alternative="greater")
+        mwu_p = float(U.pvalue)
+        auc = float(U.statistic / (same.size * bg.size))
+    except Exception:  # noqa: BLE001
+        mwu_p, auc = float("nan"), float("nan")
+    return ms, mb, sd, z, emp_p, mwu_p, auc
+
+
+def _plot_test5_separation(same_df, bg_df, png):
+    """Overlaid same-gene vs unrelated (background) guide-pair distributions for each reproducibility
+    metric, with mean lines + separation z — the Test-5 analog of the Test-1/4 reproducibility figure."""
+    panels = [(c, t, xr) for c, t, _, xr in TEST5_METRICS]
+    fig, axes = plt.subplots(1, len(panels), figsize=(3.6 * len(panels), 3.7), squeeze=False)
+    for ax, (col, title, xr) in zip(axes[0], panels):
+        s = same_df[col].to_numpy().astype(float); s = s[np.isfinite(s)]
+        b = bg_df[col].to_numpy().astype(float); b = b[np.isfinite(b)]
+        bins = np.linspace(xr[0], xr[1], 26)
+        if b.size:
+            ax.hist(b, bins=bins, density=True, alpha=0.5, color="#999999", label=f"background (n={b.size})")
+        if s.size:
+            ax.hist(s, bins=bins, density=True, alpha=0.6, color="#1a3c6e", label=f"same-gene (n={s.size})")
+        mb = float(b.mean()) if b.size else float("nan")
+        ms = float(s.mean()) if s.size else float("nan")
+        sd = float(b.std(ddof=1)) if b.size > 1 else 0.0
+        z = (ms - mb) / sd if sd > 0 else float("nan")
+        if b.size:
+            ax.axvline(mb, ls="--", color="#666666", lw=1)
+        if s.size:
+            ax.axvline(ms, ls="--", color="#1a3c6e", lw=1.3)
+        ax.set_title(f"{title}\nsame={fmt(ms)} · bg={fmt(mb)} · sep z={fmt(z)}", fontsize=8.3)
+        ax.set_xlabel("pair concordance")
+        ax.set_ylabel("density (guide pairs)")
+        ax.set_xlim(*xr); ax.legend(fontsize=6.5)
+    fig.suptitle("Test 5 — same-gene vs unrelated guide-pair concordance "
+                 "(separation = same-gene signal above the background distribution)", fontsize=10)
+    fig.tight_layout(); fig.savefig(png, dpi=120); plt.close(fig)
+
+
+def _plot_test5_vs_ncells(same_df, bg_df, prim_col, png):
+    """Same-gene pair concordance (PRIMARY metric) vs the pair's cells-per-guide (min of the two guides),
+    with the background mean ± SD band — the Test-5 analog of the Test-4 undersampling plot: does the
+    (modest) same-gene separation strengthen with more cells, i.e. is it real-but-undersampled?"""
+    if "min_cells" not in same_df.columns:
+        return
+    mc = same_df["min_cells"].to_numpy().astype(float)
+    v = same_df[prim_col].to_numpy().astype(float)
+    ok = np.isfinite(mc) & np.isfinite(v)
+    if ok.sum() < 3:
+        return
+    mc, v = mc[ok], v[ok]
+    b = bg_df[prim_col].to_numpy().astype(float); b = b[np.isfinite(b)]
+    rho = float(stats.spearmanr(mc, v).correlation)
+    fig, ax = plt.subplots(figsize=(6.4, 4.2))
+    if b.size:
+        bm, bs = float(b.mean()), float(b.std(ddof=1)) if b.size > 1 else 0.0
+        ax.axhspan(bm - bs, bm + bs, color="#cccccc", alpha=0.6, label=f"background mean±SD ({fmt(bm)})")
+        ax.axhline(bm, ls="--", color="#777777", lw=1)
+    ax.axhline(float(v.mean()), ls="--", color="#1a3c6e", lw=1.2, label=f"same-gene mean ({fmt(float(v.mean()))})")
+    ax.scatter(mc, v, s=26, alpha=0.6, color="#1a3c6e", edgecolor="white", linewidth=0.3)
+    ax.set_xscale("log")
+    ax.set_xlabel("cells per guide in the pair (min of the two guides, log)")
+    ax.set_ylabel("same-gene pair concordance (primary: DEG LFC ρ)")
+    ax.set_title(f"Test 5 — same-gene concordance vs cells-per-guide\nSpearman(cells, concordance)="
+                 f"{fmt(rho)} (n={mc.size} same-gene pairs)", fontsize=9)
+    ax.legend(fontsize=7)
+    fig.tight_layout(); fig.savefig(png, dpi=120); plt.close(fig)
 
 
 def test_5(adata, cfg, outdir):
+    """Test 5 — Same-Gene Independent sgRNA Reproducibility (improved, in the spirit of Test 4).
+
+    For each gene with ≥2 guides, DE each guide vs control, then compute the **full Test-4
+    reproducibility metrics** (Spearman LFC ρ over all genes & over DE genes, DEG-set Jaccard, direction
+    agreement) for every **same-gene guide pair** and for a matched **background** of unrelated
+    (different-gene) guide pairs. For each metric report the **separation** (same-gene mean − background
+    mean)/SD(background) plus an **empirical p** (fraction of background pairs ≥ the same-gene mean) and
+    a Mann-Whitney U p. Emits per-pair tables + a same-gene-vs-background distribution plot. Verdict
+    (on LFC ρ): PASS sep>1.5 / WARN 1–1.5 / FAIL else — but WARN-only (uninformative) when <5 genes with
+    ≥2 guides / <5 same-gene pairs (never FAIL on an underpowered comparison)."""
     pc, sg, mcg = cfg["pert_col"], cfg.get("sgrna_col"), cfg["min_cells_per_group"]
     if not sg:
         return TestResult("test_5", "Same-Gene Independent sgRNA Reproducibility", "SKIP", flags=["no sgrna_col"],
@@ -1623,7 +1779,7 @@ def test_5(adata, cfg, outdir):
                           reason="SKIP: no gene has ≥2 guides")
     allg = sorted({g for gs in gene2guides.values() for g in gs})
     cmask = (tg == cfg["control_pert"]).to_numpy()
-    de_by_guide = {}
+    de_by_guide, n_cells = {}, {}
     for guide in allg:
         gmask = (sgv == guide).to_numpy()
         if gmask.sum() < mcg:
@@ -1634,42 +1790,81 @@ def test_5(adata, cfg, outdir):
         s.obs["_g"] = lab
         try:
             de_by_guide[guide] = run_de(s, cfg, groupby="_g", reference=cfg["control_pert"])
+            n_cells[guide] = int(gmask.sum())
         except Exception as e:  # noqa: BLE001
             log.warning("test5 %s: %s", guide, e)
-    same, bg = [], []
+    guide_gene = {g: gene for gene, gs in gene2guides.items() for g in gs}
+    metric_cols = [c for c, *_ in TEST5_METRICS]
+    same_rows = []
     for gene, gs in gene2guides.items():
         gs = [g for g in gs if g in de_by_guide]
         for i in range(len(gs)):
             for j in range(i + 1, len(gs)):
                 c = compare_signatures(de_by_guide[gs[i]], de_by_guide[gs[j]], cfg)
                 if c:
-                    same.append(c["lfc_spearman"])
+                    ni, nj = n_cells.get(gs[i]), n_cells.get(gs[j])
+                    same_rows.append({"gene": gene, "guide_i": gs[i], "guide_j": gs[j],
+                                      "n_cells_i": ni, "n_cells_j": nj,
+                                      "min_cells": (min(ni, nj) if (ni is not None and nj is not None) else None),
+                                      **{k: c.get(k) for k in metric_cols}})
+    # background: random UNRELATED (different-gene) guide pairs, deterministic, deduplicated
     glist = list(de_by_guide)
     rng = np.random.default_rng(cfg["seed"] + 5)
-    guide_gene = {g: gene for gene, gs in gene2guides.items() for g in gs}
-    tries = 0
-    while len(bg) < max(len(same), 3) and tries < 200 and len(glist) >= 2:
+    n_target_bg = int(min(2000, max(200, 5 * len(same_rows))))
+    seen, bg_rows, tries = set(), [], 0
+    while len(bg_rows) < n_target_bg and tries < 60 * n_target_bg + 200 and len(glist) >= 2:
         tries += 1
-        a, b = rng.choice(glist, size=2, replace=False)
-        if guide_gene.get(a) == guide_gene.get(b):
+        a, b = sorted(map(str, rng.choice(glist, size=2, replace=False)))
+        if guide_gene.get(a) == guide_gene.get(b) or (a, b) in seen:
             continue
+        seen.add((a, b))
         c = compare_signatures(de_by_guide[a], de_by_guide[b], cfg)
         if c:
-            bg.append(c["lfc_spearman"])
-    if not same or not bg:
+            na, nb = n_cells.get(a), n_cells.get(b)
+            bg_rows.append({"guide_i": a, "guide_j": b, "n_cells_i": na, "n_cells_j": nb,
+                            "min_cells": (min(na, nb) if (na is not None and nb is not None) else None),
+                            **{k: c.get(k) for k in metric_cols}})
+    if not same_rows or not bg_rows:
         return TestResult("test_5", "Same-Gene Independent sgRNA Reproducibility", "SKIP",
                           flags=["insufficient same-gene or background pairs"],
                           reason="SKIP: insufficient same-gene or background pairs")
-    same, bg = np.array(same), np.array(bg)
-    sep = (same.mean() - bg.mean()) / bg.std(ddof=1) if bg.std(ddof=1) > 0 else float("inf")
-    pl.DataFrame({"same_gene_rho": np.pad(same, (0, max(0, len(bg) - len(same))), constant_values=np.nan)[:len(bg)]
-                  if len(bg) >= len(same) else same}).write_csv(os.path.join(outdir, "tables", "test_5__pairs.csv"))
-    metrics = {"n_genes": len(gene2guides), "n_same_pairs": int(len(same)),
-               "same_gene_mean_rho": float(same.mean()), "background_mean_rho": float(bg.mean()),
-               "separation_z": float(sep)}
+    same_df = pl.DataFrame(same_rows)
+    bg_df = pl.DataFrame(bg_rows)
+    same_df.write_csv(os.path.join(outdir, "tables", "test_5__same_gene_pairs.csv"))
+    bg_df.write_csv(os.path.join(outdir, "tables", "test_5__background_pairs.csv"))
+    metrics = {"n_genes": len(gene2guides), "n_guides_tested": len(de_by_guide),
+               "n_same_pairs": same_df.height, "n_background_pairs": bg_df.height,
+               # PRIMARY metric = DEG-restricted LFC ρ (Test 5 is a SEPARATION test: the all-genes ρ is
+               # ~0 for both same & background — diluted by ~thousands of noise genes — and cannot
+               # discriminate biology; the shared signal lives in the responsive (DE) genes).
+               "primary_metric": "rho_deg"}
+    for col, _disp, lab, _xr in TEST5_METRICS:
+        ms, mb, _sd, z, emp_p, mwu_p, auc = _separation(same_df[col].to_numpy(), bg_df[col].to_numpy())
+        metrics[f"same_gene_mean_{lab}"] = ms
+        metrics[f"background_mean_{lab}"] = mb
+        metrics[f"separation_z_{lab}"] = z
+        metrics[f"emp_p_{lab}"] = emp_p
+        metrics[f"mwu_p_{lab}"] = mwu_p
+        metrics[f"auc_{lab}"] = auc
+    prim = metrics["primary_metric"]
+    prim_col = next(c for c, _d, lab, _x in TEST5_METRICS if lab == prim)
+    # legacy/verdict-driver key points at the PRIMARY metric's separation
+    metrics["separation_z"] = metrics[f"separation_z_{prim}"]
+    # cell-count dependence: does same-gene concordance climb with cells-per-guide? (Test-4 undersampling
+    # analog) — Spearman of the pair's smaller guide cell count vs the primary concordance metric.
+    sg_mc = same_df["min_cells"].to_numpy().astype(float)
+    sg_v = same_df[prim_col].to_numpy().astype(float)
+    ok = np.isfinite(sg_mc) & np.isfinite(sg_v)
+    metrics["samegene_primary_vs_ncells_spearman"] = (
+        float(stats.spearmanr(sg_mc[ok], sg_v[ok]).correlation) if ok.sum() >= 3 else float("nan"))
+    _plot_test5_separation(same_df, bg_df, os.path.join(outdir, "plots", "test_5_separation.png"))
+    _plot_test5_vs_ncells(same_df, bg_df, prim_col, os.path.join(outdir, "plots", "test_5_vs_ncells.png"))
     verdict, reason, flags = verdict_test_5(metrics, cfg)
+    pvalues = {f"separation_z ({prim})": metrics["separation_z"],
+               f"emp_p ({prim})": metrics[f"emp_p_{prim}"], f"mwu_p ({prim})": metrics[f"mwu_p_{prim}"]}
     return TestResult("test_5", "Same-Gene Independent sgRNA Reproducibility", verdict,
-                      metrics=metrics, flags=flags, pvalues={"separation_z": float(sep)}, reason=reason)
+                      metrics=metrics, flags=flags, pvalues=pvalues, plot="plots/test_5_separation.png",
+                      reason=reason)
 
 
 def test_6(adata, cfg, outdir, de_true=None):
@@ -1792,12 +1987,21 @@ TIER_DOC = {
               "(metric cannot tell signal from noise). Diagnostic: real p-values should show a small-p "
               "excess (ECDF above diagonal / QQ above the line) while shuffled p-values track "
               "Uniform[0,1] (frac(p<0.05)≈0.05, λ_GC≈1) — across all cell-count strata.",
-    "test_4": "**Tiers** (same as Test 1) — LFC Spearman ρ: > 0.6 strong/PASS · 0.3–0.6 moderate/WARN · "
-              "< 0.3 low/FAIL. DEG Jaccard: > 0.3 · 0.1–0.3 · < 0.1. Direction: > 0.7 · 0.6–0.7 · ≈ 0.5. "
-              "This is the empirical reproducibility ceiling for downstream metrics.",
-    "test_5": "**Tiers** — separation (same-gene vs background guide agreement): > 1.5 PASS · 1.0–1.5 "
-              "WARN · < 1.0 FAIL. With < ~5 guide pairs the result is power-limited ⇒ WARN (cannot "
-              "conclude), never FAIL.",
+    "test_4": "Test 1's within-condition reproducibility design run at the **guide (sgRNA) level** — the "
+              "unit is one guide, split A/B vs split control (DE_A, DE_B), plus the difference-is-null "
+              "QQ and the ρ-vs-cell-count diagnostic, same as Test 1. **Tiers** (same as Test 1) — LFC "
+              "Spearman ρ: > 0.6 strong/PASS · 0.3–0.6 moderate/WARN · < 0.3 low/FAIL. DEG Jaccard: > 0.3 "
+              "· 0.1–0.3 · < 0.1. Direction: > 0.7 · 0.6–0.7 · ≈ 0.5. This is the empirical reproducibility "
+              "ceiling for any per-guide downstream metric.",
+    "test_5": "A separation test (like Test 3) using Test 4's reproducibility metrics: same-gene guide "
+              "pairs vs an unrelated-pair background, on **DEG-restricted LFC ρ** (all-genes ρ is ≈0 for "
+              "both — diluted by non-responsive genes — so it can't discriminate; the signal is in the DE "
+              "genes). The verdict is driven by the **AUC effect size** = P(a random same-gene pair is "
+              "more concordant than a random unrelated pair) **gated by Mann-Whitney significance**: PASS "
+              "AUC≥0.65 & p<α · WARN AUC≥0.55 & p<α (real but modest) · FAIL otherwise. (Separation z is "
+              "reported but not the driver — it is variance-sensitive and understates a wide-background "
+              "separation.) Plus a cells-per-guide trend (is weak concordance biology or undersampling?). "
+              "With < ~5 genes with ≥2 guides / < ~5 pairs ⇒ WARN (power-limited, never FAIL).",
     "test_6": "**Tiers** — recovery_rate (targets detected as DE): > 0.5 PASS · 0.2–0.5 WARN · < 0.2 "
               "FAIL. direction_rate (knocked down in expected direction): > 0.8 PASS · 0.6–0.8 WARN · "
               "< 0.6 FAIL. (Also reflects assay/guide quality, not the metric alone.)",
@@ -1832,7 +2036,13 @@ GLOSSARY = [
      "injected log2FC that reaches TPR ≥ 0.5, i.e. the smallest real effect the metric reliably "
      "detects. A max_TPR well below 1 means even strong real effects are partly missed (false negatives)."),
     ("separation z (Tests 3,5)", "(observed − null mean) / null SD. >2 means the true signal is clearly "
-     "outside the permuted/background null."),
+     "outside the permuted/background null. Variance-sensitive: a wide/skewed null deflates it (which is "
+     "why Test 5's verdict uses the AUC effect size instead)."),
+    ("AUC / probability of superiority (Test 5)", "The Mann-Whitney common-language effect size = "
+     "U/(n_same·n_bg) = P(a random same-gene guide pair is more concordant than a random unrelated pair). "
+     "0.5 = no separation, 1.0 = perfect. Rank-based (robust to the wide, skewed background that deflates "
+     "the separation z) and not inflated by sample size (unlike a raw p-value); it is the effect-size "
+     "companion to the Mann-Whitney p, so Test 5 reports both — AUC for magnitude, p for significance."),
     ("LFC Spearman ρ / Jaccard (Tests 1, 4)", "Rank correlation of fold-changes / overlap of "
      "significant gene sets between two split halves — the empirical reproducibility ceiling."),
 ]
@@ -1982,10 +2192,12 @@ def write_report(results, cfg, power, fp, outdir):
           "| test_3 | gate — signal vs noise | Shuffle perturbation labels — is real signal far outside "
           "the permuted null (separation z)? Diagnostic: do real p-values show a small-p excess while "
           "shuffled p-values stay Uniform, across cell-count strata? |",
-          "| test_4 | sensitivity — ceiling | Same-guide split reproducibility — the empirical ceiling "
-          "for any downstream metric. |",
+          "| test_4 | sensitivity — ceiling | **Test 1 at the guide level**: split each guide's cells in "
+          "half vs control — do the two half-signatures agree, and does that depend on cell count? The "
+          "empirical reproducibility ceiling for any per-guide downstream metric. |",
           "| test_5 | sensitivity | Do independent guides for the same gene agree more than unrelated "
-          "guides? (power-limited with few guides) |",
+          "guides? Verdict = AUC effect size (P[same>unrelated]) gated by Mann-Whitney significance; "
+          "power-limited with few guides. |",
           "| test_6 | sensitivity | Is the targeted gene itself knocked down in the right direction? "
           "(also reflects assay/guide quality) |",
           "| composition | confounder | Do perturbations shift cell-state proportions vs control? "
@@ -2070,19 +2282,35 @@ def write_report(results, cfg, power, fp, outdir):
             L.append("")
         L.append(f"**Verdict reason:** {r.reason}")
         L.append("")
-        # Test 1: reproducibility statistics — render as a clean table
-        if r.name == "test_1" and any(k.startswith("no_match__") for k in r.metrics):
+        # Test 1 (perturbation-level) & Test 4 (guide-level) share this reproducibility renderer
+        if r.name in ("test_1", "test_4") and any(k.startswith("no_match__") for k in r.metrics):
             m = r.metrics
             present = ["no_match"]
-            L.append("**What this measures.** Split each perturbation's cells into two halves A and B "
-                     "and run each half against control (`DE_A`, `DE_B`), with the control cells also "
-                     "split into two halves (`DE_A = A vs ctrl_half_A`, `DE_B = B vs ctrl_half_B`; **no "
-                     "1:1 cell matching**). The **primary** question is *reproducibility* — do the two "
-                     "independent half-signatures agree (`DE_A ≈ DE_B`)? A **secondary** difference-is-null "
-                     "stat (direct `A_pert vs B_pert`, the same perturbation ⇒ should be ≈null) is "
-                     "reported as a sanity check.")
+            tprefix = r.name
+            unit = "perturbation" if r.name == "test_1" else "guide"
+            U = unit.capitalize()
+            ab = "A_pert vs B_pert" if r.name == "test_1" else "A_guide vs B_guide"
+            if r.name == "test_4":
+                L.append("**What this measures.** This is **Test 1 run at the sgRNA (guide) level** — the "
+                         "*unit* is an individual guide, not a perturbation/gene. Split each guide's cells "
+                         "into two halves A and B and run each half against control (`DE_A`, `DE_B`), with "
+                         "the control cells also split into two halves (`DE_A = A vs ctrl_half_A`, `DE_B = B "
+                         "vs ctrl_half_B`; **no 1:1 cell matching**). The **primary** question is "
+                         "*reproducibility* — do the two independent half-signatures of the **same guide** "
+                         "agree (`DE_A ≈ DE_B`)? A **secondary** difference-is-null stat (direct `A_guide vs "
+                         "B_guide`, the same guide ⇒ should be ≈null) is reported as a sanity check. With "
+                         "many guides per gene, this is the empirical reproducibility ceiling at the "
+                         "resolution downstream per-guide metrics actually operate.")
+            else:
+                L.append("**What this measures.** Split each perturbation's cells into two halves A and B "
+                         "and run each half against control (`DE_A`, `DE_B`), with the control cells also "
+                         "split into two halves (`DE_A = A vs ctrl_half_A`, `DE_B = B vs ctrl_half_B`; **no "
+                         "1:1 cell matching**). The **primary** question is *reproducibility* — do the two "
+                         "independent half-signatures agree (`DE_A ≈ DE_B`)? A **secondary** difference-is-null "
+                         "stat (direct `A_pert vs B_pert`, the same perturbation ⇒ should be ≈null) is "
+                         "reported as a sanity check.")
             L.append("")
-            # --- design: what's compared, how DE is defined, thresholds, and per-perturbation cell counts ---
+            # --- design: what's compared, how DE is defined, thresholds, and per-unit cell counts ---
             de_desc = ("cell-level **Wilcoxon rank-sum** (each cell is a unit; log2FC = "
                        "log2(mean_perturbed / mean_control), BH-FDR)" if cfg.get("de_method") == "pdex"
                        else "**pseudobulk DESeq2 Wald** (cells summed per replicate/`%s`, negative-binomial GLM)"
@@ -2091,16 +2319,16 @@ def write_report(results, cfg, power, fp, outdir):
             nperm_t1 = cfg.get("test1_n_resamples", min(3, cfg.get("n_resamples", 10)))
             ncond = m.get("no_match__n_conditions")
             nctrl = fp.get("n_control_cells")
-            ppcsv = os.path.join(outdir, "tables", "test_1__repro_vs_ncells_no_match.csv")
+            ppcsv = os.path.join(outdir, "tables", f"{tprefix}__repro_vs_ncells_no_match.csv")
             cell_txt = ""
             if os.path.exists(ppcsv):
                 ncv = pl.read_csv(ppcsv)["n_cells"].to_numpy()
                 if ncv.size:
-                    cell_txt = (f" Across the **{ncv.size} tested perturbations**, total cells per "
-                                f"perturbation range **{int(ncv.min()):,}–{int(ncv.max()):,}** "
+                    cell_txt = (f" Across the **{ncv.size} tested {unit}s**, total cells per "
+                                f"{unit} range **{int(ncv.min()):,}–{int(ncv.max()):,}** "
                                 f"(median {int(np.median(ncv)):,}); each A/B half uses ~half of those "
-                                "(the per-perturbation counts are in the table below / "
-                                "`tables/test_1__repro_vs_ncells_no_match.csv`).")
+                                f"(the per-{unit} counts are in the table below / "
+                                f"`tables/{tprefix}__repro_vs_ncells_no_match.csv`).")
             L.append(
                 "*Design (ground truth).* An **arm** is one side of the split DE compares. `DE_A` and "
                 f"`DE_B` are computed with the **same DE method as the main analysis** — {de_desc} — and a "
@@ -2108,7 +2336,7 @@ def write_report(results, cfg, power, fp, outdir):
                 f"{cfg.get('lfc_threshold')}**. Reproducibility compares the two signatures gene-by-gene: "
                 "**Spearman ρ of their log2FC vectors** (primary), **DEG-set Jaccard**, and **direction "
                 f"agreement**. The split is repeated for **{nperm_t1} draws** (`test1_n_resamples`) per "
-                f"perturbation (each perturbation's reported ρ is the median over its {nperm_t1} draws). "
+                f"{unit} (each {unit}'s reported ρ is the median over its {nperm_t1} draws). "
                 f"Controls ({nctrl:,} cells) are split into two halves (~{nctrl // 2:,} each).{cell_txt}")
             L.append("")
             L.append(f"*Thresholds (reproducibility tiers).* split-half LFC Spearman ρ: **PASS > "
@@ -2125,13 +2353,13 @@ def write_report(results, cfg, power, fp, outdir):
                 ("reproducibility — median Spearman LFC ρ, DE genes only (2°)", "repro_lfc_spearman_deg"),
                 ("reproducibility — median DEG Jaccard", "repro_jaccard"),
                 ("reproducibility — median direction agreement", "repro_direction"),
-                ("# perturbations strong (ρ>0.6)", "n_strong_rho_gt0.6"),
+                (f"# {unit}s strong (ρ>0.6)", "n_strong_rho_gt0.6"),
                 ("# moderate (0.3–0.6)", "n_moderate_rho_0.3_0.6"),
                 ("# low (<0.3)", "n_low_rho_lt0.3"),
                 ("(2°) difference-is-null λ_GC", "diffnull_lambda_gc"),
                 ("(2°) difference-is-null frac_sig", "diffnull_frac_sig"),
                 ("(2°) difference-is-null ks_p_uniform", "diffnull_ks_p_uniform"),
-                ("# perturbations tested", "n_conditions"),
+                (f"# {unit}s tested", "n_conditions"),
             ]
             tier_key = {"repro_lfc_spearman": "lfc_spearman", "repro_lfc_spearman_deg": "lfc_spearman",
                         "repro_jaccard": "sig_jaccard", "repro_direction": "direction_agreement"}
@@ -2146,7 +2374,7 @@ def write_report(results, cfg, power, fp, outdir):
                 L.append(f"| {lbl} | " + " | ".join(cells) + " |")
             L.append("")
             L.append(f"_Tiers (strong/moderate/low) per metric: {REPRO_LEGEND} The split-half LFC ρ "
-                     "(all genes) drives the verdict. difference-is-null: A and B are the same perturbation, "
+                     f"(all genes) drives the verdict. difference-is-null: A and B are the same {unit}, "
                      "so a calibrated pipeline calls ≈α (λ_GC≈1, p uniform)._")
             L.append("")
             # which gene set each reproducibility metric uses
@@ -2169,7 +2397,7 @@ def write_report(results, cfg, power, fp, outdir):
                 wp_min = next((m.get(f"{mode}__wellpowered_min_cells") for mode in present
                                if m.get(f"{mode}__wellpowered_min_cells")), 200)
                 L.append("**Reproducibility vs cell count — is it the method, or undersampling?** Splitting a "
-                         "perturbation into halves starves small conditions of cells, so each perturbation is "
+                         f"{unit} into halves starves small {unit}s of cells, so each {unit} is "
                          "plotted as **one point** (its total cell count vs its median split-half ρ). Points "
                          "that **climb with cell count and plateau** ⇒ low scores are power-limited (not enough "
                          "cells); points that **stay low even at high cell counts** ⇒ a genuine method "
@@ -2185,7 +2413,7 @@ def write_report(results, cfg, power, fp, outdir):
                     lifts = (isinstance(wp, (int, float)) and np.isfinite(wp)
                              and isinstance(overall_mode, (int, float))
                              and verdict_reproducibility(wp) != verdict_reproducibility(overall_mode))
-                    note = ("→ restricting to well-powered perturbations **lifts** ρ across a tier boundary ⇒ "
+                    note = (f"→ restricting to well-powered {unit}s **lifts** ρ across a tier boundary ⇒ "
                             "part of the low score is an undersampling artifact." if lifts else
                             "→ well-powered ρ ≈ this scenario's overall ρ ⇒ the score reflects a **genuine "
                             "method property**, not undersampling.")
@@ -2193,17 +2421,17 @@ def write_report(results, cfg, power, fp, outdir):
                              f"(n={upn}) median ρ={fmt(up)} · Spearman(cell count, ρ)={fmt(tr)} {note}")
                 L.append("")
                 L.append("The figure shows this for **every** reproducibility statistic (one panel each), "
-                         "one point per perturbation:")
+                         f"one point per {unit}:")
                 L.append("")
-                upng = "plots/test_1_undersampling.png"
+                upng = f"plots/{tprefix}_undersampling.png"
                 if os.path.exists(os.path.join(outdir, upng)):
                     L.append(f"![reproducibility vs cell count]({upng})")
                     L.append("")
                 # per-statistic cell-count trend table (Spearman of cell count vs the metric + well/under medians)
-                tcsv = os.path.join(outdir, "tables", "test_1__repro_vs_ncells_trends_no_match.csv")
+                tcsv = os.path.join(outdir, "tables", f"{tprefix}__repro_vs_ncells_trends_no_match.csv")
                 if os.path.exists(tcsv):
                     tdf = pl.read_csv(tcsv)
-                    L.append("Per-statistic cell-count dependence (one point per perturbation):")
+                    L.append(f"Per-statistic cell-count dependence (one point per {unit}):")
                     L.append("")
                     L.append("| statistic | Spearman(cells, value) | well-powered median | under-powered median |")
                     L.append("|---|---|---|---|")
@@ -2221,9 +2449,70 @@ def write_report(results, cfg, power, fp, outdir):
                              "genuine method property. Jaccard is universe-independent, so its all-genes and "
                              "DE-genes values coincide._")
                     L.append("")
-                L.append("_Per-perturbation points: `tables/test_1__repro_vs_ncells_no_match.csv`; "
-                         "per-statistic trends: `tables/test_1__repro_vs_ncells_trends_no_match.csv`._")
+                L.append(f"_Per-{unit} points: `tables/{tprefix}__repro_vs_ncells_no_match.csv`; "
+                         f"per-statistic trends: `tables/{tprefix}__repro_vs_ncells_trends_no_match.csv`._")
                 L.append("")
+        elif r.name == "test_5" and r.verdict != "SKIP" and r.metrics:
+            m = r.metrics
+            L.append("**What this measures.** Do **two different guides targeting the same gene** produce "
+                     "more similar perturbation signatures than two **unrelated** guides (different "
+                     "genes)? Each guide is DE'd vs control; then the **same Test-4 reproducibility "
+                     "metrics** (Spearman LFC ρ over all genes & over DE genes, DEG-set Jaccard, direction "
+                     "agreement) are computed for every **same-gene guide pair** and for a matched "
+                     "**background** of unrelated pairs. The headline statistic is the **AUC** = "
+                     "P(a random same-gene pair is more concordant than a random unrelated pair) — the "
+                     "Mann-Whitney common-language effect size (0.5 = no separation, 1.0 = perfect). A "
+                     "biology-rewarding metric puts same-gene pairs above background. Expect only **modest** "
+                     "concordance — guides for one gene genuinely differ in knockdown efficacy.")
+            L.append("")
+            prim = m.get("primary_metric", "rho_deg")
+            prim_disp = next((d for _c, d, lab, _x in TEST5_METRICS if lab == prim), prim)
+            fdr = cfg.get("fdr_threshold", 0.05)
+            L.append(f"*Design & verdict.* **{m.get('n_genes')} genes with ≥2 guides** "
+                     f"({m.get('n_guides_tested')} guides DE'd vs control) → **{m.get('n_same_pairs')} "
+                     f"same-gene pairs** vs **{m.get('n_background_pairs')} unrelated background pairs**. The "
+                     f"**primary metric is {prim_disp}** (all-genes ρ is diluted to ≈0 by thousands of "
+                     "non-responsive genes for *both* same and background pairs, so it cannot discriminate — "
+                     "the signal lives in the DE genes). The verdict is driven by the **AUC effect size "
+                     f"gated by Mann-Whitney significance**: **PASS** AUC ≥ 0.65 & p < {fdr} (clear "
+                     f"discrimination) · **WARN** AUC ≥ 0.55 & p < {fdr} (real but modest) · **FAIL** "
+                     "otherwise. With < 5 genes-with-≥2-guides or < 5 same-gene pairs ⇒ **WARN-only "
+                     "(uninformative — never FAIL)**. (Separation z = (same−bg)/SD(bg) is reported as a "
+                     "secondary number but is *not* the driver: it is variance-sensitive and understates a "
+                     "separation when the background distribution is wide, as it is for essential-gene screens.)")
+            L.append("")
+            L.append("| metric | AUC P(same>bg) | MWU p | same-gene mean | background mean | separation z | empirical p |")
+            L.append("|---|---|---|---|---|---|---|")
+            for _col, disp, lab, _xr in TEST5_METRICS:
+                tag = " **(primary)**" if lab == prim else ""
+                L.append(f"| {disp}{tag} | {fmt(m.get('auc_' + lab))} | {fmt(m.get('mwu_p_' + lab))} | "
+                         f"{fmt(m.get('same_gene_mean_' + lab))} | {fmt(m.get('background_mean_' + lab))} | "
+                         f"{fmt(m.get('separation_z_' + lab))} | {fmt(m.get('emp_p_' + lab))} |")
+            L.append("")
+            L.append("_**AUC** (verdict driver) = P(same-gene pair more concordant than a random unrelated "
+                     "pair), the Mann-Whitney effect size — rank-based, so robust to the wide/skewed "
+                     "background, and not inflated by sample size. **MWU p** = significance that same-gene > "
+                     "background. Separation z & empirical p are secondary. Per-pair values: "
+                     "`tables/test_5__same_gene_pairs.csv`, `tables/test_5__background_pairs.csv`._")
+            L.append("")
+            # cell-count dependence (Test-4 undersampling analog): is weak concordance a biology problem
+            # or just undersampled guides?
+            vsn = m.get("samegene_primary_vs_ncells_spearman")
+            if vsn is not None and isinstance(vsn, (int, float)) and np.isfinite(vsn):
+                interp = ("a clear **positive** trend ⇒ the (modest) same-gene concordance is real but "
+                          "**cell-limited** (more cells per guide ⇒ stronger agreement), mirroring the "
+                          "Test-4 undersampling finding." if vsn >= 0.15 else
+                          ("**≈ 0** ⇒ low same-gene concordance persists even for well-powered guides — a "
+                           "**genuine ceiling**, not just undersampling." if vsn > -0.15 else
+                           "**negative** ⇒ no evidence that more cells per guide improve same-gene "
+                           "concordance here (the low concordance is not explained by undersampling)."))
+                L.append(f"**Is weak concordance biology or undersampling?** Spearman(cells-per-guide, "
+                         f"same-gene {prim_disp}) = **{fmt(vsn)}** — {interp}")
+                L.append("")
+                vpng = "plots/test_5_vs_ncells.png"
+                if os.path.exists(os.path.join(outdir, vpng)):
+                    L.append(f"![same-gene concordance vs cells per guide]({vpng})")
+                    L.append("")
         elif r.metrics:
             L.append("| metric | value |")
             L.append("|---|---|")
