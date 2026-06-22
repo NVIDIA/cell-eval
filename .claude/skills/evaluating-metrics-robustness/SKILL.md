@@ -1,13 +1,13 @@
 ---
 name: evaluating-metrics-robustness
-description: Stress-test cell-eval's metrics for stability & robustness on a perturbation .h5ad (e.g. adata_Validation.h5ad). Acts as a metaskill — fingerprint the dataset, confirm a configuration with the user in dialog, then INSTANTIATE a self-contained, reproducible experiment in a per-run experiment folder (frozen config.yaml + standalone run.py + a copy of the test plan + README) that runs cell-eval's real DE backend (pdex or pydeseq2) through the test plan and outputs a robustness report (markdown + PDF) with all p-values, thresholds, per-test tier explanations, and the embedded test plan. Use when someone wants to audit/calibrate cell-eval metrics, validate a DE pipeline's calibration before interpreting biology, or produce a reproducible robustness report for a dataset.
+description: Stress-test cell-eval's metrics for stability & robustness on a perturbation .h5ad (e.g. adata_Validation.h5ad). Acts as a metaskill — fingerprint the dataset, confirm a configuration with the user in dialog, then INSTANTIATE a self-contained, reproducible experiment in a per-run experiment folder (frozen config.yaml + standalone run.py + a copy of the test plan + README) that runs cell-eval's real DE backend (pdex or pydeseq2) through the test plan and outputs a robustness report (markdown + PDF) whose every test section is self-contained (question, data, parameters-with-values, method, results, decision rule, verdict). Use when someone wants to audit/calibrate cell-eval metrics, validate a DE pipeline's calibration before interpreting biology, or produce a reproducible robustness report for a dataset.
 type: skill
 ---
 
 # Evaluating cell-eval metrics for stability & robustness (metaskill)
 
 This is the **metaskill**. Given a perturbation dataset in `.h5ad` format
-(e.g. `/home/yangzhang/code/cell-eval/adata_Validation.h5ad`), you work in two phases:
+(e.g. `<repo-root>/adata_Validation.h5ad`), you work in two phases:
 
 **Phase A — nail down the configuration (interactive).**
 1. **create a fresh experiment folder** for this run,
@@ -26,7 +26,7 @@ portable and the result reproduces under the same `seed`.
 
 `TEST_PLAN.md` (in this directory) is the canonical specification of *what* the tests are, their
 formulas, and verdict rules. **Do not reimplement DE or the metrics — call the real `cell_eval` code.**
-Run commands from the repo root `/home/yangzhang/code/cell-eval` in the **Python environment the user
+Run commands from the repo root `<repo-root>` in the **Python environment the user
 confirms in Phase A** — either `uv run python …`, or `source .venv/bin/activate` then `python …`.
 
 ## Experiment folder (one per run)
@@ -38,7 +38,7 @@ clobber each other and each result is fully reproducible. Convention:
 experiments/<dataset-stem>__<de_method>__<UTC-timestamp>/
 ```
 e.g. `experiments/adata_Validation__pydeseq2__20260604-141530/`, created under the repo root
-`/home/yangzhang/code/cell-eval/` (make the parent `experiments/` if missing). Create it first:
+`<repo-root>/` (make the parent `experiments/` if missing). Create it first:
 
 ```bash
 RUN_DIR="experiments/$(basename <h5ad> .h5ad)__<de_method>__$(date -u +%Y%m%d-%H%M%S)"
@@ -76,27 +76,14 @@ Drive cell-eval's actual code paths so the report reflects the real pipeline:
       de_kwargs=de_kwargs or None, counts_layer=counts_layer, replicate_col=replicate_col,
   )  # -> polars DataFrame
   ```
-- **Run-pipeline metrics** — `cell_eval.MetricsEvaluator(...).compute(...)` is exactly
-  `cell-eval run --de-methods <de_method>`:
-  ```python
-  from cell_eval import MetricsEvaluator
-  ev = MetricsEvaluator(
-      adata_pred=pred, adata_real=real, control_pert=control_pert, pert_col=pert_col,
-      num_threads=n, outdir=RUN_DIR, prefix="testX", allow_discrete=allow_discrete,
-      de_methods=[de_method], counts_layer=counts_layer, replicate_col=replicate_col,
-      de_kwargs={de_method: de_kwargs} if de_kwargs else None,
-  )
-  perturbation_results, agg_results = ev.compute(profile="full", write_csv=True, basename="results.csv")
-  ```
 - **Backend dispatch & validation** — `cell_eval._de_backends.normalize_de_methods(de_method)`
-  validates the name (`pdex` or `pydeseq2`). `MetricsEvaluator` is re-exported at the top level
-  (`from cell_eval import MetricsEvaluator`). The null-split tests MUST use the **same `de_method` as the intended real
-  analysis** (TEST_PLAN.md §"Critical").
+  validates the name (`pdex` or `pydeseq2`). The null-split tests MUST use the **same `de_method` as the
+  intended real analysis** (TEST_PLAN.md §"Critical").
 
 ## Test plan → what to run
 
-`TEST_PLAN.md` defines the tests. Tests **0–3** are **validity gates**; tests **4–6** plus the
-**composition** diagnostic are **sensitivity diagnostics**. **Read TEST_PLAN.md §"Read first: unit of
+`TEST_PLAN.md` defines the tests. Tests **0–3** are **validity gates**; tests **4–6** are
+**sensitivity diagnostics**. **Read TEST_PLAN.md §"Read first: unit of
 analysis & DE method" before anything else** — whether the null-split tests behave depends entirely
 on the DE method's unit of analysis (cell-level `pdex`/Wilcoxon is subject to *pseudoreplication*,
 Squair et al. 2021; only pseudobulk/mixed-model nulls are calibrated). Implement each test exactly as
@@ -106,12 +93,11 @@ specified there (formulas, expected behaviour, verdict rules):
 |---|---|---|
 | 0 — Controlled Effect-Size Injection | gate | on control cells: split A/B, spike known log2FC into a **small number (~a dozen) of genes** in B at several δ tiers (incl. δ=0), pooled over several random draws → same DE → FPR-at-null + TPR-vs-δ curve. Injecting few genes (not a large fraction) is faithful to a real perturbation and avoids the library-size shift that artificially induces compositional coupling. (Legacy large-fraction stress: `injection_n_genes: null` + `injection_frac_genes`.) |
 | 1 — Within-Condition Reproducibility | gate | per perturbation: split cells into halves A/B, run each vs control (`DE_A`,`DE_B`) with controls also split in half (**no 1:1 cell matching**) → median split-half Spearman LFC ρ (+ Jaccard, direction). PLUS ρ-vs-cell-count **per perturbation** (separates a low-reproducibility method from undersampled conditions) and a secondary `A_pert`-vs-`B_pert` difference-is-null QQ |
-| 2 — Control-Control Split Null | gate | split control cells into pseudo-pert vs reference → same null metrics + check downstream cell-metrics collapse to chance |
+| 2 — Control-Control Split Null | gate | split control cells into pseudo-pert vs reference → same DE null metrics (`frac_sig`, `λ_GC`, `ks_p_uniform`) |
 | 3 — Label Permutation Null | gate | true metrics vs `n_resamples` within-`block_cols` label shuffles → separation z-score / empirical p. PLUS a cell-count-stratified p-value diagnostic (`plots/test_3_pvalue_diagnostics.png`, `tables/test_3__pvalues_by_cellcount.csv`): real vs shuffled per-gene p-values pooled over all perturbations × genes, ECDF/QQ-vs-Uniform + per-perturbation frac(p<0.05) vs cell count + ECDF faceted by cell-count tertile (real should show a small-p excess; shuffled should track Uniform across strata) |
-| 4 — Same-sgRNA Split Reproducibility | ceiling | split each guide's cells A/B, each vs control → compare signatures (Spearman LFC, Jaccard, direction, AUC) |
-| 5 — Same-Gene Independent sgRNA Reproducibility | sensitivity | same-gene guide pairs vs unrelated-pair background → separation score (expect modest concordance; power-limited with few guides) |
+| 4 — Same-sgRNA Split Reproducibility (guide-level Test 1) | ceiling | **Test 1 at the guide level**: per guide, split cells A/B with controls also split in half, run each vs control (`DE_A`,`DE_B`) over `test1_n_resamples` draws → median split-half Spearman LFC ρ (+ Jaccard, direction) + ρ-vs-cell-count per guide + difference-is-null QQ (same two plots as Test 1) |
+| 5 — Same-Gene Independent sgRNA Reproducibility | sensitivity | same-gene guide pairs vs unrelated-pair background → **AUC = P(same>unrelated)** gated by Mann-Whitney p, on DEG-restricted LFC ρ (expect modest concordance; power-limited with few guides) |
 | 6 — Target Gene Knockdown Recovery | sensitivity | per guide vs control → target-gene `lfc/padj/rank/direction`; recovery & direction rates (also reflects assay/guide quality) |
-| Composition diagnostic | confounder | if a cell-type/cluster/cell-cycle column exists, TVD of per-pert proportions vs control; else SKIP with guidance |
 
 **Global verdict gate:** if ANY of tests 0–3 FAIL, the global verdict is **FAIL** — report it and tell
 the user not to interpret the biology until the pipeline is fixed; tests 4–6 are only informative once
@@ -138,9 +124,6 @@ before trusting thresholds.
 - **Unit of analysis must be reported.** Derive it from `de_method` (`pdex` → individual cell /
   Wilcoxon → pseudoreplication caveat; `pydeseq2` → pseudobulk replicate) and state it in the report's
   "How DE was computed" section.
-- **Composition diagnostic.** If `obs` has a cell-type / cluster / cell-cycle column (auto-detect or
-  `celltype_cols`), compute per-perturbation TVD of proportions vs control and WARN on TVD > 0.10;
-  otherwise SKIP with explicit guidance that composition cannot be assessed.
 
 ## Report contents (REQUIRED)
 
@@ -151,8 +134,11 @@ conventions"); a buried, summary-only report is a failure even if every number i
 
 **Lead the report with, in this order:**
 
-- **A. Global verdict** with a one-line reason, and the per-gate (0–3) verdicts each with their own
-  one-line reason.
+- **A. Global verdict** with a one-line reason, then **every test's verdict + one-line reason** —
+  grouped as validity gates (0–3, which drive the global call) and sensitivity diagnostics (4–6,
+  reported for completeness). List **all** verdicts here even when a gate FAILs, so the
+  global section is a complete scoreboard. Do **not** render emoji/symbols before the PASS/WARN/FAIL/SKIP
+  word (the PDF font can't display them); the word alone carries the verdict.
 - **B. Dataset & experimental context** — file, #cells/#genes, #perturbations, control cell count,
   cells-per-perturbation (min/median/max), #guides and #genes-with-≥2-guides, the full obs-column
   list, and an explicit **"what is NOT available"** line (cell type, cell cycle, donor/patient, sex,
@@ -163,9 +149,27 @@ conventions"); a buried, summary-only report is a failure even if every number i
   on both corrected and uncorrected data.
 - **D. At-a-glance table** — every test with verdict + its **local one-line reason**.
 
-Then the **per-test detail** sections, each opening with a **1–3 sentence plain-language "what this
-tests / how to read it"** (reuse the "In one sentence" lines from TEST_PLAN.md), then the local
-verdict reason, the rounded metric table, the verification p-values, flags, and the plot.
+Then the **per-test detail** sections. **Every test section MUST be fully self-contained** — a reader
+who jumps straight to one section understands it without scrolling back to any earlier section — and
+**every section uses the same 7-part template, in this exact order**, so the sections are structurally
+parallel:
+
+1. **What was tested** — the question/hypothesis in plain language.
+2. **Data** — which dataset, the sample size(s) *for this test* (e.g. # perturbations / # guides /
+   # pairs, cells per arm, control-cell count), and what was measured.
+3. **Parameters** — a `parameter | what it controls | value` table listing **every** parameter the
+   test uses, each with a one-line explanation **and its actual assigned value for this run** (not just
+   the name); include the verdict thresholds/tiers here.
+4. **Method** — the statistical procedure applied.
+5. **Results** — the computed statistic(s), p-value / CI / effect size, the rounded metric table(s),
+   and the plot(s). **All existing tables and plots live here** (Test 0 calibration curve, Test 1/4
+   reproducibility tables + both plots, Test 5 AUC table + both plots, Test 2/3 diagnostics, etc.).
+6. **Verdict strategy** — the explicit decision rule (the threshold(s) and how the result maps to
+   PASS / WARN / FAIL / SKIP), stated **before** the verdict so the reader sees the reasoning.
+7. **Verdict** — the verdict itself, plus any supporting caveat flags.
+
+The global §1/§2/§5 sections are kept as a brief upfront overview/navigation, but each per-test
+section repeats the data + parameters it needs so it stands alone.
 
 - **Test 0 MUST render the full per-δ calibration curve as an inline table in the report body** —
   one row per injected effect size `δ` (including `δ=0`) with columns **TPR (injected genes)**,
@@ -197,14 +201,14 @@ verdict reason, the rounded metric table, the verification p-values, flags, and 
 
 **Formatting rules:** round all numbers to 4–6 significant figures (`0.1952`, never
 `0.19523047652509917`); keep each test's failure/caveat reason **local to that test**; put heavy
-material (full thresholds dump, embedded TEST_PLAN.md) **last**. **In the PDF, render every markdown
+reference material (the glossary) **last**. **In the PDF, render every markdown
 table as a real typeset table** (reportlab `Table`/`TableStyle` — shaded header row, grid lines,
 wrapping cells, alternating row backgrounds), NOT as raw `| … |` pipe text: the `render_pdf` helper
 must detect markdown table blocks (a `| header |` row followed by a `|---|` separator) and convert
 them to `Table` flowables (skip code-fence ``` lines too). Include a **Glossary** (λ_GC,
 ks_p_uniform, frac_sig, separation z, TPR/FPR, max_TPR / min resolvable δ, reproducibility ρ, "unit of analysis", **"arm"**, **"stratified split / block_cols"**) and a
 **Known limitations & next steps** section (single dataset, cell-level unit,
-composition not assessed, corrected-vs-uncorrected, why enrichment is excluded).
+corrected-vs-uncorrected, why enrichment is excluded).
 
 **Also emit (optional but encouraged):** a **MultiQC** custom-content file
 (`$RUN_DIR/multiqc/*_mqc.txt`, https://github.com/MultiQC/MultiQC) so the verdicts render as an
@@ -217,24 +221,16 @@ In addition to the above, the report MUST include:
    (test 3), per-target `padj_target` (test 6), and the pooled null Wald/Wilcoxon p-value summary.
    Include a **`p_values` table per test** and reference the full per-gene p-value/FDR CSVs written in
    `$RUN_DIR/tables/` (so nothing is hidden behind a summary statistic).
-2. **Every threshold used for verification**, listed explicitly with its value and source, so the
-   verdicts are reproducible. At minimum: `fdr_threshold`, `lfc_threshold`, `lambda_gc_warn` (1.05),
-   `lambda_gc_fail` (1.10), the λ_GC deflation/ks WARN thresholds (< 0.90 / < 0.05), the test-0
-   injection δ tiers and null-FPR FAIL threshold (> 2×α), `n_resamples`, `min_cells_per_group`,
-   `seed`, the test-1/test-4 reproducibility tiers (ρ 0.6/0.3, Jaccard 0.3/0.1, direction 0.7/0.6),
-   the test-3 separation thresholds (PASS > 2, WARN 1–2), test-5 separation (> 1.5), and test-6
-   `recovery_rate` / `direction_rate` thresholds. Render this as a **"Verification parameters &
-   thresholds" table** — placed *after* the context and per-test sections (it is reference material,
-   not a first impression). Each test's own metric **tiers** are explained inline in its result section.
-3. **A full copy of the test plan.** Embed the complete `TEST_PLAN.md` (design, formulas, verdict
-   rules) as an appendix in both the markdown report and the PDF, so the report is self-describing.
+   Each test's own parameters (with values) and tier thresholds are listed **inline in that section's
+   parts (3) and (6)** — there is **no** separate "Verification parameters & thresholds" section and
+   **no** embedded TEST_PLAN.md appendix in the report.
 
 > **No power/sample-size calculation.** The skill does **not** compute a power / `n_required` /
 > dispersion analysis (it was removed). Do not add a power section to the report.
 
 Ordering: **global verdict → dataset/experimental context → how DE was computed (unit of analysis) →
-at-a-glance → per-test detail (with plain-language + per-test tier explanations + local reasons) →
-thresholds → glossary → limitations → embedded TEST_PLAN.md appendix.** Heavy reference material goes
+at-a-glance → per-test detail (each as the self-contained 7-part section) → glossary → limitations.**
+Heavy reference material goes
 last so the report's first screen is interpretable.
 
 ## Procedure
@@ -289,7 +285,7 @@ Use **AskUserQuestion** to confirm — never assume:
 5. **`target_gene_col`** / **`sgrna_col`** (gate tests 4–6; `target_gene_col` must match `var_names`).
 6. **`covariate_correction`** — what (if anything) was regressed out of `.X` (`none` = uncorrected).
    Confirm whether to evaluate uncorrected, corrected, or **both** (recommended); record the state so
-   the report can label it. Also **`celltype_cols`** for the composition diagnostic (empty if none).
+   the report can label it.
 7. **knobs**: `n_resamples` (TEST_PLAN.md default 10), `min_cells_per_group` (20),
    `fdr_threshold` (0.05), `lfc_threshold` (0.1), `seed`, `max_conditions` (cap for smoke runs), and
    the **Test 0 injection** params (`injection_deltas` e.g. `[0,0.25,0.5,1,2]`, `injection_n_genes`
@@ -302,7 +298,7 @@ with `outdir: .` so the experiment folder is portable.
 
 Example `$RUN_DIR/config.yaml` for `adata_Validation.h5ad` (pydeseq2 / DESeq2 Wald):
 ```yaml
-adata_path: /home/yangzhang/code/cell-eval/adata_Validation.h5ad
+adata_path: <repo-root>/adata_Validation.h5ad
 de_method: pydeseq2
 pert_col: target_gene
 control_pert: non-targeting
@@ -313,7 +309,6 @@ normalize_if_raw: false
 target_gene_col: target_gene
 sgrna_col: guide_id
 covariate_correction: none    # what was regressed out of .X; evaluate uncorrected AND corrected
-celltype_cols: []             # obs cols for composition control; [] -> composition SKIPs with guidance
 fdr_threshold: 0.05
 lfc_threshold: 0.1
 n_resamples: 10
@@ -328,7 +323,7 @@ injection_frac_genes: null     # legacy large-fraction stress only (set n_genes:
 injection_max_cells_per_arm: 3000
 emit_multiqc: true            # also emit a MultiQC custom-content table
 outdir: .                     # outputs land in this experiment folder (portable)
-tests: [test_0, composition, test_1, test_2, test_3, test_4, test_5, test_6]
+tests: [test_0, test_1, test_2, test_3, test_4, test_5, test_6]
 ```
 (For `pdex`: set `de_method: pdex`, `allow_discrete: false`, `normalize_if_raw: true` so raw counts
 get `normalize_total`+`log1p` and pdex runs with `is_log1p=True`.)
@@ -341,17 +336,17 @@ Materialize a self-contained, runnable experiment in `$RUN_DIR`:
 - **`run.py`** — **start from the reference implementation `run_template.py` in this skill directory**
   (`cp .claude/skills/evaluating-metrics-robustness/run_template.py "$RUN_DIR/run.py"`). It is the
   battle-tested runner that already satisfies everything below — both backends (`pdex`/`pydeseq2`),
-  all tests (0, 1–6, composition), the context-first report, inline Test-0 calibration curve +
+  all tests (0–6), the context-first report, inline Test-0 calibration curve +
   injection-design prose, glossary, MultiQC export, proper PDF tables, and `--report-only`. It is
   fully config-driven, so for a new dataset you normally only change `config.yaml`; edit `run.py`
   only to add a genuinely new test or backend. The template loads `config.yaml` + the dataset and, for
-  each selected test, drives the recipe from `TEST_PLAN.md` via `build_de_frame` / `MetricsEvaluator`
+  each selected test, drives the recipe from `TEST_PLAN.md` via `build_de_frame`
   (see "Use the real cell-eval code"). Its shared helpers (TEST_PLAN.md §Implementation Notes):
   `fingerprint(...)` (dataset/experimental context + missing-covariate detection),
   `stratified_split(...)` (tests 0,1,2,4), `compare_signatures(de_A, de_B)` (tests 4,5),
   `null_metrics(de)` (`frac_sig`, `mean_lfc`, `mean_abs_lfc`, `ks_p_uniform`, `λ_GC` + QQ PNG with the
-  Beta(i, G−i+1) envelope → `plots/`), `test_0_injection(...)` (inject on **raw** counts before
-  normalization; TPR/FPR curve PNG), and `composition_diagnostic(...)`. Each `TestResult` carries a
+  Beta(i, G−i+1) envelope → `plots/`), and `test_0_injection(...)` (inject on **raw** counts before
+  normalization; TPR/FPR curve PNG). Each `TestResult` carries a
   one-line local `reason`. SKIP any condition with `< 2 × min_cells_per_group` cells (log it; >50%
   SKIP → WARN). Use the fixed `seed` for every split/permutation/injection. It writes
   `robustness_summary.json` (incl. the fingerprint + per-test `reason`), per-test CSVs in `tables/`
@@ -359,7 +354,7 @@ Materialize a self-contained, runnable experiment in `$RUN_DIR`:
   `robustness_report.md` satisfying **"Report contents (REQUIRED)"** (context-first, plain-language,
   glossary, local reasons, rounded numbers), an optional **MultiQC** custom-content file under
   `multiqc/`, and **renders `report.pdf` itself** (reportlab + a Unicode font like DejaVu; embed the
-  plots + the full `TEST_PLAN.md` appendix). Provide a **`--report-only`** mode that re-renders the
+  plots). Provide a **`--report-only`** mode that re-renders the
   report/PDF/MultiQC from the cached `robustness_summary.json` **without recomputing DE**, so report
   formatting can be iterated cheaply after the (expensive) compute has run once.
 - **`README.md`** — one screen: what this experiment is (dataset, `de_method`, tests), the **exact run
@@ -386,7 +381,7 @@ Grounded in the per-test tables and the global verdict gate, report:
 - per-test verdicts with concrete numbers (Test 0 null-FPR + min resolvable δ, `frac_sig`, `λ_GC`,
   KS p, separation z-scores, recovery / direction rates, reproducibility Spearman / Jaccard),
 - the empirical ceilings (tests 4–5) and what they imply for downstream model scores,
-- what was SKIPped and why (e.g. composition: no cell-state column),
+- what was SKIPped and why (e.g. tests 4–6: no `sgrna_col`, or a perturbation with too few cells),
 - the absolute path of `$RUN_DIR` and its `report.pdf`.
 
 ## Conventions & guardrails

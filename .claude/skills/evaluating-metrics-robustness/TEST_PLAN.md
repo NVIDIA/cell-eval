@@ -1,10 +1,10 @@
 # Cell Metrics Robustness & Stability Test Plan
 
-> **Purpose.** Validate that a cell-metrics evaluation pipeline produces calibrated, unbiased results before interpreting biological findings. Tests **0–3** are **validity gates** — all must pass before proceeding. Tests **4–6** plus the **composition** diagnostic are **sensitivity diagnostics** — they characterise how much signal the data contains and set empirical ceilings for downstream metrics.
+> **Purpose.** Validate that a cell-metrics evaluation pipeline produces calibrated, unbiased results before interpreting biological findings. Tests **0–3** are **validity gates** — all must pass before proceeding. Tests **4–6** are **sensitivity diagnostics** — they characterise how much signal the data contains and set empirical ceilings for downstream metrics.
 
 ---
 
-## ⚠️ Read first: unit of analysis & DE method (the single most important framing)
+## Read first: unit of analysis & DE method (the single most important framing)
 
 **The null-split tests (0, 1, 2, 4) split *cells* and run DE directly. Whether the null looks null depends entirely on the DE method's *unit of analysis*.**
 
@@ -16,10 +16,6 @@
 ### Corrected vs uncorrected data
 
 It is common to regress out **batch** and **cell-cycle** (and sometimes other covariates) before DE. An ideal perturbation metric would be insensitive to this; real metrics are not. **Evaluate the metric on both corrected and uncorrected data** for the major covariates and report which state each run used. State explicitly what (if anything) was regressed out of `.X`.
-
-### Composition confounder
-
-A perturbation that changes **proliferation or differentiation** shifts cell-type/state proportions. Cross-population DE then reads that composition change as expression change. When a cell-type / cluster / cell-cycle annotation exists, run the **Composition diagnostic** (below); when it does not, say so and flag that strong hits may be composition-driven.
 
 ### Scope & validation
 
@@ -293,7 +289,7 @@ Report the result, the thresholds, and the per-perturbation tier counts (how man
 
 ## Test 2 — Control-Control Split Null
 
-> **In one sentence.** Same as Test 1 but splitting only control cells, so any detected signal is pure noise/batch — this confirms the null and that downstream cell-metrics collapse to chance; uncorrected batch structure leaks in here.
+> **In one sentence.** Same as Test 1 but splitting only control cells, so any detected signal is pure noise/batch — this confirms the null; uncorrected batch structure leaks in here.
 
 ### Question
 
@@ -304,12 +300,11 @@ Do metrics remain near null when pseudo-perturbations are created by splitting c
 1. Take all cells where `perturbation_col == control_label`.
 2. Perform `n_resamples` independent **stratified** splits into groups A and B (random A/B balanced within `batch_cols`). No 1:1 control-to-control matching mode: both arms are the *same* population (controls), so a stratified split already balances batch/depth and matching controls-to-controls is uninformative. (The batch-controlled 1:1-matched design belongs to **Test 1**, where two *different* populations — perturbed vs control — are compared.)
 3. In each split, treat group A as a pseudo-perturbation and group B as the reference.
-4. Run the full cell-metrics workflow for each split.
-5. Aggregate metrics: mean ± SD across splits.
+4. Aggregate the DE null-metrics: mean ± SD across splits.
 
 ### Test Statistic
 
-Same Wald test as Test 1. Additionally compute all downstream cell-metrics outputs (overlap, AUC, delta correlations) to verify they also collapse to null.
+Same Wald test as Test 1; the DE null-metrics (`frac_sig`, `mean_lfc`, `mean_abs_lfc`, `ks_p_uniform`, `λ_GC`) should all collapse to null.
 
 ### Expected Behaviour
 
@@ -321,13 +316,10 @@ Same Wald test as Test 1. Additionally compute all downstream cell-metrics outpu
 | `λ_GC` | ≈ 1.00 |
 | Split-to-split SD of `λ_GC` | Low (< 0.05) |
 | QQ-plot | Points hug y = x diagonal within envelope; consistent across splits |
-| DEG overlap / precision / AUC | Near chance level |
-| Delta correlations | Near zero |
-| AnnData-level deltas | Near zero |
 
 ### Verdict Rules
 
-Same thresholds as Test 1, applied to the mean over splits. Additionally: if cell-metrics scores (overlap, AUC) are substantially above chance across splits, verdict is **FAIL**.
+Same thresholds as Test 1, applied to the mean over splits.
 
 ---
 
@@ -344,7 +336,7 @@ Do metrics collapse when perturbation labels are broken?
 1. Compute all metrics under true perturbation labels → `true_metrics`.
 2. For each of `n_resamples` iterations:
    a. Shuffle `perturbation_col` values within each stratum defined by `batch_cols`.
-   b. Recompute DE and all cell-metrics → `perm_metrics[i]`.
+   b. Recompute DE → `perm_metrics[i]`.
 3. Compute separation score between true and permuted distributions.
 
 ### Cell-count-stratified p-value diagnostic
@@ -390,45 +382,31 @@ perm_p = |{i : perm_metrics[i] ≥ true_metric}| / n_resamples
 
 ---
 
-## Test 4 — Same-sgRNA Split Reproducibility
+## Test 4 — Same-sgRNA Split Reproducibility (guide-level Test 1)
 
-> **In one sentence.** Split each guide's cells in two and compare each half vs control; agreement between the halves is the **reproducibility ceiling** — no model can score higher on a perturbation than the data agrees with itself.
+> **In one sentence.** **Test 1's within-condition reproducibility design run at the sgRNA (guide) level** — split each guide's cells in two (controls also split) and compare each half vs control; agreement between the halves is the **reproducibility ceiling** at the resolution per-guide downstream metrics operate, and no model can score higher than the data agrees with itself.
 
 ### Question
 
-If the same sgRNA's cells are split into two groups and each is compared to control, are the resulting DE signatures reproducible?
+If a single sgRNA's cells are split into two halves and each is run vs control, are the resulting DE signatures reproducible?
 
 ### Design
 
-For each sgRNA with ≥ `2 × min_cells_per_group` perturbed cells:
-
-1. Split perturbed cells into arms A and B (stratified by `batch_cols`).
-2. Run DE: A vs control → `de_A`.
-3. Run DE: B vs control → `de_B`.
-4. Compare `de_A` and `de_B` using reproducibility metrics below.
+Identical to Test 1, but the **unit is one guide** rather than a perturbation/gene. For each sgRNA with ≥ `2 × min_cells_per_group` cells, split its cells into halves A/B (stratified by `block_cols`), split the controls into halves, run `DE_A = A vs ctrl_half_A` and `DE_B = B vs ctrl_half_B` (**no 1:1 cell matching**) plus the difference-is-null `DE_AB = A vs B`, repeated for `test1_n_resamples` draws (each guide's reported value is the median over draws).
 
 ### Reproducibility Metrics
 
-| Metric | Formula | Interpretation |
-|---|---|---|
-| LFC correlation | `ρ = Spearman(LFC_A, LFC_B)` over all G genes | Overall signature agreement |
-| DEG overlap | `Jaccard(S_A, S_B) = \|S_A ∩ S_B\| / \|S_A ∪ S_B\|` | Significant gene set overlap |
-| Directional agreement | `(1/G) Σ_g 𝟙[sign(LFC_A(g)) = sign(LFC_B(g))]` | Fraction of genes agreeing in direction |
-| AUC recovery | AUROC of S_A ranks predicting S_B membership | Rank-based reproducibility |
+Same as Test 1: Spearman LFC ρ over **all genes** (primary) and over **DE genes**, DEG-set Jaccard, and directional agreement (see Test 1 §Test Statistic). Also reported, exactly as in Test 1: ρ-vs-cell-count **per guide** (separates a low-reproducibility method from undersampled guides) and the secondary `A`-vs-`B` difference-is-null QQ. Emits the **same two plots** as Test 1 (`plots/test_4_reproducibility.png`, `plots/test_4_undersampling.png`).
 
-### Expected Behaviour
+### Expected Behaviour & Verdict Rules
 
-| Perturbation strength | LFC correlation | DEG Jaccard | Directional agreement |
-|---|---|---|---|
-| Strong | > 0.6 | > 0.3 | > 0.7 |
-| Moderate | 0.3–0.6 | 0.1–0.3 | 0.6–0.7 |
-| Weak | < 0.3 | < 0.1 | ≈ 0.5 (chance) |
+| Strength | LFC ρ | DEG Jaccard | Directional agreement | Verdict (on median split-half LFC ρ) |
+|---|---|---|---|---|
+| Strong | > 0.6 | > 0.3 | > 0.7 | **PASS** |
+| Moderate | 0.3–0.6 | 0.1–0.3 | 0.6–0.7 | **WARN** |
+| Weak | < 0.3 | < 0.1 | ≈ 0.5 (chance) | **FAIL** |
 
-> **Note:** This test sets the **empirical ceiling** for all downstream evaluation metrics. A perturbation with low reproducibility here cannot be expected to score well on cross-model or cross-condition comparisons.
-
-### Verdict Rules
-
-Reproducibility is not a pass/fail gate but an empirical characterisation. Flag perturbations with LFC correlation < 0.2 as **LOW REPRODUCIBILITY** and exclude them from sensitivity benchmarks.
+> **Note:** Same tiers as Test 1 (harmonised). This test sets the **empirical ceiling** for any per-guide downstream metric — a guide with low reproducibility here cannot be expected to score well on cross-model or cross-condition comparisons.
 
 ---
 
@@ -543,30 +521,6 @@ median_lfc_rank     = median over sgRNAs of lfc_rank
 
 ---
 
-## Composition Diagnostic
-
-> **In one sentence.** Do perturbations shift cell-type / cluster / cell-cycle proportions versus control? Such shifts make cross-population DE read composition change as expression change; this requires a cell-state annotation in `obs`.
-
-### Design
-
-If a categorical cell-state column exists (`cell_type` / `cluster` / `leiden` / cell-cycle `phase`, configurable via `celltype_cols`):
-
-1. Compute the control's cell-state proportion vector.
-2. For each perturbation, compute its proportion vector and the **total-variation distance (TVD)** from control: `TVD = ½ Σ_k |p_pert(k) − p_ctrl(k)|`.
-3. Flag perturbations with `TVD > 0.10` — their DE may partly reflect composition.
-
-If no such column exists, **SKIP with an explicit message**: composition cannot be assessed, only the available structural columns are present, and strong hits should be interpreted with this confounder in mind. Recommend annotating cell type / cell-cycle and re-running.
-
-### Verdict Rules
-
-| Condition | Verdict |
-|---|---|
-| No perturbation shifts proportions (`TVD ≤ 0.10` for all) | **PASS** |
-| One or more perturbations with `TVD > 0.10` | **WARN** — list them; their DE is partly compositional |
-| No cell-state column available | **SKIP** (with guidance) |
-
----
-
 ## Output Schema
 
 ```python
@@ -587,7 +541,6 @@ class RobustnessReport:
     test4: TestResult   # Same-sgRNA reproducibility
     test5: TestResult   # Cross-sgRNA reproducibility
     test6: TestResult   # Target knockdown recovery
-    composition: TestResult  # Composition diagnostic
 
     global_verdict: Literal["PASS", "WARN", "FAIL"]
     blocking_flags: list[str]   # reasons for FAIL at global level
@@ -607,7 +560,6 @@ Validity gates are Tests **0, 1, 2, 3**.
 | Any of Tests 0–3 WARN (e.g. deflated/under-powered cell-level null, compositional coupling) | **WARN** — results usable but read the caveats; with a cell-level test, treat output as ranking, not calibrated FDR |
 | Gates PASS/WARN but Test 6 WARN | **WARN** — results valid but guide efficacy may limit sensitivity |
 | Tests 4–5 show no separation from background | **WARN** — empirical ceiling is low; downstream metrics may not be informative |
-| Composition diagnostic WARN | informational — flag affected perturbations |
 
 ---
 
