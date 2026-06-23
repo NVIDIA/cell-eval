@@ -5,7 +5,7 @@
 
 import importlib
 from logging import getLogger
-from typing import Callable, Literal, Sequence, cast
+from typing import Any, Callable, Literal, Sequence, cast
 
 import anndata as ad
 import numpy as np
@@ -301,7 +301,11 @@ class ClusteringAgreement:
         embed_key: str | None = None,
     ) -> ad.AnnData:
         # Isolate the features
-        feats = adata.obsm.get(embed_key, adata.X)  # type: ignore
+        if embed_key is None:
+            raw_feats = adata.X
+        else:
+            raw_feats = adata.obsm.get(embed_key, adata.X)
+        feats = cast(Any, raw_feats)
 
         # Convert to float if not already
         if feats.dtype != np.dtype("float64"):
