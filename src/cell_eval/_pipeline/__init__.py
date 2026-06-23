@@ -1,3 +1,6 @@
-from ._runner import KNOWN_PROFILES, MetricPipeline
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
 
-__all__ = ["MetricPipeline", "KNOWN_PROFILES"]
+from ._runner import KNOWN_PROFILES, MetricPipeline, Profile
+
+__all__ = ["MetricPipeline", "KNOWN_PROFILES", "Profile"]

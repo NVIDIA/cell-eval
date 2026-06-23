@@ -1,7 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
 """Array metrics module."""
 
+import importlib
 from logging import getLogger
-from typing import Callable, Literal, Sequence, cast
+from typing import Any, Callable, Literal, Sequence, cast
 
 import anndata as ad
 import numpy as np
@@ -19,6 +23,18 @@ from sklearn.metrics import (
 from .._types import PerturbationAnndataPair
 
 logger = getLogger(__name__)
+
+
+def _require_igraph() -> None:
+    try:
+        importlib.import_module("igraph")
+    except ModuleNotFoundError as error:
+        if error.name == "igraph":
+            raise ImportError(
+                "clustering_agreement requires the optional igraph dependency. "
+                "Install with `cell-eval[igraph]` and use `--profile full_igraph`."
+            ) from error
+        raise
 
 
 def pearson_delta(
@@ -264,6 +280,7 @@ class ClusteringAgreement:
     ) -> None:
         if key_added in adata.obs:
             return
+        _require_igraph()
         if "neighbors" not in adata.uns:
             sc.pp.neighbors(
                 adata, n_neighbors=min(n_neighbors, adata.n_obs - 1), use_rep="X"
@@ -284,7 +301,11 @@ class ClusteringAgreement:
         embed_key: str | None = None,
     ) -> ad.AnnData:
         # Isolate the features
-        feats = adata.obsm.get(embed_key, adata.X)  # type: ignore
+        if embed_key is None:
+            raw_feats = adata.X
+        else:
+            raw_feats = adata.obsm.get(embed_key, adata.X)
+        feats = cast(Any, raw_feats)
 
         # Convert to float if not already
         if feats.dtype != np.dtype("float64"):

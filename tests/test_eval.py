@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
+import importlib.util
 import os
 import shutil
 from typing import Literal, cast
@@ -6,7 +10,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from cell_eval import MetricsEvaluator
+from cell_eval import KNOWN_PROFILES, MetricsEvaluator, MetricPipeline
 from cell_eval.data import (
     CONTROL_VAR,
     PERT_COL,
@@ -15,13 +19,7 @@ from cell_eval.data import (
 )
 
 OUTDIR = "TEST_OUTPUT_DIRECTORY"
-KNOWN_PROFILES: list[Literal["full", "vcc", "minimal", "de", "anndata"]] = [
-    "full",
-    "vcc",
-    "minimal",
-    "de",
-    "anndata",
-]
+IGRAPH_PROFILE: Literal["full_igraph"] = "full_igraph"
 
 
 def test_broken_adata_mismatched_var_size():
@@ -224,6 +222,8 @@ def test_eval_simple_profiles():
         pert_col="perturbation",
     )
     for profile in KNOWN_PROFILES:
+        if profile == IGRAPH_PROFILE:
+            continue
         evaluator.compute(
             profile=profile,
             break_on_error=True,
@@ -234,6 +234,63 @@ def test_eval_simple_profiles():
             profile="unknown",  # type: ignore
             break_on_error=True,
         )
+
+
+def test_igraph_metric_profile_membership():
+    assert IGRAPH_PROFILE in KNOWN_PROFILES
+    assert "clustering_agreement" not in MetricPipeline(profile="full")._metrics
+    assert "clustering_agreement" not in MetricPipeline(profile="anndata")._metrics
+    assert "clustering_agreement" in MetricPipeline(profile=IGRAPH_PROFILE)._metrics
+
+
+def test_full_igraph_profile_requires_igraph():
+    if importlib.util.find_spec("igraph") is not None:
+        pytest.skip("igraph is installed")
+
+    adata_real = build_random_anndata()
+    adata_pred = downsample_cells(adata_real, fraction=0.5)
+    evaluator = MetricsEvaluator(
+        adata_pred=adata_pred,
+        adata_real=adata_real,
+        control_pert="control",
+        pert_col="perturbation",
+        outdir=OUTDIR,
+        skip_de=True,
+    )
+    try:
+        with pytest.raises(ImportError, match=r"cell-eval\[igraph\]"):
+            evaluator.compute(
+                profile=IGRAPH_PROFILE,
+                break_on_error=True,
+                write_csv=False,
+            )
+    finally:
+        if os.path.exists(OUTDIR):
+            shutil.rmtree(OUTDIR)
+
+
+def test_eval_full_igraph_profile():
+    pytest.importorskip("igraph")
+
+    adata_real = build_random_anndata()
+    adata_pred = downsample_cells(adata_real, fraction=0.5)
+    evaluator = MetricsEvaluator(
+        adata_pred=adata_pred,
+        adata_real=adata_real,
+        control_pert="control",
+        pert_col="perturbation",
+        outdir=OUTDIR,
+        skip_de=True,
+    )
+    try:
+        evaluator.compute(
+            profile=IGRAPH_PROFILE,
+            break_on_error=True,
+            write_csv=False,
+        )
+    finally:
+        if os.path.exists(OUTDIR):
+            shutil.rmtree(OUTDIR)
 
 
 def test_eval_missing_celltype_col():

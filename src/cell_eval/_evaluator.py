@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
 import logging
 import multiprocessing as mp
 import os
@@ -11,7 +14,7 @@ from pdex import pdex
 
 from cell_eval.utils import guess_is_lognorm
 
-from ._pipeline import MetricPipeline
+from ._pipeline import MetricPipeline, Profile
 from ._types import PerturbationAnndataPair, initialize_de_comparison
 from .utils import _cast_float16_to_float32
 
@@ -119,7 +122,7 @@ class MetricsEvaluator:
 
     def compute(
         self,
-        profile: Literal["full", "vcc", "minimal", "de", "anndata"] = "full",
+        profile: Profile = "full",
         metric_configs: dict[str, dict[str, Any]] | None = None,
         skip_metrics: list[str] | None = None,
         basename: str = "results.csv",
