@@ -1,8 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
 [project]
 name = "cell-eval"
 version = "0.7.2"
 description = "Evaluation metrics for single-cell perturbation predictions"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "THIRD-PARTY-NOTICES.md"]
 authors = [
     { name = "Noam Teyssier", email = "noam.teyssier@arcinstitute.org" },
     { name = "Abhinav Adduri", email = "abhinav.adduri@arcinstitute.org" },
@@ -38,3 +43,22 @@ dev = [
 
 [project.scripts]
 cell-eval = "cell_eval.__main__:main"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/.github",
+    "/.pre-commit-config.yaml",
+    "/.python-version",
+    "/CONTRIBUTING.md",
+    "/LICENSE",
+    "/README.md",
+    "/THIRD-PARTY-NOTICES.md",
+    "/config",
+    "/pyproject.toml",
+    "/src",
+    "/tests",
+    "/tutorials",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cell_eval"]

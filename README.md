@@ -16,10 +16,10 @@ uv pip install -U cell-eval
 uv pip install -U "cell-eval[igraph]"
 
 # install from github directly
-uv pip install -U git+https://github.com/arcinstitute/cell-eval
+uv pip install -U git+https://github.com/NVIDIA/cell-eval
 
 # install cli with uv tool
-uv tool install -U git+https://github.com/arcinstitute/cell-eval
+uv tool install -U git+https://github.com/NVIDIA/cell-eval
 
 # Check installation
 cell-eval --help

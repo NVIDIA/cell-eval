@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
 from ._baseline import build_base_mean_adata
 from ._evaluator import MetricsEvaluator
 from ._pipeline import KNOWN_PROFILES, MetricPipeline, Profile
