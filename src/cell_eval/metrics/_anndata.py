@@ -1,5 +1,6 @@
 """Array metrics module."""
 
+import importlib
 from logging import getLogger
 from typing import Callable, Literal, Sequence, cast
 
@@ -19,6 +20,18 @@ from sklearn.metrics import (
 from .._types import PerturbationAnndataPair
 
 logger = getLogger(__name__)
+
+
+def _require_igraph() -> None:
+    try:
+        importlib.import_module("igraph")
+    except ModuleNotFoundError as error:
+        if error.name == "igraph":
+            raise ImportError(
+                "clustering_agreement requires the optional igraph dependency. "
+                "Install with `cell-eval[igraph]` and use `--profile full_igraph`."
+            ) from error
+        raise
 
 
 def pearson_delta(
@@ -264,6 +277,7 @@ class ClusteringAgreement:
     ) -> None:
         if key_added in adata.obs:
             return
+        _require_igraph()
         if "neighbors" not in adata.uns:
             sc.pp.neighbors(
                 adata, n_neighbors=min(n_neighbors, adata.n_obs - 1), use_rep="X"

@@ -12,6 +12,9 @@ Distribution with [`uv`](https://docs.astral.sh/uv/)
 # install from pypi
 uv pip install -U cell-eval
 
+# install with clustering_agreement support
+uv pip install -U "cell-eval[igraph]"
+
 # install from github directly
 uv pip install -U git+https://github.com/arcinstitute/cell-eval
 
@@ -60,6 +63,10 @@ cell-eval run \
     --num-threads 64 \
     --profile full
 ```
+
+The default `full` profile excludes `clustering_agreement` because that metric
+uses the optional `igraph` dependency. To opt in, install `cell-eval[igraph]`
+and run with `--profile full_igraph`.
 
 To run this as a python module you will need to use the `MetricsEvaluator` class.
 

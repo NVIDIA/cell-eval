@@ -8,6 +8,8 @@ from ..metrics import MetricResult, metrics_registry
 
 logger = logging.getLogger(__name__)
 
+Profile = Literal["full", "minimal", "vcc", "de", "anndata", "pds", "full_igraph"]
+
 MINIMAL_METRICS = [
     "pearson_delta",
     "mse",
@@ -24,14 +26,27 @@ VCC_METRICS = [
     "overlap_at_N",
 ]
 
-KNOWN_PROFILES = [
+IGRAPH_METRICS = [
+    "clustering_agreement",
+]
+
+KNOWN_PROFILES: list[Profile] = [
     "full",
     "minimal",
     "vcc",
     "de",
     "anndata",
     "pds",
+    "full_igraph",
 ]
+
+
+def _default_anndata_metrics() -> list[str]:
+    return [
+        metric
+        for metric in metrics_registry.list_metrics(MetricType.ANNDATA_PAIR)
+        if metric not in IGRAPH_METRICS
+    ]
 
 
 class MetricPipeline:
@@ -39,15 +54,14 @@ class MetricPipeline:
 
     def __init__(
         self,
-        profile: Literal["full", "minimal", "vcc", "de", "anndata", "pds"]
-        | None = "full",
+        profile: Profile | None = "full",
         metric_configs: dict[str, dict[str, Any]] | None = None,
         break_on_error: bool = False,
     ) -> None:
         """Initialize pipeline.
 
         Args:
-            profile: Which set of metrics to compute ('full', 'de', 'anndata', or None)
+            profile: Which set of metrics to compute
             metric_configs: Dictionary mapping metric names to their configuration kwargs
             break_on_error: Whether to stop the pipeline on error
         """
@@ -60,21 +74,21 @@ class MetricPipeline:
         match profile:
             case "full":
                 self._metrics.extend(metrics_registry.list_metrics(MetricType.DE))
-                self._metrics.extend(
-                    metrics_registry.list_metrics(MetricType.ANNDATA_PAIR)
-                )
+                self._metrics.extend(_default_anndata_metrics())
             case "de":
                 self._metrics.extend(metrics_registry.list_metrics(MetricType.DE))
             case "anndata":
-                self._metrics.extend(
-                    metrics_registry.list_metrics(MetricType.ANNDATA_PAIR)
-                )
+                self._metrics.extend(_default_anndata_metrics())
             case "minimal":
                 self._metrics.extend(MINIMAL_METRICS)
             case "vcc":
                 self._metrics.extend(VCC_METRICS)
             case "pds":
                 self._metrics.extend(["discrimination_score_l1"])
+            case "full_igraph":
+                self._metrics.extend(metrics_registry.list_metrics(MetricType.DE))
+                self._metrics.extend(_default_anndata_metrics())
+                self._metrics.extend(IGRAPH_METRICS)
             case None:
                 pass
             case _:
