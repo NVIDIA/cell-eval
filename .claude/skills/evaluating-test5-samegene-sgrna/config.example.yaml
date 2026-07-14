@@ -1,0 +1,16 @@
+# samegene_guide_heatmap.py — run both pdex and pydeseq2 in one pass
+# python samegene_guide_heatmap.py --adata <h5ad> --methods pdex,pydeseq2 #   --pert-col gene --control non-targeting --sgrna-col sgID_AB --target-gene-col gene #   --replicate-col gem_group --block-cols gem_group --min-guides 2 --outdir .
+adata: /data2/shared/perturb_seq/jurkat/Nadig_Jurkat_Essential_2025/GSE264667_jurkat_raw_singlecell_01.h5ad
+methods: pdex,pydeseq2
+pert_col: gene
+control: non-targeting
+sgrna_col: sgID_AB
+target_gene_col: gene
+replicate_col: gem_group
+block_cols: gem_group
+fdr: 0.05
+lfc: 0.1
+min_cells: 20
+min_guides: 2
+max_control: 1200
+seed: 0

@@ -1,0 +1,18 @@
+# Example args for test 1 (within-condition reproducibility). Both backends run in one pass.
+# Usage: python reproducibility_heatmap.py --adata <h5ad> --methods pdex,pydeseq2 \
+#   --pert-col gene --control non-targeting --replicate-col batch --block-cols batch \
+#   --zoom-per-page 1 --max-genes 400 --outdir <outdir>
+
+adata: /data2/shared/perturb_seq/k562/Replogle_K562_Essential_2022/cell_eval2.h5ad
+methods: pdex,pydeseq2
+pert_col: gene
+control: non-targeting
+replicate_col: batch
+block_cols: batch
+counts_layer: counts      # raw counts layer (auto-detected if omitted)
+fdr: 0.05
+lfc: 0.1
+min_cells: 20
+max_genes: 400
+zoom_per_page: 1
+seed: 0

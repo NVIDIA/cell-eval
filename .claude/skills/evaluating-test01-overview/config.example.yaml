@@ -1,0 +1,24 @@
+# Config for evaluating-test01-overview / overview.py
+# Edit adata_path and column names to match your dataset, then run:
+#
+#   uv run python overview.py --config config.yaml
+#   uv run python overview.py --config config.yaml --n-seeds 20 --subsample-frac 0.5
+#   uv run python overview.py --config config.yaml --plot-only   # re-render from cached tables
+#
+# Outputs (in outdir/):
+#   plots/test01_overview.png   — 3-panel figure
+#   tables/overview_pydeseq2_full.csv
+#   tables/overview_pdex_full.csv
+#   tables/overview_seed_counts.csv
+
+adata_path: /workspace/cell-eval/adata_Validation.h5ad
+pert_col: target_gene
+control_pert: non-targeting
+replicate_col: batch          # REQUIRED for pydeseq2 pseudobulk (batch = pseudobulk unit)
+fdr_threshold: 0.05           # gene is significant if FDR < this
+lfc_threshold: 0.1            # gene is significant if |LFC| >= this (log2)
+min_cells_per_group: 20       # skip groups with fewer cells during subsampling
+counts_layer: null            # layer with raw integer counts; null = use .X
+num_threads: 8
+seed: 0
+outdir: .

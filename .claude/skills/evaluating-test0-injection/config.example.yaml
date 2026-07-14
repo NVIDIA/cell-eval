@@ -1,0 +1,12 @@
+# inject_and_count_de.py — run both pdex and pydeseq2 in one pass
+# python inject_and_count_de.py --adata <h5ad> --pert-col gene --control non-targeting #   --replicate-col batch --counts-layer counts --n-repeats 100 --out injection_recovery.csv
+adata: /data2/shared/perturb_seq/k562/Replogle_K562_Essential_2022/cell_eval2.h5ad
+pert_col: gene
+control: non-targeting
+replicate_col: batch
+counts_layer: counts
+fdr: 0.05
+lfc: 0.1
+n_genes: 12
+n_repeats: 100
+deltas: "0,0.5,1,2"

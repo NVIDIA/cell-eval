@@ -1,0 +1,11 @@
+# shuffle_de_comparison.py reads this file via --config
+# python shuffle_de_comparison.py --config config.yaml --outdir .
+adata_path: /data2/shared/perturb_seq/k562/Replogle_K562_Essential_2022/cell_eval2.h5ad
+pert_col: gene
+control_pert: non-targeting
+replicate_col: batch
+block_cols: [batch]
+fdr_threshold: 0.05
+lfc_threshold: 0.1
+num_threads: 8
+seed: 0

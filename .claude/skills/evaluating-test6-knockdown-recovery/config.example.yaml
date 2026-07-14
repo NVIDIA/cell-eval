@@ -1,0 +1,8 @@
+# knockdown_recovery.py — run both pdex and pydeseq2 in one pass
+# python knockdown_recovery.py --adata <h5ad> --methods pdex,pydeseq2 #   --pert-col gene --control non-targeting --replicate-col batch --fdr 0.05 --outdir .
+adata: /data2/shared/perturb_seq/k562/Replogle_K562_Essential_2022/cell_eval2.h5ad
+methods: pdex,pydeseq2
+pert_col: gene
+control: non-targeting
+replicate_col: batch
+fdr: 0.05
