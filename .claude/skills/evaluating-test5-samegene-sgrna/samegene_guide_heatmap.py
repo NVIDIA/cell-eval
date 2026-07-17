@@ -314,7 +314,14 @@ def layer3_corr_matrix(sigs_by_method, gene_groups, out_png, cfg, genes, *, meth
                 (within if gene_of_lbl[labels[i]] == gene_of_lbl[labels[j]] else cross).append(C[i, j])
         wm = float(np.nanmean(within)) if within else float("nan")
         cm = float(np.nanmean(cross)) if cross else float("nan")
-        ax.set_title(f"{m}  within-gene ρ̄={wm:.2f} vs cross-gene ρ̄={cm:.2f}", fontsize=10)
+        diagonal_mask = np.eye(n, dtype=bool)
+        dm = float(np.nanmean(C[diagonal_mask]))
+        om = float(np.nanmean(C[~diagonal_mask]))
+        ax.set_title(
+            f"{m}: diagonal ρ̄={dm:.2f}; off-diagonal ρ̄={om:.2f}\n"
+            f"within-gene off-diagonal ρ̄={wm:.2f}; cross-gene off-diagonal ρ̄={cm:.2f}",
+            fontsize=9,
+        )
     fig.colorbar(im, ax=axes[0].tolist(), fraction=0.025, pad=0.02,
                  label="Spearman(guide i, guide j) over union DE genes")
     fig.suptitle("Test-5 guide × guide signature correlation — bright WITHIN-gene blocks = same-gene "

@@ -1,7 +1,6 @@
 ---
 name: evaluating-test3-permutation-null
 description: Run ONLY Test 3 (label permutation null) from the cell-eval metric-robustness battery and emit a single-test report. Shuffles perturbation labels within block strata, recomputes DE, and scores the separation (z) of the real signal from the permuted null, plus a cell-count-stratified real-vs-shuffled p-value diagnostic (ECDF/QQ). Use when someone wants a permutation/label-shuffle null or signal-vs-noise separation check without running the whole battery.
-type: skill
 ---
 
 # Test 3 — Label Permutation Null
@@ -47,3 +46,5 @@ python .claude/skills/evaluating-test3-permutation-null/shuffle_de_comparison.py
 ## Outputs (in `--outdir/plots/`)
 - `test_3_shuffle_de_comparison__global.png` — scatter: n_sig_pydeseq2 vs n_sig_pdex, global shuffle
 - `test_3_shuffle_de_comparison__within.png` — same, within-batch shuffle
+- `test_3_corr_matrix__<mode>__<method>.png` — fake-perturbation Spearman correlation map; every
+  title reports finite mean diagonal and off-diagonal rho separately.

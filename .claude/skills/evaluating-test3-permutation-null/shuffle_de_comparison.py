@@ -388,7 +388,9 @@ def _plot_corr_matrix(results: dict[str, dict], method_key: str,
             mat[i, j] = mat[j, i] = float(r)
     np.fill_diagonal(mat, 1.0)
 
-    mean_off = float(np.nanmean(mat[~np.eye(n, dtype=bool)]))
+    diagonal_mask = np.eye(n, dtype=bool)
+    mean_diagonal = float(np.nanmean(mat[diagonal_mask]))
+    mean_off = float(np.nanmean(mat[~diagonal_mask]))
 
     fig, ax = plt.subplots(figsize=(max(7, n * 0.22 + 1.5), max(6, n * 0.22 + 1.5)))
     im = ax.imshow(mat, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
@@ -401,7 +403,8 @@ def _plot_corr_matrix(results: dict[str, dict], method_key: str,
     cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cb.set_label("Spearman r (LFC vectors)", fontsize=8)
     method_label = "pdex (cell-level Wilcoxon)" if method_key == "lfc_pdex" else "pydeseq2 (pseudobulk DESeq2)"
-    ax.set_title(f"{title}\n{method_label}  (mean off-diagonal ρ = {mean_off:.3f})\n"
+    ax.set_title(f"{title}\n{method_label}  (mean diagonal ρ = {mean_diagonal:.3f}; "
+                 f"off-diagonal ρ = {mean_off:.3f})\n"
                  f"calibrated null — clean diagonal, zero elsewhere",
                  fontsize=8.5)
     fig.tight_layout()

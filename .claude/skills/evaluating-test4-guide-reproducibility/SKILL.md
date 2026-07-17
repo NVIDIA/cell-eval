@@ -1,7 +1,6 @@
 ---
 name: evaluating-test4-guide-reproducibility
-description: Run ONLY Test 4 (same-sgRNA split reproducibility) from the cell-eval metric-robustness battery and emit a single-test report. This is Test 1 run at the sgRNA (guide) level: split each guide's cells into halves A/B vs split control and measure split-half agreement (Spearman LFC rho, DEG Jaccard, direction) + rho-vs-cell-count + difference-is-null QQ. Use when someone wants the per-guide reproducibility ceiling without running the whole battery. Needs an sgRNA column.
-type: skill
+description: Run ONLY Test 4 (same-sgRNA split reproducibility) from the cell-eval metric-robustness battery and emit a single-test report. This is Test 1 run at the sgRNA guide level, splitting each guide's cells into halves A and B versus split control and measuring split-half agreement with Spearman, Pearson, DEG Jaccard, and direction. Use when someone wants the per-guide reproducibility ceiling and cross-guide specificity without running the whole battery. Needs an sgRNA column.
 ---
 
 # Test 4 — Same-sgRNA Split Reproducibility (guide-level Test 1)
@@ -70,7 +69,8 @@ python .claude/skills/evaluating-test4-guide-reproducibility/guide_split_reprodu
 - **Layer 3 — `test4_corr_matrix__<dataset>.png`** (one panel per backend): split-A × split-B **guide**
   correlation matrix — **diagonal = within-guide A/B reproducibility** (bright = reproducible),
   off-diagonal = cross-guide. **Each diagonal cell is labelled with that guide's cell count** (n cells
-  before the A/B split), so you can read reproducibility against power at a glance.
+  before the A/B split), so you can read reproducibility against power at a glance. Every panel title
+  reports finite diagonal and off-diagonal means for both Spearman and Pearson.
 - `test4_rho_<method>__<dataset>.csv` — per-guide split-half ρ.
 
 **This differs from `evaluating-test5-samegene-sgrna`'s `samegene_guide_heatmap.py`:** Test 4 splits ONE

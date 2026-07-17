@@ -1,7 +1,6 @@
 ---
 name: evaluating-test5-samegene-sgrna
-description: Run ONLY Test 5 (same-gene independent-sgRNA reproducibility) from the cell-eval metric-robustness battery and emit a single-test report. Asks whether independent guides targeting the SAME gene produce more concordant signatures than unrelated guide pairs, using the Mann-Whitney effect size AUC = P(same>unrelated) on DEG-restricted LFC rho, gated by significance. Use when someone wants to check whether a DE metric rewards shared biology / same-gene concordance without running the whole battery. Needs an sgRNA column and genes with >=2 guides.
-type: skill
+description: Run ONLY Test 5 (same-gene independent-sgRNA reproducibility) from the cell-eval metric-robustness battery and emit a single-test report. Asks whether independent guides targeting the SAME gene produce more concordant signatures than unrelated guide pairs, using the Mann-Whitney probability-of-superiority AUC on DEG-restricted LFC rho, gated by significance. Use when someone wants to check whether a DE metric rewards shared biology or same-gene concordance without running the whole battery. Needs an sgRNA column and genes with at least two guides.
 ---
 
 # Test 5 — Same-Gene Independent sgRNA Reproducibility
@@ -85,8 +84,9 @@ python .claude/skills/evaluating-test5-samegene-sgrna/samegene_guide_heatmap.py 
 - **Layer 3 — `test5_corr_matrix__<dataset>.png`** (one panel per backend): **guide × guide** Spearman-LFC
   correlation over the union DE genes, guides ordered by gene with gene-block separators. **Bright
   within-gene blocks = same-gene guides agree (on-target, reproducible); bright cross-gene off-diagonal =
-  a shared program / low specificity.** Each panel's title reports **within-gene ρ̄ vs cross-gene ρ̄** —
-  the gap between them is the same-gene concordance signal that the `test_5` AUC verdict quantifies.
+  a shared program / low specificity.** Each panel's title reports overall **diagonal and
+  off-diagonal rho**, followed by **within-gene vs cross-gene off-diagonal rho**. The latter gap is
+  the same-gene concordance signal that the `test_5` AUC verdict quantifies.
 
 Levers: `--max-genes` caps #genes-with-guides (by #guides desc) for readability/runtime, `--max-control`
 subsamples control cells for speed, `--methods pdex` alone skips the (slower) pydeseq2 backend.

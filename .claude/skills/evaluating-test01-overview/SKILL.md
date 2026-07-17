@@ -1,7 +1,6 @@
 ---
 name: evaluating-test01-overview
 description: Generate a scatter plot comparing DE gene counts per perturbation between pyDESeq2 and pdex. x = pdex n_sig, y = pyDESeq2 n_sig, one point per perturbation, sized by cell count, diagonal = equal calling. Saved to plots/test01_overview.png. Use when you want a quick method-comparison overview of how many genes each backend calls per perturbation.
-type: skill
 ---
 
 # DE Gene Count Overview: pyDESeq2 vs pdex
@@ -55,7 +54,8 @@ datasets never overwrite each other.
 | file | description |
 |------|-------------|
 | `plots/test01_overview__<dataset>.png` | scatter plot (n_sig per perturbation: pyDESeq2 vs pdex) |
-| `plots/test01_corr_matrix__<dataset>.png` | **perturbation × perturbation Spearman-LFC correlation, one panel per backend** (pdex \| pyDESeq2), over the union DE genes. Diagonal = 1 (self); **off-diagonal = cross-perturbation signature similarity** — dim ⇒ perturbation-specific, bright ⇒ a shared program (less specific). |
+| `plots/test01_corr_matrix__<dataset>.png` | **perturbation × perturbation Spearman-LFC correlation, one panel per backend** (pdex \| pyDESeq2), over the union DE genes. Diagonal = 1 (self); **off-diagonal = cross-perturbation signature similarity** — dim ⇒ perturbation-specific, bright ⇒ a shared program (less specific). Every panel title reports finite mean diagonal and off-diagonal correlation. |
+| `plots/test01_corr_matrix_pearson__<dataset>.png` | Pearson-LFC version of the perturbation correlation map, with separate mean diagonal and off-diagonal values in every panel title. |
 | `plots/test01_ma_pydeseq2__<dataset>.png` | **MA scatter for pyDESeq2**: 1×3 panel showing mean raw count (x) vs log2 LFC (y) for least / median / most-cell perturbations. DE genes (FDR < threshold, \|LFC\| ≥ threshold) highlighted in red. |
 | `plots/test01_ma_pdex__<dataset>.png` | **MA scatter for pdex**: same 1×3 layout, x = mean raw count (same scale as pyDESeq2 for direct comparison), y = log2 LFC. |
 | `tables/overview_pydeseq2_full__<dataset>.csv` | pydeseq2 DE (all genes × all perturbations) |

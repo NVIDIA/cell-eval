@@ -370,9 +370,8 @@ def _union_de_genes(de_by: dict, fdr_t: float, lfc_t: float, max_genes: int) -> 
     return sorted(genes, key=lambda g: -(vmap.get(g) or 0.0))[:max_genes]
 
 
-def _pert_corr(de: pl.DataFrame, perts: list[str], genes: list[str]) -> np.ndarray:
-    """Perturbation × perturbation Spearman correlation of LFC signatures over `genes`."""
-    from scipy.stats import rankdata
+def _build_lfc_matrix(de: pl.DataFrame, perts: list[str], genes: list[str]) -> np.ndarray:
+    """Build a (n_perts × n_genes) LFC matrix; columns with any NaN are dropped."""
     gi = {g: i for i, g in enumerate(genes)}
     M = np.full((len(perts), len(genes)), np.nan)
     for r, p in enumerate(perts):
@@ -380,20 +379,29 @@ def _pert_corr(de: pl.DataFrame, perts: list[str], genes: list[str]) -> np.ndarr
         for fe, lv in zip(sub["feature"].to_list(), sub["log2_fold_change"].to_numpy().astype(float)):
             if fe in gi:
                 M[r, gi[fe]] = lv
-    keep = ~np.isnan(M).any(axis=0)          # genes present for every perturbation
-    M = M[:, keep]
+    keep = ~np.isnan(M).any(axis=0)
+    return M[:, keep]
+
+
+def _pert_corr(de: pl.DataFrame, perts: list[str], genes: list[str]) -> np.ndarray:
+    """Perturbation × perturbation Spearman correlation of LFC signatures over `genes`."""
+    from scipy.stats import rankdata
+    M = _build_lfc_matrix(de, perts, genes)
     R = np.vstack([rankdata(row) for row in M])
     return np.corrcoef(R)
 
 
-def plot_correlation_matrices(de_by: dict, cfg: dict, out_png: str) -> str:
-    """One PNG, one panel per backend: perturbation × perturbation Spearman-LFC correlation over the
-    union DE genes. Diagonal = 1 (self); **off-diagonal = cross-perturbation signature similarity** —
-    dim off-diagonal ⇒ perturbation-specific signatures, bright ⇒ a shared program (less specific)."""
+def _pert_corr_pearson(de: pl.DataFrame, perts: list[str], genes: list[str]) -> np.ndarray:
+    """Perturbation × perturbation Pearson correlation of LFC signatures over `genes`."""
+    M = _build_lfc_matrix(de, perts, genes)
+    return np.corrcoef(M)
+
+
+def _plot_corr_matrices(de_by: dict, cfg: dict, out_png: str,
+                        corr_fn, metric_label: str) -> str:
     fdr_t, lfc_t, ctrl = cfg["fdr_threshold"], cfg["lfc_threshold"], cfg["control_pert"]
     methods = [m for m in ("pdex", "pydeseq2") if m in de_by]
     genes = _union_de_genes(de_by, fdr_t, lfc_t, cfg.get("corr_max_genes", 400))
-    # shared perturbation order (present in all backends, excl control) sorted by pydeseq2 n_sig desc
     common = set.intersection(*[set(de["target"].unique().to_list()) for de in de_by.values()])
     perts = [p for p in common if p != ctrl]
     nsig = _count_sig(de_by.get("pydeseq2", de_by[methods[0]]), fdr_t, lfc_t)
@@ -402,20 +410,36 @@ def plot_correlation_matrices(de_by: dict, cfg: dict, out_png: str) -> str:
     fig, axes = plt.subplots(1, len(methods), figsize=(6.8 * len(methods), 6.4), squeeze=False)
     im = None
     for ax, m in zip(axes[0], methods):
-        C = _pert_corr(de_by[m], perts, genes)
-        off = C[~np.eye(len(perts), dtype=bool)]
+        C = corr_fn(de_by[m], perts, genes)
+        diagonal_mask = np.eye(len(perts), dtype=bool)
+        diagonal = C[diagonal_mask]
+        off = C[~diagonal_mask]
         im = ax.imshow(C, cmap="RdBu_r", vmin=-1, vmax=1, interpolation="nearest")
         ax.set_xticks(range(len(perts))); ax.set_xticklabels(perts, rotation=90, fontsize=5)
         ax.set_yticks(range(len(perts))); ax.set_yticklabels(perts, fontsize=5)
         label = {"pdex": "pdex (cell-level Wilcoxon)", "pydeseq2": "pydeseq2 (pseudobulk DESeq2)"}[m]
-        ax.set_title(f"{label}\nmean off-diagonal ρ = {np.nanmean(off):.2f}", fontsize=10)
+        ax.set_title(
+            f"{label}\nmean diagonal r = {np.nanmean(diagonal):.2f}; "
+            f"off-diagonal r = {np.nanmean(off):.2f}",
+            fontsize=10,
+        )
     fig.colorbar(im, ax=axes[0].tolist(), fraction=0.025, pad=0.02,
-                 label=f"Spearman(LFC) over {len(genes)} union DE genes")
+                 label=f"{metric_label} over {len(genes)} union DE genes")
     fig.suptitle("Perturbation × perturbation signature correlation — diagonal = self (1); "
                  "off-diagonal = cross-perturbation similarity (dim = more specific)", fontsize=11)
     fig.savefig(out_png, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return out_png
+
+
+def plot_correlation_matrices(de_by: dict, cfg: dict, out_png: str) -> str:
+    """Perturbation × perturbation Spearman-LFC correlation."""
+    return _plot_corr_matrices(de_by, cfg, out_png, _pert_corr, "Spearman(LFC)")
+
+
+def plot_correlation_matrices_pearson(de_by: dict, cfg: dict, out_png: str) -> str:
+    """Perturbation × perturbation Pearson-LFC correlation."""
+    return _plot_corr_matrices(de_by, cfg, out_png, _pert_corr_pearson, "Pearson(LFC)")
 
 
 # ---------------------------------------------------------------------------
@@ -529,6 +553,10 @@ def main() -> None:
     corr_path = os.path.join(plots_dir, f"test01_corr_matrix__{ds}.png")
     plot_correlation_matrices({"pdex": de_pdx, "pydeseq2": de_pyd}, cfg, corr_path)
     log.info("Saved → %s", corr_path)
+
+    pearson_path = os.path.join(plots_dir, f"test01_corr_matrix_pearson__{ds}.png")
+    plot_correlation_matrices_pearson({"pdex": de_pdx, "pydeseq2": de_pyd}, cfg, pearson_path)
+    log.info("Saved → %s", pearson_path)
 
     # ------------------------------------------------------------------ #
     # MA scatter: mean expression vs LFC for most / median / least cells
