@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pathway Test 2 Control Null"
+  short_description: "Compare control-null pathway calibration"
+  default_prompt: "Use $evaluating-pathways-test2-control-null to compare null calibration of bioconcord regression and pdex-MWU."

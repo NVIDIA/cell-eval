@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pathway Test 0 Injection"
+  short_description: "Measure pathway inference calibration and power"
+  default_prompt: "Use $evaluating-pathways-test0-injection to compare calibration and power under controlled pathway-score shifts."

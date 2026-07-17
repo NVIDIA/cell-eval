@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pathway Test 4 Guide Reproducibility"
+  short_description: "Compare split-half pathway effects per guide"
+  default_prompt: "Use $evaluating-pathways-test4-guide-reproducibility to compare OLS and pdex-MWU guide-level pathway reproducibility."

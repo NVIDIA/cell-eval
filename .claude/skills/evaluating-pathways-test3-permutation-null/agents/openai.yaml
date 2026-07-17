@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pathway Test 3 Permutation Null"
+  short_description: "Compare pathway signal with global and batch shuffles"
+  default_prompt: "Use $evaluating-pathways-test3-permutation-null to compare real pathway calls with both global and within-block label permutations."

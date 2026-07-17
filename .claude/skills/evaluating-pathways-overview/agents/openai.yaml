@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pathway Method Overview"
+  short_description: "Compare pathway calls across both methods"
+  default_prompt: "Use $evaluating-pathways-overview to compare bioconcord regression and pdex-MWU pathway calls."

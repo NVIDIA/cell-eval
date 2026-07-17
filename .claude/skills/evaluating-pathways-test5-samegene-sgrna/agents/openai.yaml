@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pathway Test 5 Same-Gene Guides"
+  short_description: "Compare pathway concordance across same-gene guides"
+  default_prompt: "Use $evaluating-pathways-test5-samegene-sgrna to compare same-gene guide pathway concordance for both methods."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pathway Test 1 Reproducibility"
+  short_description: "Compare perturbation split-half pathway stability"
+  default_prompt: "Use $evaluating-pathways-test1-reproducibility to compare split-half pathway reproducibility."
