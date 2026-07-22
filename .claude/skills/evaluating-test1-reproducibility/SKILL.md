@@ -151,6 +151,8 @@ the operating system, plotting, and the interactive session and avoids an OOM-pr
 - Treat the shared DE-2,000 and shared all-gene matrices as the two default correlation outputs.
 - `test1_rho_<method>__<dataset>.csv` — per-repeat, per-perturbation split-half ρ, including repeat,
   seed, and cell count.
+- `test1_lfc_vectors_<method>__<dataset>.parquet` — long-form per-repeat, per-perturbation LFC
+  vectors with one row per feature and separate split-A / split-B values.
 
 Colour spec: diverging blue–white–red centred at 0, capped ±2 log2FC — genes near 0 in both splits
 appear white, so colour in split B where split A is white (or vice versa) is irreproducibility made

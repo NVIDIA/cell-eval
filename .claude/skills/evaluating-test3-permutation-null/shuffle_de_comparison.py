@@ -51,7 +51,7 @@ from cell_eval._de_backends import build_de_frame
 
 log = logging.getLogger("shuffle_de_cmp")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-LFC_ARCHIVE_VERSION = 2
+LFC_ARCHIVE_VERSION = 3
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -265,7 +265,7 @@ def _run_shuffled_null(adata_raw: ad.AnnData, adata_norm: ad.AnnData,
                     for feat, lfc_val in zip(sub["feature"].to_list(), sub["log2_fold_change"].to_list()):
                         idx = gene_idx.get(str(feat))
                         if idx is not None:
-                            lfc_pdex_arr[idx] = float(lfc_val)
+                            lfc_pdex_arr[idx] = np.nan if lfc_val is None else float(lfc_val)
             except Exception as e:
                 log.warning("pdex shuffled null for %s: %s", p, e)
 
@@ -281,20 +281,62 @@ def _run_shuffled_null(adata_raw: ad.AnnData, adata_norm: ad.AnnData,
                     for feat, lfc_val in zip(sub["feature"].to_list(), sub["log2_fold_change"].to_list()):
                         idx = gene_idx.get(str(feat))
                         if idx is not None:
-                            lfc_pydx_arr[idx] = float(lfc_val)
+                            lfc_pydx_arr[idx] = np.nan if lfc_val is None else float(lfc_val)
             except Exception as e:
                 log.warning("pydeseq2 shuffled null for %s: %s", p, e)
 
         results[p] = {
             "n_pdex": n_pdex, "genes_pdex": genes_pdex,
             "n_pydx":  n_pydx,  "genes_pydx":  genes_pydx,
-            "n_cells": n_p,
+            "n_cells": n_p, "reference": ref_label, "n_reference_cells": n_ref,
             "lfc_pdex": lfc_pdex_arr,
             "lfc_pydx":  lfc_pydx_arr,
         }
         log.info("  fake-%s  n=%d  pdex_n_de=%d  pydx_n_de=%d", p, n_p, n_pdex, n_pydx)
 
     return results
+
+
+def _write_lfc_vectors(results, gene_names, mode, method, method_key, out_path):
+    """Stream one long-form Parquet row per shuffled-comparison-feature LFC pair."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    schema = pa.schema([
+        ("method", pa.string()),
+        ("shuffle_mode", pa.string()),
+        ("comparison", pa.string()),
+        ("reference", pa.string()),
+        ("n_cells", pa.int32()),
+        ("n_reference_cells", pa.int32()),
+        ("feature_index", pa.int32()),
+        ("feature", pa.string()),
+        ("lfc", pa.float64()),
+    ])
+    writer = pq.ParquetWriter(out_path, schema, compression="zstd")
+    n_rows = 0
+    try:
+        for comparison, d in results.items():
+            values = np.asarray(d[method_key], dtype=float)
+            n = len(values)
+            table = pa.Table.from_pydict({
+                "method": [method] * n,
+                "shuffle_mode": [mode] * n,
+                "comparison": [comparison] * n,
+                "reference": [str(d["reference"])] * n,
+                "n_cells": np.full(n, int(d["n_cells"]), dtype=np.int32),
+                "n_reference_cells": np.full(
+                    n, int(d["n_reference_cells"]), dtype=np.int32
+                ),
+                "feature_index": np.arange(n, dtype=np.int32),
+                "feature": gene_names,
+                "lfc": values,
+            }, schema=schema)
+            writer.write_table(table)
+            n_rows += n
+    finally:
+        writer.close()
+    return n_rows
 
 
 # ── plotting ───────────────────────────────────────────────────────────────────
@@ -637,6 +679,18 @@ def main() -> None:
         npz_path = os.path.join(args.outdir, f"test_3_lfc_matrix__{mode}.npz")
         np.savez_compressed(npz_path, **lfc_save)
         log.info("Saved LFC matrix → %s", npz_path)
+        for method_key, method_tag in (
+            ("lfc_pdex", "pdex"), ("lfc_pydx", "pydeseq2")
+        ):
+            if method_tag not in methods:
+                continue
+            lfc_path = os.path.join(
+                args.outdir, f"test3_lfc_vectors_{mode}_{method_tag}.parquet"
+            )
+            n_lfc_rows = _write_lfc_vectors(
+                results, gene_names, mode, method_tag, method_key, lfc_path
+            )
+            log.info("Saved LFC vectors → %s (%d rows)", lfc_path, n_lfc_rows)
 
         mode_label = "global shuffle (across all batches)" if mode == "global" else f"within-batch shuffle (block_cols={block_cols})"
         if "pdex" in methods and "pydeseq2" in methods:

@@ -48,3 +48,6 @@ python .claude/skills/evaluating-test3-permutation-null/shuffle_de_comparison.py
 - `test_3_shuffle_de_comparison__within.png` — same, within-batch shuffle
 - `test_3_corr_matrix__<mode>__<method>.png` — fake-perturbation Spearman correlation map; every
   title reports finite mean diagonal and off-diagonal rho separately.
+- `test3_lfc_vectors_<mode>_<method>.parquet` — long-form shuffled-comparison LFC vectors with one
+  row per feature. Existing versioned `test_3_lfc_matrix__<mode>.npz` archives remain available for
+  fast correlation-matrix replotting.

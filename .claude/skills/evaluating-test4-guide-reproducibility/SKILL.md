@@ -72,6 +72,8 @@ python .claude/skills/evaluating-test4-guide-reproducibility/guide_split_reprodu
   before the A/B split), so you can read reproducibility against power at a glance. Every panel title
   reports finite diagonal and off-diagonal means for both Spearman and Pearson.
 - `test4_rho_<method>__<dataset>.csv` — per-guide split-half ρ.
+- `test4_lfc_vectors_<method>__<dataset>.parquet` — long-form per-guide LFC vectors with one row per
+  feature and separate split-A / split-B values.
 
 **This differs from `evaluating-test5-samegene-sgrna`'s `samegene_guide_heatmap.py`:** Test 4 splits ONE
 guide's cells in half (within-guide reproducibility ceiling); Test 5 compares DIFFERENT guides of the

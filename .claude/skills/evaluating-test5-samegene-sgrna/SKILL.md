@@ -87,6 +87,8 @@ python .claude/skills/evaluating-test5-samegene-sgrna/samegene_guide_heatmap.py 
   a shared program / low specificity.** Each panel's title reports overall **diagonal and
   off-diagonal rho**, followed by **within-gene vs cross-gene off-diagonal rho**. The latter gap is
   the same-gene concordance signal that the `test_5` AUC verdict quantifies.
+- `test5_lfc_vectors_<method>__<dataset>.parquet` — long-form per-guide LFC vectors with one row per
+  feature.
 
 Levers: `--max-genes` caps #genes-with-guides (by #guides desc) for readability/runtime, `--max-control`
 subsamples control cells for speed, `--methods pdex` alone skips the (slower) pydeseq2 backend.

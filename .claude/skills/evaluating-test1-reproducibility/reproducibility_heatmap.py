@@ -196,6 +196,46 @@ def split_half_signatures(adata, cfg, rt, *, seed=0):
     return out
 
 
+def _write_lfc_vectors(signatures_by_repeat, method, base_seed, out_path):
+    """Stream one long-form Parquet row per repeat-perturbation-feature LFC pair."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    schema = pa.schema([
+        ("method", pa.string()),
+        ("repeat", pa.int32()),
+        ("seed", pa.int64()),
+        ("perturbation", pa.string()),
+        ("n_cells", pa.int32()),
+        ("feature_index", pa.int32()),
+        ("feature", pa.string()),
+        ("lfc_a", pa.float64()),
+        ("lfc_b", pa.float64()),
+    ])
+    writer = pq.ParquetWriter(out_path, schema, compression="zstd")
+    n_rows = 0
+    try:
+        for repeat, sigs in enumerate(signatures_by_repeat):
+            for perturbation, d in sigs.items():
+                n = len(d["genes"])
+                table = pa.Table.from_pydict({
+                    "method": [method] * n,
+                    "repeat": np.full(n, repeat, dtype=np.int32),
+                    "seed": np.full(n, base_seed + repeat, dtype=np.int64),
+                    "perturbation": [perturbation] * n,
+                    "n_cells": np.full(n, int(d["n_cells"]), dtype=np.int32),
+                    "feature_index": np.arange(n, dtype=np.int32),
+                    "feature": d["genes"],
+                    "lfc_a": d["lfc_a"],
+                    "lfc_b": d["lfc_b"],
+                }, schema=schema)
+                writer.write_table(table)
+                n_rows += n
+    finally:
+        writer.close()
+    return n_rows
+
+
 def _run_repeat_worker(task):
     """Process-pool entry point for one complete split repeat."""
     repeat, seed = task
@@ -1144,6 +1184,9 @@ def main():
             print(f"saved complete signature checkpoint: {cache_path}")
         repeat_sigs_by_method[m] = repeats
         display_sigs_by_method[m] = repeats[0]
+        lfc_path = os.path.join(a.outdir, f"test1_lfc_vectors_{m}__{ds}.parquet")
+        n_lfc_rows = _write_lfc_vectors(repeats, m, a.seed, lfc_path)
+        print(f"LFC vectors: {os.path.abspath(lfc_path)} ({n_lfc_rows} rows)")
 
     # Remove method-only/repeat-only units before they can nominate DE genes,
     # constrain the complete-case panel, or contribute headline rho values.

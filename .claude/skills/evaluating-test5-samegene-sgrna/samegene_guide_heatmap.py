@@ -146,6 +146,43 @@ def guide_signatures(adata, cfg, rt, *, min_guides=2, max_genes=None, max_contro
     return sigs, gene_groups
 
 
+def _write_lfc_vectors(sigs, method, out_path):
+    """Stream one long-form Parquet row per guide-feature LFC pair."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    schema = pa.schema([
+        ("method", pa.string()),
+        ("guide_label", pa.string()),
+        ("target_gene", pa.string()),
+        ("guide", pa.string()),
+        ("n_cells", pa.int32()),
+        ("feature_index", pa.int32()),
+        ("feature", pa.string()),
+        ("lfc", pa.float64()),
+    ])
+    writer = pq.ParquetWriter(out_path, schema, compression="zstd")
+    n_rows = 0
+    try:
+        for label, d in sigs.items():
+            n = len(d["genes"])
+            table = pa.Table.from_pydict({
+                "method": [method] * n,
+                "guide_label": [label] * n,
+                "target_gene": [str(d["gene"])] * n,
+                "guide": [str(d["guide"])] * n,
+                "n_cells": np.full(n, int(d["n_cells"]), dtype=np.int32),
+                "feature_index": np.arange(n, dtype=np.int32),
+                "feature": d["genes"],
+                "lfc": d["lfc"],
+            }, schema=schema)
+            writer.write_table(table)
+            n_rows += n
+    finally:
+        writer.close()
+    return n_rows
+
+
 def _cpm_elig_mask_t5(signature: dict) -> np.ndarray:
     """Return the required CPM mask for a guide signature."""
     cpm_elig = signature.get("cpm_elig")
@@ -504,6 +541,9 @@ def main():
         sigs, gene_groups = guide_signatures(adata, cfg_for(m), rt, min_guides=a.min_guides,
                                              max_genes=a.max_genes, max_control=a.max_control, seed=a.seed)
         sigs_by_method[m] = sigs
+        lfc_path = os.path.join(a.outdir, f"test5_lfc_vectors_{m}__{ds}.parquet")
+        n_lfc_rows = _write_lfc_vectors(sigs, m, lfc_path)
+        print(f"LFC vectors: {os.path.abspath(lfc_path)} ({n_lfc_rows} rows)")
         p1 = os.path.join(plots_dir, f"test5_guide_heatmap_{m}__{ds}.png")
         layer1_heatmap(sigs, gene_groups, p1, cfg_for(m), m, max_genes=a.max_de_genes)
         print("Layer 1 heatmap:", os.path.abspath(p1))

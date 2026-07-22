@@ -109,6 +109,7 @@ def guide_split_half_signatures(adata, cfg, rt, *, max_guides=None, max_control=
         genes = j["feature"].to_numpy().astype(str)
         elig = t1._compute_cpm_elig(adata, pos_G, pos_C, cfg)
         out[lbl] = {"rho": float("nan"), "rho_pairwise": rho_pairwise,
+                    "gene": gene, "guide": gu,
                     "genes": genes, "lfc_a": la, "lfc_b": lb,
                     "fdr_a": j["fdr"].to_numpy().astype(float),
                     "fdr_b": j["fdr_b"].to_numpy().astype(float),
@@ -116,6 +117,45 @@ def guide_split_half_signatures(adata, cfg, rt, *, max_guides=None, max_control=
                     "n_cells": int(ncell)}
         print(f"  {lbl:16s} provisional-overlap ρ={rho_pairwise:.3f}  ({pos_G.size} cells)  {gu[:36]}")
     return out
+
+
+def _write_lfc_vectors(sigs, method, out_path):
+    """Stream one long-form Parquet row per guide-feature LFC pair."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    schema = pa.schema([
+        ("method", pa.string()),
+        ("guide_label", pa.string()),
+        ("target_gene", pa.string()),
+        ("guide", pa.string()),
+        ("n_cells", pa.int32()),
+        ("feature_index", pa.int32()),
+        ("feature", pa.string()),
+        ("lfc_a", pa.float64()),
+        ("lfc_b", pa.float64()),
+    ])
+    writer = pq.ParquetWriter(out_path, schema, compression="zstd")
+    n_rows = 0
+    try:
+        for label, d in sigs.items():
+            n = len(d["genes"])
+            table = pa.Table.from_pydict({
+                "method": [method] * n,
+                "guide_label": [label] * n,
+                "target_gene": [str(d["gene"])] * n,
+                "guide": [str(d["guide"])] * n,
+                "n_cells": np.full(n, int(d["n_cells"]), dtype=np.int32),
+                "feature_index": np.arange(n, dtype=np.int32),
+                "feature": d["genes"],
+                "lfc_a": d["lfc_a"],
+                "lfc_b": d["lfc_b"],
+            }, schema=schema)
+            writer.write_table(table)
+            n_rows += n
+    finally:
+        writer.close()
+    return n_rows
 
 
 def main():
@@ -163,8 +203,14 @@ def main():
     sigs_by_method = {}
     for m in order:
         print(f"\n=== {m} within-guide split-half DE (seed={a.seed}) ===")
-        sigs_by_method[m] = guide_split_half_signatures(adata, cfg_for(m), rt, max_guides=a.max_guides,
-                                                        max_control=a.max_control, seed=a.seed)
+        sigs = guide_split_half_signatures(
+            adata, cfg_for(m), rt, max_guides=a.max_guides,
+            max_control=a.max_control, seed=a.seed,
+        )
+        sigs_by_method[m] = sigs
+        lfc_path = os.path.join(a.outdir, f"test4_lfc_vectors_{m}__{ds}.parquet")
+        n_lfc_rows = _write_lfc_vectors(sigs, m, lfc_path)
+        print(f"LFC vectors: {os.path.abspath(lfc_path)} ({n_lfc_rows} rows)")
 
     # A guide must exist in every backend before it can nominate genes, constrain
     # the complete-case feature panel, or receive a headline cross-method rho.
