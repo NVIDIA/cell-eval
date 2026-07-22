@@ -37,35 +37,49 @@ def maybe_normalize(adata: ad.AnnData, cfg: dict) -> None:
         sc.pp.log1p(adata)
 
 
-def _pdex_expr_filter(de_frame: pl.DataFrame, adata: ad.AnnData,
-                      groupby: str, pert_label: str, ctrl_label: str,
-                      *, min_cpm: float = 5.0) -> pl.DataFrame:
-    """Remove pdex DE genes where mean CPM < min_cpm in both groups.
-    adata.X must be log1p-normalized; expm1 recovers the pre-log values."""
+def _cpm_eligible_genes(adata: ad.AnnData, groupby: str, pert_label: str,
+                         ctrl_label: str, cfg: dict, *, min_cpm: float = 5.0) -> set:
+    """Return the set of genes with mean CPM ≥ min_cpm in either perturbed or control cells.
+
+    Shared eligibility filter applied identically to both pdex and pyDESeq2.  Uses raw
+    counts from cfg['counts_layer'] when available; otherwise uses expm1(adata.X) for
+    log-normalised X or adata.X directly for integer-count X.
+    """
     obs_g = adata.obs[groupby].astype(str).to_numpy()
-    X = adata.X
-    if not sp.issparse(X):
-        X = sp.csr_matrix(X)
-    X = X.tocsr()
+    counts_layer = cfg.get("counts_layer")
+    if counts_layer and counts_layer in adata.layers:
+        X = adata.layers[counts_layer]
+        if not sp.issparse(X):
+            X = sp.csr_matrix(X)
+        X = X.tocsr()
+    else:
+        X = adata.X
+        if not sp.issparse(X):
+            X = sp.csr_matrix(X)
+        X = X.tocsr()
+        sample = X.data[:min(5_000, X.data.size)] if X.data.size > 0 else np.array([0.0])
+        if not np.allclose(sample, np.rint(sample)):
+            X = X.copy()
+            X.data = np.expm1(X.data)
 
-    def _mean_norm(idx):
-        sub = X[idx, :].copy()
-        sub.data = np.expm1(sub.data)
-        return sub
+    pos_p = np.where(obs_g == pert_label)[0]
+    pos_c = np.where(obs_g == ctrl_label)[0]
+    if pos_p.size == 0 or pos_c.size == 0:
+        return set(adata.var_names)
 
-    Xp = _mean_norm(np.where(obs_g == pert_label)[0])
-    Xc = _mean_norm(np.where(obs_g == ctrl_label)[0])
-    # median_lib: after normalize_total each cell sums to median library size
-    median_lib = float(np.asarray(Xc.sum(axis=1)).mean())
-    min_norm = min_cpm / 1e6 * median_lib  # convert CPM threshold to normalized-count units
-    m_pert = np.asarray(Xp.mean(axis=0)).ravel()
-    m_ctrl = np.asarray(Xc.mean(axis=0)).ravel()
-    g2i = {g: i for i, g in enumerate(adata.var_names)}
-    keep = {str(g) for g in de_frame["feature"].to_list()
-            if (i := g2i.get(str(g))) is not None
-            and (m_pert[i] >= min_norm or m_ctrl[i] >= min_norm)}
-    return de_frame.filter(pl.col("feature").is_in(keep))
+    def mean_cpm(pos):
+        group = X[pos]
+        library_sizes = np.asarray(group.sum(axis=1)).ravel().astype(float)
+        scales = np.divide(
+            1e6, library_sizes, out=np.zeros_like(library_sizes),
+            where=library_sizes > 0,
+        )
+        return np.asarray(group.multiply(scales[:, None]).mean(axis=0)).ravel()
 
+    m_pert = mean_cpm(pos_p)
+    m_ctrl = mean_cpm(pos_c)
+    eligible_idx = np.where((m_pert >= min_cpm) | (m_ctrl >= min_cpm))[0]
+    return set(adata.var_names[eligible_idx])
 
 
 def run_de(adata: ad.AnnData, cfg: dict, groupby: str, reference: str) -> pl.DataFrame:
@@ -81,11 +95,12 @@ def run_de(adata: ad.AnnData, cfg: dict, groupby: str, reference: str) -> pl.Dat
         counts_layer=cfg.get("counts_layer"),
         replicate_col=cfg.get("replicate_col"),
     )
-    if cfg["de_method"] == "pdex":
-        labels = adata.obs[groupby].astype(str).unique().tolist()
-        pert_label = next((lb for lb in labels if lb != reference), None)
-        if pert_label is not None:
-            result = _pdex_expr_filter(result, adata, groupby, pert_label, reference)
+    # Shared CPM eligibility filter — applied to both pdex and pyDESeq2 identically.
+    labels = adata.obs[groupby].astype(str).unique().tolist()
+    pert_label = next((lb for lb in labels if lb != reference), None)
+    if pert_label is not None:
+        eligible = _cpm_eligible_genes(adata, groupby, pert_label, reference, cfg)
+        result = result.filter(pl.col("feature").is_in(eligible))
     return result
 
 

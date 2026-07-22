@@ -89,6 +89,9 @@ from scipy import stats
 _RT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "de_helpers.py")
 
 CAP = 2.0  # ±log2FC colour cap
+SIGNATURE_CACHE_VERSION = 4
+CPM_NORMALIZATION = "per_cell_then_mean"
+MIN_CPM = 5.0
 
 # Fork workers inherit these read-mostly objects without serialising a large
 # AnnData for every repeat. Each worker owns its copy-on-write mutations (pdex
@@ -105,6 +108,42 @@ def _load_runner():
     sys.modules["rt_shared"] = rt
     spec.loader.exec_module(rt)
     return rt
+
+
+def _compute_cpm_elig(adata, pos_P, pos_C, cfg, *, min_cpm=MIN_CPM):
+    """Return a set of gene names with mean CPM ≥ min_cpm in either pert or ctrl cells.
+
+    Computed from raw counts (cfg['counts_layer'] if present) so the result is independent
+    of whether adata.X has been log-normalised by maybe_normalize. Applied once per
+    perturbation and shared across DE backends so the CPM gate is method-neutral.
+    """
+    import scipy.sparse as sp_local
+    counts_layer = cfg.get("counts_layer")
+    if counts_layer and counts_layer in adata.layers:
+        X = adata.layers[counts_layer]
+        if not sp_local.issparse(X):
+            X = sp_local.csr_matrix(X)
+        X = X.tocsr()
+    else:
+        X = adata.X
+        if not sp_local.issparse(X):
+            X = sp_local.csr_matrix(X)
+        X = X.tocsr()
+        sample = X.data[:min(5_000, X.data.size)] if X.data.size > 0 else np.array([0.0])
+        if not np.allclose(sample, np.rint(sample)):
+            X = X.copy(); X.data = np.expm1(X.data)
+    def mean_cpm(pos):
+        group = X[pos]
+        library_sizes = np.asarray(group.sum(axis=1)).ravel().astype(float)
+        scales = np.divide(
+            1e6, library_sizes, out=np.zeros_like(library_sizes),
+            where=library_sizes > 0,
+        )
+        return np.asarray(group.multiply(scales[:, None]).mean(axis=0)).ravel()
+
+    m_pert = mean_cpm(pos_P)
+    m_ctrl = mean_cpm(pos_C)
+    return set(adata.var_names[np.where((m_pert >= min_cpm) | (m_ctrl >= min_cpm))[0]])
 
 
 def split_half_signatures(adata, cfg, rt, *, seed=0):
@@ -138,13 +177,17 @@ def split_half_signatures(adata, cfg, rt, *, seed=0):
         la = j["log2_fold_change"].to_numpy().astype(float)
         lb = j["log2_fold_change_b"].to_numpy().astype(float)
         ok = np.isfinite(la) & np.isfinite(lb)
-        rho = float(stats.spearmanr(la[ok], lb[ok]).statistic) if ok.sum() >= 5 else float("nan")
+        rho_pairwise = (float(stats.spearmanr(la[ok], lb[ok]).statistic)
+                        if ok.sum() >= 5 else float("nan"))
         genes = j["feature"].to_numpy().astype(str)
-        out[pert] = {"rho": rho, "genes": genes, "lfc_a": la, "lfc_b": lb,
+        elig = _compute_cpm_elig(adata, pos_P, pos_C, cfg)
+        out[pert] = {"rho": float("nan"), "rho_pairwise": rho_pairwise,
+                     "genes": genes, "lfc_a": la, "lfc_b": lb,
                      "fdr_a": j["fdr"].to_numpy().astype(float),
                      "fdr_b": j["fdr_b"].to_numpy().astype(float),
+                     "cpm_elig": np.array([g in elig for g in genes]),
                      "n_cells": int(pos_P.size)}
-        print(f"  {pert:20s} ρ={rho:.3f}  ({pos_P.size} cells)")
+        print(f"  {pert:20s} provisional-overlap ρ={rho_pairwise:.3f}  ({pos_P.size} cells)")
     if not out:
         raise ValueError(
             f"No perturbation produced a valid split-half signature. Check control "
@@ -169,10 +212,11 @@ def _signature_cache_path(cache_dir, method, dataset):
     return os.path.join(cache_dir, f"test1_signatures_{method}__{dataset}.pkl")
 
 
-def _write_signature_cache(path, signatures_by_repeat, *, method, dataset, args):
+def _write_signature_cache(path, signatures_by_repeat, *, method, dataset, args,
+                           counts_layer):
     """Atomically persist completed repeats, including partial runs."""
     payload = {
-        "format_version": 2,
+        "format_version": SIGNATURE_CACHE_VERSION,
         "method": method,
         "dataset": dataset,
         "n_repeats": args.n_repeats,
@@ -180,6 +224,9 @@ def _write_signature_cache(path, signatures_by_repeat, *, method, dataset, args)
         "pert_col": args.pert_col,
         "control": args.control,
         "block_cols": args.block_cols,
+        "cpm_normalization": CPM_NORMALIZATION,
+        "min_cpm": MIN_CPM,
+        "counts_layer": counts_layer,
         "signatures_by_repeat": dict(sorted(signatures_by_repeat.items())),
     }
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -189,10 +236,16 @@ def _write_signature_cache(path, signatures_by_repeat, *, method, dataset, args)
     os.replace(tmp, path)
 
 
-def _read_signature_cache(path, *, method, dataset, args):
+def _read_signature_cache(path, *, method, dataset, args, counts_layer):
     """Load and validate a complete or partial local signature checkpoint."""
     with open(path, "rb") as handle:
         payload = pickle.load(handle)  # trusted local checkpoint from this skill
+    version = payload.get("format_version")
+    if version != SIGNATURE_CACHE_VERSION:
+        raise ValueError(
+            f"Unsupported signature cache format {version!r} in {path}; "
+            f"version {SIGNATURE_CACHE_VERSION} is required after the per-cell CPM change"
+        )
     expected = {
         "method": method,
         "dataset": dataset,
@@ -201,6 +254,9 @@ def _read_signature_cache(path, *, method, dataset, args):
         "pert_col": args.pert_col,
         "control": args.control,
         "block_cols": args.block_cols,
+        "cpm_normalization": CPM_NORMALIZATION,
+        "min_cpm": MIN_CPM,
+        "counts_layer": counts_layer,
     }
     mismatches = {
         key: (payload.get(key), value)
@@ -209,22 +265,24 @@ def _read_signature_cache(path, *, method, dataset, args):
     }
     if mismatches:
         raise ValueError(f"Signature cache metadata mismatch in {path}: {mismatches}")
-    version = payload.get("format_version")
-    if version == 1:
-        signatures = payload.get("signatures")
-        if not isinstance(signatures, list) or len(signatures) != args.n_repeats:
-            raise ValueError(f"Invalid version-1 repeat signature payload in {path}")
-        return dict(enumerate(signatures))
-    if version != 2:
-        raise ValueError(f"Unsupported signature cache format {version!r} in {path}")
     signatures = payload.get("signatures_by_repeat")
     if not isinstance(signatures, dict):
-        raise ValueError(f"Invalid version-2 repeat signature payload in {path}")
+        raise ValueError(f"Invalid version-{version} repeat signature payload in {path}")
     cleaned = {}
     for repeat, value in signatures.items():
         repeat = int(repeat)
         if repeat < 0 or repeat >= args.n_repeats or not isinstance(value, dict):
             raise ValueError(f"Invalid repeat {repeat!r} in {path}")
+        for group, signature in value.items():
+            if not isinstance(signature, dict):
+                raise ValueError(f"Invalid signature {group!r} in repeat {repeat} of {path}")
+            cpm_elig = signature.get("cpm_elig")
+            genes = signature.get("genes")
+            if cpm_elig is None or genes is None or len(cpm_elig) != len(genes):
+                raise ValueError(
+                    f"Signature cache {path} predates the CPM-eligibility schema "
+                    f"(repeat={repeat}, group={group!r}); delete it and recompute"
+                )
         cleaned[repeat] = value
     return cleaned
 
@@ -299,9 +357,9 @@ def _union_de_genes(sigs, cfg, max_genes):
     `max_genes` most dynamic (highest cross-perturbation variance of LFC_A), for a readable heatmap."""
     fdr, lfc = cfg["fdr_threshold"], cfg["lfc_threshold"]
     union = set()
-    per_gene_lfcA = {}
     for pert, d in sigs.items():
         sig = ((d["fdr_a"] <= fdr) & (np.abs(d["lfc_a"]) >= lfc)) | ((d["fdr_b"] <= fdr) & (np.abs(d["lfc_b"]) >= lfc))
+        sig &= _cpm_elig_mask(d)
         for g in d["genes"][sig]:
             union.add(g)
     union.intersection_update(_genes_finite_in_every_signature({"signatures": sigs}))
@@ -361,46 +419,114 @@ def layer1_heatmap(sigs, out_png, cfg, *, max_genes=2000, title_prefix="Test-1",
     return out_png, perts, genes
 
 
-def _union_de_genes_multi(sigs_by_method, cfg, max_genes):
-    """Union DE genes across ALL methods (a gene DE in split A or B of any perturbation in any method),
-    ordered by the across-perturbation, across-method mean split-A LFC, capped to `max_genes` by
-    cross-perturbation variance so both methods' heatmap strips share one column order."""
+def _cpm_elig_mask(signature: dict) -> np.ndarray:
+    """Return the required per-gene CPM mask, rejecting stale signature data."""
+    cpm_elig = signature.get("cpm_elig")
+    if cpm_elig is None or len(cpm_elig) != len(signature["genes"]):
+        raise ValueError(
+            "Signature is missing a valid cpm_elig mask; recompute stale cached signatures"
+        )
+    return np.asarray(cpm_elig, dtype=bool)
+
+
+def _union_de_genes_ranked(sigs_by_method, cfg):
+    """Return ALL union-DE complete-case genes ranked by cross-method LFC variance (desc).
+
+    G = union of genes called DE (split A or B, FDR+LFC thresholds) by any method × group,
+    intersected with the complete-case set (finite lfc_a AND lfc_b for every method × group).
+    Note: union membership depends on both methods' FDR calling — a gene enters G if either
+    method calls it DE in any split. Only the variance ranking is symmetric across methods:
+    it pools split-A and split-B LFCs from ALL methods so no single method's FDR drives
+    the rank order. The pooled variance includes between-method disagreement.
+    Returns the full ranked list; callers slice [:n] for any desired cap size.
+    """
     fdr, lfc = cfg["fdr_threshold"], cfg["lfc_threshold"]
     union = set()
     for sigs in sigs_by_method.values():
         for d in sigs.values():
-            sig = ((d["fdr_a"] <= fdr) & (np.abs(d["lfc_a"]) >= lfc)) | ((d["fdr_b"] <= fdr) & (np.abs(d["lfc_b"]) >= lfc))
+            sig = ((d["fdr_a"] <= fdr) & (np.abs(d["lfc_a"]) >= lfc)) | \
+                  ((d["fdr_b"] <= fdr) & (np.abs(d["lfc_b"]) >= lfc))
+            sig &= _cpm_elig_mask(d)
             union.update(d["genes"][sig])
     union.intersection_update(_genes_finite_in_every_signature(sigs_by_method))
     union = sorted(union)
+    if not union:
+        return []
     idx = {m: {p: {g: i for i, g in enumerate(d["genes"])} for p, d in sigs.items()}
            for m, sigs in sigs_by_method.items()}
-    var, meanA = {}, {}
+    var = {}
     for g in union:
+        vals = ([sigs_by_method[m][p]["lfc_a"][idx[m][p][g]]
+                 for m in sigs_by_method for p in sigs_by_method[m] if g in idx[m][p]] +
+                [sigs_by_method[m][p]["lfc_b"][idx[m][p][g]]
+                 for m in sigs_by_method for p in sigs_by_method[m] if g in idx[m][p]])
+        var[g] = float(np.nanvar(vals)) if vals else 0.0
+    return sorted(union, key=lambda g: -var[g])
+
+
+def _union_de_genes_multi(sigs_by_method, cfg, max_genes):
+    """Capped union-DE gene list for heatmap column ordering (layer1/layer2 display).
+
+    Delegates to _union_de_genes_ranked for gene selection, then sorts the top-max_genes
+    by mean split-A LFC (blue→red column order) for heatmap readability.
+    For correlation matrices use _union_de_genes_ranked directly and slice [:n].
+    """
+    ranked = _union_de_genes_ranked(sigs_by_method, cfg)
+    top = ranked[:max_genes]
+    if not top:
+        return []
+    idx = {m: {p: {g: i for i, g in enumerate(d["genes"])} for p, d in sigs.items()}
+           for m, sigs in sigs_by_method.items()}
+    meanA = {}
+    for g in top:
         vals = [sigs_by_method[m][p]["lfc_a"][idx[m][p][g]]
                 for m in sigs_by_method for p in sigs_by_method[m] if g in idx[m][p]]
-        var[g] = float(np.nanvar(vals)) if vals else 0.0
         meanA[g] = float(np.nanmean(vals)) if vals else 0.0
-    top = sorted(union, key=lambda g: -var[g])[:max_genes]
     return sorted(top, key=lambda g: meanA[g])  # column order: blue (down) → red (up)
 
 
-def _zoom_row(sc, hm, d, genes, cfg, row_label):
+def _rho_on_gene_panel(d: dict, genes: list[str]) -> float:
+    """Split-half Spearman rho on one fixed, explicitly supplied gene panel."""
+    gi = {g: i for i, g in enumerate(d["genes"])}
+    la = np.asarray([d["lfc_a"][gi[g]] if g in gi else np.nan for g in genes])
+    lb = np.asarray([d["lfc_b"][gi[g]] if g in gi else np.nan for g in genes])
+    ok = np.isfinite(la) & np.isfinite(lb)
+    return float(stats.spearmanr(la[ok], lb[ok]).statistic) if ok.sum() >= 5 else float("nan")
+
+
+def _set_shared_panel_rhos(sigs_by_method: dict, genes: list[str]) -> None:
+    """Replace headline rho values with correlations on a global shared panel."""
+    for sigs in sigs_by_method.values():
+        for d in sigs.values():
+            d["rho"] = _rho_on_gene_panel(d, genes)
+            d["rho_n_genes"] = len(genes)
+
+
+def _zoom_row(sc, hm, d, genes, cfg, row_label, *, rho_genes=None):
     """Draw one (method, perturbation) row: LFC_A-vs-LFC_B scatter (left) + split-A/B heatmap strips
     (right, over the shared global gene order). Returns the heatmap image handle."""
     fdr, lfc = cfg["fdr_threshold"], cfg["lfc_threshold"]
-    sig = ((d["fdr_a"] <= fdr) & (np.abs(d["lfc_a"]) >= lfc)) | ((d["fdr_b"] <= fdr) & (np.abs(d["lfc_b"]) >= lfc))
-    la, lb = d["lfc_a"], d["lfc_b"]
+    gi = {g: i for i, g in enumerate(d["genes"])}
+    scatter_genes = genes if rho_genes is None else rho_genes
+    la = np.asarray([d["lfc_a"][gi[g]] if g in gi else np.nan for g in scatter_genes])
+    lb = np.asarray([d["lfc_b"][gi[g]] if g in gi else np.nan for g in scatter_genes])
+    fa = np.asarray([d["fdr_a"][gi[g]] if g in gi else np.nan for g in scatter_genes])
+    fb = np.asarray([d["fdr_b"][gi[g]] if g in gi else np.nan for g in scatter_genes])
+    cpm = _cpm_elig_mask(d)
+    ce = np.asarray([cpm[gi[g]] if g in gi else False for g in scatter_genes])
+    finite = np.isfinite(la) & np.isfinite(lb)
+    sig = finite & ce & (((fa <= fdr) & (np.abs(la) >= lfc)) |
+                         ((fb <= fdr) & (np.abs(lb) >= lfc)))
     sc.axhline(0, color="0.8", lw=0.7); sc.axvline(0, color="0.8", lw=0.7)
     sc.plot([-CAP, CAP], [-CAP, CAP], "--", color="0.6", lw=0.8)
-    sc.scatter(la[~sig], lb[~sig], s=5, color="0.7", alpha=0.4, label="non-DE")
+    sc.scatter(la[finite & ~sig], lb[finite & ~sig], s=5, color="0.7", alpha=0.4, label="non-DE")
     sc.scatter(la[sig], lb[sig], s=12, color="#1a3c6e", alpha=0.7, label="DE (A∪B)")
     sc.set_xlim(-CAP - 0.2, CAP + 0.2); sc.set_ylim(-CAP - 0.2, CAP + 0.2)
     sc.set_xlabel("LFC split A"); sc.set_ylabel("LFC split B")
-    sc.set_title(f"{row_label}\nρ={d['rho']:.2f}", fontsize=8.5)
-    gi = {g: i for i, g in enumerate(d["genes"])}
-    rowA = np.array([[la[gi[g]] if g in gi else np.nan for g in genes]])
-    rowB = np.array([[lb[gi[g]] if g in gi else np.nan for g in genes]])
+    sc.set_title(f"{row_label}\nρ={d['rho']:.2f} (shared n={d.get('rho_n_genes', len(scatter_genes))})",
+                 fontsize=8.5)
+    rowA = np.array([[d["lfc_a"][gi[g]] if g in gi else np.nan for g in genes]])
+    rowB = np.array([[d["lfc_b"][gi[g]] if g in gi else np.nan for g in genes]])
     im = hm.imshow(np.vstack([rowA, rowB]), aspect="auto", cmap="RdBu_r", vmin=-CAP, vmax=CAP,
                    interpolation="nearest")
     hm.set_yticks([0, 1]); hm.set_yticklabels(["A", "B"], fontsize=8); hm.set_xticks([])
@@ -408,12 +534,16 @@ def _zoom_row(sc, hm, d, genes, cfg, row_label):
     return im
 
 
-def layer2_zoom_compare(sigs_by_method, out_png, cfg, genes, *, methods, per_page=1, title_prefix="Test-1"):
+def layer2_zoom_compare(sigs_by_method, out_png, cfg, genes, *, methods, per_page=1,
+                        title_prefix="Test-1", rho_genes=None):
     """Per-perturbation zoom COMPARING backends: each PNG holds `per_page` perturbation(s); every
     perturbation contributes ONE ROW PER METHOD (e.g. a pdex row and a pydeseq2 row) — scatter +
     split-A/B heatmap strips over a shared gene order — so the two backends' reproducibility for the
     same perturbation (same A/B split) sit directly above/below each other. Perturbations are sorted by
     the FIRST method's ρ (low ρ first). One PNG per perturbation by default."""
+    if len(genes) == 0:
+        return []
+
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -432,7 +562,8 @@ def layer2_zoom_compare(sigs_by_method, out_png, cfg, genes, *, methods, per_pag
                                  squeeze=False)
         im = None
         for r, (p, m) in enumerate(rows):
-            im = _zoom_row(axes[r][0], axes[r][1], sigs_by_method[m][p], genes, cfg, f"{p} · {m}")
+            im = _zoom_row(axes[r][0], axes[r][1], sigs_by_method[m][p], genes, cfg,
+                           f"{p} · {m}", rho_genes=rho_genes)
         fig.colorbar(im, ax=axes[:, 1].tolist(), fraction=0.02, pad=0.02, label=f"log2FC (±{CAP:g})")
         if len(page) == 1:
             p = page[0]
@@ -453,6 +584,161 @@ def _all_shared_genes(sigs_by_method: dict) -> list[str]:
     return sorted(_genes_finite_in_every_signature(sigs_by_method))
 
 
+def _gene_set_diagnostics(sigs_by_method: dict, cfg: dict) -> dict:
+    """Report and return gene-set filtering counts for inclusion in plot titles.
+
+    Computes, prints to terminal, and returns:
+      union_before  — union-DE genes before CPM and complete-case filtering
+      dropped_cpm   — genes removed by every DE call's CPM eligibility mask
+      dropped_nonfinite — CPM-retained genes lacking a finite LFC somewhere
+      dropped_de    — total genes removed by CPM or complete-case filtering
+      retained_de   — final complete-case union-DE count
+      all_before    — all genes appearing in any DE output
+      dropped_all   — removed for the all-eligible panel
+      retained_all  — final complete-case all-gene panel count
+    Also breaks down dropped_de by which method's absence caused the removal.
+    """
+    fdr, lfc = cfg["fdr_threshold"], cfg["lfc_threshold"]
+
+    # Identify method name for each top-level key (handles "pdex__repeat0" style too)
+    def _method_of(key: str) -> str:
+        if "pydeseq2" in key:
+            return "pydeseq2"
+        if "pdex" in key:
+            return "pdex"
+        return key
+
+    # Raw union-DE and the union after applying each signature's CPM gate.
+    union_before: set[str] = set()
+    union_after_cpm: set[str] = set()
+    for sigs in sigs_by_method.values():
+        for d in sigs.values():
+            sig = ((d["fdr_a"] <= fdr) & (np.abs(d["lfc_a"]) >= lfc)) | \
+                  ((d["fdr_b"] <= fdr) & (np.abs(d["lfc_b"]) >= lfc))
+            union_before.update(d["genes"][sig])
+            union_after_cpm.update(d["genes"][sig & _cpm_elig_mask(d)])
+
+    # Complete-case per method (intersection within method, then across methods)
+    cc_by_method: dict[str, set[str]] = {}
+    for ent_key, sigs in sigs_by_method.items():
+        m = _method_of(ent_key)
+        cc: set[str] | None = None
+        for d in sigs.values():
+            finite = set(d["genes"][np.isfinite(d["lfc_a"]) & np.isfinite(d["lfc_b"])])
+            cc = finite if cc is None else cc.intersection(finite)
+        cc = cc or set()
+        if m in cc_by_method:
+            cc_by_method[m] = cc_by_method[m].intersection(cc)
+        else:
+            cc_by_method[m] = cc
+    cc_global = set.intersection(*cc_by_method.values()) if cc_by_method else set()
+
+    retained_de = union_after_cpm & cc_global
+    dropped_cpm = union_before - union_after_cpm
+    dropped_nonfinite = union_after_cpm - cc_global
+    dropped_de = union_before - retained_de
+
+    # All genes appearing in any signature (for the all-eligible panel)
+    all_before: set[str] = set()
+    for sigs in sigs_by_method.values():
+        for d in sigs.values():
+            all_before.update(d["genes"])
+    retained_all = all_before & cc_global
+    dropped_all = all_before - cc_global
+
+    pct_de = len(dropped_de) / len(union_before) * 100 if union_before else 0.0
+    pct_all = len(dropped_all) / len(all_before) * 100 if all_before else 0.0
+
+    # Per-method attribution of the nonfinite-LFC drops (only for two methods).
+    method_breakdown = ""
+    if len(cc_by_method) == 2:
+        ms = list(cc_by_method)
+        cc0, cc1 = cc_by_method[ms[0]], cc_by_method[ms[1]]
+        d0_only = len(dropped_nonfinite & cc1)        # absent in ms[0], present in ms[1]
+        d1_only = len(dropped_nonfinite & cc0)        # absent in ms[1], present in ms[0]
+        d_both  = len(dropped_nonfinite - cc0 - cc1)  # absent in both
+        method_breakdown = (
+            f"  dropped breakdown: {ms[0]}-only={d0_only}, "
+            f"{ms[1]}-only={d1_only}, both={d_both}"
+        )
+        mi_tag = f" [{ms[0]}-only={d0_only}, {ms[1]}-only={d1_only}, both={d_both}]"
+    else:
+        mi_tag = ""
+
+    print(f"\n{'─' * 64}")
+    print("Gene-set diagnostics:")
+    print(f"  union-DE before CPM/complete-case: {len(union_before)}")
+    print(f"  dropped by CPM eligibility:        {len(dropped_cpm)}")
+    print(f"  dropped (≥1 nonfinite LFC):        {len(dropped_nonfinite)}{mi_tag}")
+    print(f"  dropped total:                     {len(dropped_de)} ({pct_de:.1f}%)")
+    print(f"  final complete-case union-DE:   {len(retained_de)}")
+    if method_breakdown:
+        print(method_breakdown)
+    print(f"  all genes (any DE output):      {len(all_before)}")
+    print(f"  dropped (≥1 nonfinite LFC):     {len(dropped_all)} ({pct_all:.1f}%)")
+    print(f"  final complete-case all-genes:  {len(retained_all)}")
+    print(f"{'─' * 64}")
+
+    de_sfx = (f"from {len(union_before)} union-DE; dropped {len(dropped_de)} "
+              f"({pct_de:.0f}%; CPM={len(dropped_cpm)}, nonfinite={len(dropped_nonfinite)})")
+    all_sfx = (f"from {len(all_before)} total; dropped {len(dropped_all)} "
+               f"({pct_all:.0f}%)")
+    return {
+        "union_before": len(union_before),
+        "dropped_cpm": len(dropped_cpm),
+        "dropped_nonfinite": len(dropped_nonfinite),
+        "dropped_de":   len(dropped_de),
+        "retained_de":  len(retained_de),
+        "all_before":   len(all_before),
+        "dropped_all":  len(dropped_all),
+        "retained_all": len(retained_all),
+        "de_sfx":       de_sfx,
+        "all_sfx":      all_sfx,
+    }
+
+
+def _shared_unit_order(sigs_by_method: dict, methods: list[str]):
+    """Return normalized repeat lists and one unit order shared by every panel."""
+    repeats_by_method = {}
+    common_units: set[str] | None = None
+    for method in methods:
+        method_sigs = sigs_by_method[method]
+        repeats = method_sigs if isinstance(method_sigs, (list, tuple)) else [method_sigs]
+        if not repeats:
+            raise ValueError(f"No split-half signatures supplied for method {method!r}")
+        repeats_by_method[method] = repeats
+        for sigs in repeats:
+            units = set(sigs)
+            common_units = units if common_units is None else common_units.intersection(units)
+    if not common_units:
+        raise ValueError("No units are shared by every method and repeat")
+
+    def rho_sort_key(unit):
+        values = [
+            sigs[unit]["rho"]
+            for method in methods
+            for sigs in repeats_by_method[method]
+        ]
+        finite = [value for value in values if np.isfinite(value)]
+        return (float(np.mean(finite)) if finite else np.inf, unit)
+
+    return repeats_by_method, sorted(common_units, key=rho_sort_key)
+
+
+def _filter_signatures_to_shared_units(sigs_by_method: dict, methods: list[str]):
+    """Preserve input shape while removing units absent from any method/repeat."""
+    repeats_by_method, units = _shared_unit_order(sigs_by_method, methods)
+    filtered = {}
+    for method in methods:
+        original = sigs_by_method[method]
+        repeats = [
+            {unit: sigs[unit] for unit in units}
+            for sigs in repeats_by_method[method]
+        ]
+        filtered[method] = repeats if isinstance(original, (list, tuple)) else repeats[0]
+    return filtered
+
+
 def layer3_corr_matrix(sigs_by_method, out_png, cfg, genes, *, methods,
                        title_prefix="Test-1", unit="perturbation",
                        gene_set_label: str = "union DE genes"):
@@ -471,36 +757,23 @@ def layer3_corr_matrix(sigs_by_method, out_png, cfg, genes, *, methods,
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    repeats_by_method, perts = _shared_unit_order(sigs_by_method, methods)
+    n = len(perts)
     fig, axes = plt.subplots(1, len(methods), figsize=(6.8 * len(methods), 6.4), squeeze=False)
     im = None
     repeat_counts = []
     matrix_archive = {
         "methods": np.asarray(methods, dtype=str),
         "gene_set_label": np.asarray(gene_set_label, dtype=str),
+        "targets": np.asarray(perts, dtype=str),
     }
     if not isinstance(genes, dict):
         matrix_archive["features"] = np.asarray(genes, dtype=str)
     for ax, m in zip(axes[0], methods):
         method_genes = genes[m] if isinstance(genes, dict) else genes
         matrix_archive[f"features__{m}"] = np.asarray(method_genes, dtype=str)
-        method_sigs = sigs_by_method[m]
-        repeat_sigs = method_sigs if isinstance(method_sigs, (list, tuple)) else [method_sigs]
-        if not repeat_sigs:
-            raise ValueError(f"No split-half signatures supplied for method {m!r}")
+        repeat_sigs = repeats_by_method[m]
         repeat_counts.append(len(repeat_sigs))
-        common_perts = set(repeat_sigs[0])
-        for sigs in repeat_sigs[1:]:
-            common_perts.intersection_update(sigs)
-        if not common_perts:
-            raise ValueError(f"No perturbations shared by all repeats for method {m!r}")
-        mean_rho = {
-            p: float(np.nanmean([sigs[p]["rho"] for sigs in repeat_sigs]))
-            for p in common_perts
-        }
-        perts = sorted(common_perts, key=lambda p: (
-            np.inf if not np.isfinite(mean_rho[p]) else mean_rho[p]
-        ))
-        n = len(perts)
         repeat_spearman = []
         repeat_pearson = []
         for sigs in repeat_sigs:
@@ -751,7 +1024,6 @@ def main():
     inference_has_run = False
     for m in methods_order:
         repeat_results = []
-        rho_rows = []
         all_tasks = [(repeat, a.seed + repeat) for repeat in range(a.n_repeats)]
         cache_path = (
             _signature_cache_path(a.signature_cache_dir, m, ds)
@@ -759,7 +1031,7 @@ def main():
         )
         if a.resume_signatures and cache_path and os.path.exists(cache_path):
             cached_repeats = _read_signature_cache(
-                cache_path, method=m, dataset=ds, args=a
+                cache_path, method=m, dataset=ds, args=a, counts_layer=counts_layer
             )
             repeat_results = sorted(cached_repeats.items())
             print(
@@ -791,7 +1063,8 @@ def main():
                 )))
                 if cache_path:
                     _write_signature_cache(
-                        cache_path, dict(repeat_results), method=m, dataset=ds, args=a
+                        cache_path, dict(repeat_results), method=m, dataset=ds, args=a,
+                        counts_layer=counts_layer
                     )
                     print(f"checkpointed {m} repeat {repeat}: {cache_path}")
             inference_has_run = True
@@ -820,7 +1093,7 @@ def main():
                             if cache_path:
                                 _write_signature_cache(
                                     cache_path, dict(repeat_results), method=m,
-                                    dataset=ds, args=a
+                                    dataset=ds, args=a, counts_layer=counts_layer
                                 )
                                 print(
                                     f"checkpointed {m} repeat {item[0]}: {cache_path}"
@@ -848,7 +1121,7 @@ def main():
                     if cache_path:
                         _write_signature_cache(
                             cache_path, dict(repeat_results), method=m,
-                            dataset=ds, args=a
+                            dataset=ds, args=a, counts_layer=counts_layer
                         )
             inference_has_run = True
         repeat_results.sort(key=lambda x: x[0])
@@ -865,25 +1138,21 @@ def main():
         repeats = [sigs for _, sigs in repeat_results]
         if cache_path:
             _write_signature_cache(
-                cache_path, dict(repeat_results), method=m, dataset=ds, args=a
+                cache_path, dict(repeat_results), method=m, dataset=ds, args=a,
+                counts_layer=counts_layer
             )
             print(f"saved complete signature checkpoint: {cache_path}")
-        for repeat, sigs in repeat_results:
-            repeat_seed = a.seed + repeat
-            rho_rows.extend({"repeat": repeat, "seed": repeat_seed,
-                             "perturbation": p, "rho": d["rho"],
-                             "n_cells": d.get("n_cells")}
-                            for p, d in sigs.items())
         repeat_sigs_by_method[m] = repeats
         display_sigs_by_method[m] = repeats[0]
-        # Layer 1/2 remain an explicitly labelled single-split diagnostic. FDRs
-        # are not averaged because their arithmetic mean is not a defined DEG call.
-        p1 = os.path.join(plots_dir, f"test1_heatmap_{m}__{ds}.png")
-        layer1_heatmap(repeats[0], p1, cfg_for(m), max_genes=a.max_genes,
-                       title_prefix=f"Test-1 repeat 0 of {a.n_repeats}")
-        print("Layer 1 heatmap:", os.path.abspath(p1))
-        pl.DataFrame(rho_rows).sort(["repeat", "rho"]).write_csv(
-            os.path.join(a.outdir, f"test1_rho_{m}__{ds}.csv"))
+
+    # Remove method-only/repeat-only units before they can nominate DE genes,
+    # constrain the complete-case panel, or contribute headline rho values.
+    repeat_sigs_by_method = _filter_signatures_to_shared_units(
+        repeat_sigs_by_method, methods,
+    )
+    display_sigs_by_method = {
+        method: repeats[0] for method, repeats in repeat_sigs_by_method.items()
+    }
 
     # Select the shared correlation gene set from every method and repeat.
     flattened_sigs = {
@@ -891,52 +1160,101 @@ def main():
         for m, repeats in repeat_sigs_by_method.items()
         for repeat, sigs in enumerate(repeats)
     }
-    genes = _union_de_genes_multi(flattened_sigs, cfg_for(methods[0]), a.max_genes)
+    ranked_de = _union_de_genes_ranked(flattened_sigs, cfg_for(methods[0]))
+    genes_all = _all_shared_genes(flattened_sigs)
+    _set_shared_panel_rhos(flattened_sigs, genes_all)
+    diag = _gene_set_diagnostics(flattened_sigs, cfg_for(methods[0]))
+
+    # Headline rho values, their CSVs, and zoom titles all use the same global
+    # complete-case panel across every method, perturbation, split, and repeat.
+    # Layer 1/2 remain explicitly labelled repeat-0 diagnostics; FDRs are not
+    # averaged because their arithmetic mean is not a defined DEG call.
+    for m in methods_order:
+        repeats = repeat_sigs_by_method[m]
+        rho_rows = [
+            {"repeat": repeat, "seed": a.seed + repeat,
+             "perturbation": p, "rho": d["rho"],
+             "rho_n_genes": d.get("rho_n_genes"), "n_cells": d.get("n_cells")}
+            for repeat, sigs in enumerate(repeats)
+            for p, d in sigs.items()
+        ]
+        p1 = os.path.join(plots_dir, f"test1_heatmap_{m}__{ds}.png")
+        layer1_heatmap(repeats[0], p1, cfg_for(m), max_genes=a.max_genes,
+                       title_prefix=f"Test-1 repeat 0 of {a.n_repeats}")
+        print("Layer 1 heatmap:", os.path.abspath(p1))
+        pl.DataFrame(rho_rows).sort(["repeat", "rho"]).write_csv(
+            os.path.join(a.outdir, f"test1_rho_{m}__{ds}.csv"))
+
+    # Layer-2 zoom uses the capped union-DE set (heatmap column readability).
+    genes_zoom = _union_de_genes_multi(flattened_sigs, cfg_for(methods[0]), a.max_genes)
 
     # Layer-2 zoom: repeat 0 only, labelled as such; one row per method.
-    outs = layer2_zoom_compare(display_sigs_by_method,
-                               os.path.join(plots_dir, f"test1_zoom__{ds}.png"),
-                               cfg_for(methods[0]), genes, methods=methods,
-                               per_page=a.zoom_per_page,
-                               title_prefix=f"Test-1 repeat 0 of {a.n_repeats}")
-    print(f"\nLayer 2 zoom: {len(outs)} PNG(s) — one row per method ({', '.join(methods)}) per perturbation")
+    if genes_zoom:
+        outs = layer2_zoom_compare(display_sigs_by_method,
+                                   os.path.join(plots_dir, f"test1_zoom__{ds}.png"),
+                                   cfg_for(methods[0]), genes_zoom, methods=methods,
+                                   per_page=a.zoom_per_page,
+                                   title_prefix=f"Test-1 repeat 0 of {a.n_repeats}",
+                                   rho_genes=genes_all)
+        print(f"\nLayer 2 zoom: {len(outs)} PNG(s) — one row per method "
+              f"({', '.join(methods)}) per perturbation")
+    else:
+        print("\nLayer 2 zoom: skipped (shared CPM-eligible union-DE panel is empty)")
 
     # A cache-building one-method invocation must not overwrite the canonical
     # combined matrix: its DE-gene union is method-specific and therefore not
     # directly comparable with the final shared union.
     matrix_method_suffix = "" if len(methods) > 1 else f"_{methods[0]}"
 
-    # Canonical and only Layer-3a DE comparison: nominate genes from either
-    # backend, require complete finite effects in both, and evaluate both
-    # methods on the exact same fixed panel. Do not emit method-specific
-    # "best within method" DE matrices because they are not head-to-head
-    # comparisons and can be dominated by different feature selection.
-    p3 = os.path.join(
-        plots_dir, f"test1_corr_matrix{matrix_method_suffix}__{ds}.png"
-    )
-    de_label = (
-        f"shared cross-method DE union (n={len(genes)})"
-        if len(methods) > 1 else f"union DE genes (n={len(genes)})"
-    )
-    layer3_corr_matrix(
-        repeat_sigs_by_method,
-        p3,
-        cfg_for(methods[0]),
-        genes,
-        methods=methods,
-        gene_set_label=de_label,
-    )
-    print("Layer 3a canonical DE comparison:", os.path.abspath(p3))
+    # Both gene sets require complete finite lfc_a/lfc_b in ALL methods × ALL
+    # perturbations × ALL repeats, so pdex and pydeseq2 are evaluated on the
+    # exact same feature panel in each plot.
+    #
+    # Compute the full ranked union-DE set once: G = union of genes called DE by any
+    # method × perturbation × split, intersected with the complete-case set, ranked by
+    # cross-method cross-split LFC variance (method-neutral — does not use FDR from either
+    # method alone). Callers slice this list for sensitivity caps.
+    def _emit_layer3(genes, suffix, label):
+        p = os.path.join(plots_dir, f"test1_corr_matrix{suffix}{matrix_method_suffix}__{ds}.png")
+        layer3_corr_matrix(repeat_sigs_by_method, p, cfg_for(methods[0]), genes,
+                           methods=methods, gene_set_label=label)
+        print(f"Layer 3 {suffix or 'primary'}: {os.path.abspath(p)}")
 
-    # Layer-3b: the only all-gene comparison uses one complete-case panel
-    # shared by every method, perturbation, split, and repeat.
-    genes_all = _all_shared_genes(flattened_sigs)
+    # Layer-3a — Union-DE genes, PRIMARY: all union-DE complete-case genes, no cap.
+    if len(ranked_de) < 5:
+        print(f"Layer 3 primary union-DE: skipped (only {len(ranked_de)} genes in complete-case union)")
+    else:
+        de_label_full = (
+            f"union-DE genes — called by ≥1 method in ≥1 perturbation "
+            f"(n={len(ranked_de)}; {diag['de_sfx']})"
+            if len(methods) > 1 else
+            f"union DE genes (n={len(ranked_de)}; {diag['de_sfx']})"
+        )
+        _emit_layer3(ranked_de, "", de_label_full)
+
+    # Layer-3a sensitivity: caps at 400 / 2000 / 4000 (ranked by cross-method LFC variance).
+    # Skip a cap when it equals or exceeds the full set (would be identical to the primary).
+    for cap in (400, 2000, 4000):
+        if cap >= len(ranked_de):
+            print(f"Layer 3 sensitivity cap={cap}: skipped (cap ≥ full union-DE n={len(ranked_de)})")
+            continue
+        capped = ranked_de[:cap]
+        if len(capped) < 5:
+            print(f"Layer 3 sensitivity cap={cap}: skipped (only {len(capped)} genes available)")
+            continue
+        _emit_layer3(capped, f"_top{cap}",
+                     f"union-DE genes — top {cap} by cross-method LFC variance "
+                     f"(n={len(capped)}; {diag['de_sfx']})")
+
+    # Layer-3b — All eligible genes: unbiased overall LFC agreement, complete-case
+    # across every method, perturbation, split, and repeat (no FDR/LFC filter).
     p3b = os.path.join(
         plots_dir, f"test1_corr_matrix_all_genes{matrix_method_suffix}__{ds}.png"
     )
     layer3_corr_matrix(repeat_sigs_by_method, p3b, cfg_for(methods[0]), genes_all, methods=methods,
-                       gene_set_label=f"all genes shared across methods (n={len(genes_all)})")
-    print("Layer 3b canonical all-gene comparison:", os.path.abspath(p3b))
+                       gene_set_label=f"all eligible genes — complete-case, no FDR filter "
+                                      f"(n={len(genes_all)}; {diag['all_sfx']})")
+    print("Layer 3b all-eligible comparison:", os.path.abspath(p3b))
 
 
 if __name__ == "__main__":

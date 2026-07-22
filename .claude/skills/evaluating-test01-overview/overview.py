@@ -33,6 +33,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 from cell_eval._de_backends import build_de_frame  # noqa: E402
 
 log = logging.getLogger("overview")
+OVERVIEW_CACHE_VERSION = 2
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -58,28 +59,48 @@ def _make_norm_copy(adata: ad.AnnData) -> ad.AnnData:
     return a
 
 
-def _pdex_expr_filter_multi(de_frame: pl.DataFrame, adata: ad.AnnData,
-                            groupby: str, ctrl_label: str, *, min_cpm: float = 5.0) -> pl.DataFrame:
-    """Per-perturbation pdex expression filter: remove genes with mean CPM < min_cpm in
-    BOTH the perturbation's cells AND the control cells.
-    adata.X must be log1p-normalized; expm1 recovers the pre-log values."""
+def _cpm_filter_multi(de_frame: pl.DataFrame, adata: ad.AnnData,
+                      groupby: str, ctrl_label: str, cfg: dict,
+                      *, min_cpm: float = 5.0) -> pl.DataFrame:
+    """Per-perturbation CPM eligibility filter applied identically to both pdex and pyDESeq2.
+
+    Removes genes with mean CPM < min_cpm in BOTH the perturbation's cells AND control cells.
+    Uses raw counts from cfg['counts_layer'] when available; auto-detects log-normalised X
+    (non-integer values) and applies expm1; otherwise uses X directly as raw counts.
+    """
     obs_g = adata.obs[groupby].astype(str).to_numpy()
-    X = adata.X
-    if not sp.issparse(X):
-        X = sp.csr_matrix(X)
-    X = X.tocsr()
+    counts_layer = cfg.get("counts_layer")
+    if counts_layer and counts_layer in adata.layers:
+        X = adata.layers[counts_layer]
+        if not sp.issparse(X):
+            X = sp.csr_matrix(X)
+        X = X.tocsr()
+    else:
+        X = adata.X
+        if not sp.issparse(X):
+            X = sp.csr_matrix(X)
+        X = X.tocsr()
+        sample = X.data[:min(5_000, X.data.size)] if X.data.size > 0 else np.array([0.0])
+        if not np.allclose(sample, np.rint(sample)):
+            X = X.copy()
+            X.data = np.expm1(X.data)
     var_names = list(adata.var_names)
 
+    def mean_cpm(idx: np.ndarray) -> np.ndarray:
+        group = X[idx, :]
+        library_sizes = np.asarray(group.sum(axis=1)).ravel().astype(float)
+        scales = np.divide(
+            1e6, library_sizes, out=np.zeros_like(library_sizes),
+            where=library_sizes > 0,
+        )
+        return np.asarray(group.multiply(scales[:, None]).mean(axis=0)).ravel()
+
     ctrl_idx = np.where(obs_g == ctrl_label)[0]
-    Xc = X[ctrl_idx, :].copy(); Xc.data = np.expm1(Xc.data)
-    # median_lib: after normalize_total each cell sums to median library size
-    median_lib = float(np.asarray(Xc.sum(axis=1)).mean())
-    min_norm = min_cpm / 1e6 * median_lib  # convert CPM threshold to normalized-count units
-    m_ctrl = np.asarray(Xc.mean(axis=0)).ravel()
+    m_ctrl = mean_cpm(ctrl_idx)
 
     targets = de_frame["target"].unique().to_list() if "target" in de_frame.columns else []
     if not targets:
-        ctrl_pass = {g for g, mc in zip(var_names, m_ctrl) if mc >= min_norm}
+        ctrl_pass = {g for g, mc in zip(var_names, m_ctrl) if mc >= min_cpm}
         return de_frame.filter(pl.col("feature").is_in(ctrl_pass))
 
     pass_pairs: set[tuple[str, str]] = set()
@@ -87,10 +108,9 @@ def _pdex_expr_filter_multi(de_frame: pl.DataFrame, adata: ad.AnnData,
         tidx = np.where(obs_g == str(tgt))[0]
         if len(tidx) == 0:
             continue
-        Xp = X[tidx, :].copy(); Xp.data = np.expm1(Xp.data)
-        m_pert = np.asarray(Xp.mean(axis=0)).ravel()
+        m_pert = mean_cpm(tidx)
         for g, mc, mp in zip(var_names, m_ctrl, m_pert):
-            if mc >= min_norm or mp >= min_norm:
+            if mc >= min_cpm or mp >= min_cpm:
                 pass_pairs.add((str(tgt), g))
 
     keep_mask = pl.Series([
@@ -355,23 +375,56 @@ def _plot_scatter(
 # correlation matrix (perturbation × perturbation signature similarity)
 # ---------------------------------------------------------------------------
 
-def _union_de_genes(de_by: dict, fdr_t: float, lfc_t: float, max_genes: int) -> list[str]:
-    """Genes DE (FDR<fdr_t & |LFC|>=lfc_t) in any perturbation of any backend, capped to the
-    ``max_genes`` most variable (cross-perturbation LFC variance in the first backend)."""
+def _complete_case_genes_ov(de_by: dict, perts: list[str]) -> set[str]:
+    """Genes with finite LFC in EVERY method × perturbation combination."""
+    common: set[str] | None = None
+    for de in de_by.values():
+        sub = (de.filter(pl.col("target").is_in(perts) & pl.col("log2_fold_change").is_finite())
+                 .group_by("feature")
+                 .agg(pl.col("target").n_unique().alias("n_perts")))
+        full = set(sub.filter(pl.col("n_perts") >= len(perts))["feature"].to_list())
+        common = full if common is None else common.intersection(full)
+    return common or set()
+
+
+def _union_de_genes_ranked_ov(de_by: dict, fdr_t: float, lfc_t: float,
+                               perts: list[str]) -> list[str]:
+    """All union-DE complete-case genes ranked by cross-method LFC variance (desc).
+
+    Union membership: gene DE (FDR+LFC thresholds) in any method × perturbation.
+    Complete-case: gene has finite LFC in EVERY method × perturbation (both panels use
+    identical columns — the per-method NaN-drop in _build_lfc_matrix becomes a no-op).
+    Ranking: LFC variance pooled across ALL methods × perturbations — symmetric across
+    methods. Note: union membership itself depends on both methods' FDR calling.
+    Returns the full ranked list; callers slice [:n] for any cap size.
+    """
     union: set[str] = set()
     for de in de_by.values():
         sig = de.filter((pl.col("fdr") <= fdr_t) & (pl.col("log2_fold_change").abs() >= lfc_t))
         union.update(sig["feature"].to_list())
-    genes = sorted(union)
-    de0 = next(iter(de_by.values()))
-    v = (de0.filter(pl.col("feature").is_in(genes))
-         .group_by("feature").agg(pl.col("log2_fold_change").var().alias("v")))
-    vmap = dict(zip(v["feature"].to_list(), v["v"].to_list()))
-    return sorted(genes, key=lambda g: -(vmap.get(g) or 0.0))[:max_genes]
+    union.intersection_update(_complete_case_genes_ov(de_by, perts))
+    if not union:
+        return []
+    gene_set = union
+    var_df = (pl.concat([
+                  de.filter(pl.col("feature").is_in(gene_set) &
+                            pl.col("log2_fold_change").is_finite())
+                    .select(["feature", "log2_fold_change"])
+                  for de in de_by.values()
+              ])
+              .group_by("feature")
+              .agg(pl.col("log2_fold_change").var().alias("v")))
+    vmap = dict(zip(var_df["feature"].to_list(), var_df["v"].to_list()))
+    return sorted(union, key=lambda g: -(vmap.get(g) or 0.0))
 
 
 def _build_lfc_matrix(de: pl.DataFrame, perts: list[str], genes: list[str]) -> np.ndarray:
-    """Build a (n_perts × n_genes) LFC matrix; columns with any NaN are dropped."""
+    """Build a (n_perts × n_genes) LFC matrix.
+
+    When genes are pre-filtered to the complete-case set (via _union_de_genes_ranked_ov),
+    all columns are finite and the keep-mask is a no-op. The mask is retained as a safety
+    net so that any residual NaN silently drops rather than propagates into corrcoef.
+    """
     gi = {g: i for i, g in enumerate(genes)}
     M = np.full((len(perts), len(genes)), np.nan)
     for r, p in enumerate(perts):
@@ -398,10 +451,20 @@ def _pert_corr_pearson(de: pl.DataFrame, perts: list[str], genes: list[str]) -> 
 
 
 def _plot_corr_matrices(de_by: dict, cfg: dict, out_png: str,
-                        corr_fn, metric_label: str) -> str:
+                        corr_fn, metric_label: str,
+                        genes: list[str],
+                        gene_set_label: str = "") -> str | None:
+    """Plot perturbation × perturbation correlation matrices, one panel per backend.
+
+    Both backends use exactly the ``genes`` list — caller is responsible for supplying
+    a complete-case list (finite LFC in every method × perturbation) so both panels
+    are feature-comparable.
+    """
+    if len(genes) < 5:
+        log.warning("Correlation matrix %s skipped: only %d genes", out_png, len(genes))
+        return None
     fdr_t, lfc_t, ctrl = cfg["fdr_threshold"], cfg["lfc_threshold"], cfg["control_pert"]
     methods = [m for m in ("pdex", "pydeseq2") if m in de_by]
-    genes = _union_de_genes(de_by, fdr_t, lfc_t, cfg.get("corr_max_genes", 400))
     common = set.intersection(*[set(de["target"].unique().to_list()) for de in de_by.values()])
     perts = [p for p in common if p != ctrl]
     nsig = _count_sig(de_by.get("pydeseq2", de_by[methods[0]]), fdr_t, lfc_t)
@@ -423,23 +486,14 @@ def _plot_corr_matrices(de_by: dict, cfg: dict, out_png: str,
             f"off-diagonal r = {np.nanmean(off):.2f}",
             fontsize=10,
         )
+    glabel = gene_set_label or f"{len(genes)} genes"
     fig.colorbar(im, ax=axes[0].tolist(), fraction=0.025, pad=0.02,
-                 label=f"{metric_label} over {len(genes)} union DE genes")
+                 label=f"{metric_label} over {glabel}")
     fig.suptitle("Perturbation × perturbation signature correlation — diagonal = self (1); "
                  "off-diagonal = cross-perturbation similarity (dim = more specific)", fontsize=11)
     fig.savefig(out_png, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return out_png
-
-
-def plot_correlation_matrices(de_by: dict, cfg: dict, out_png: str) -> str:
-    """Perturbation × perturbation Spearman-LFC correlation."""
-    return _plot_corr_matrices(de_by, cfg, out_png, _pert_corr, "Spearman(LFC)")
-
-
-def plot_correlation_matrices_pearson(de_by: dict, cfg: dict, out_png: str) -> str:
-    """Perturbation × perturbation Pearson-LFC correlation."""
-    return _plot_corr_matrices(de_by, cfg, out_png, _pert_corr_pearson, "Pearson(LFC)")
 
 
 # ---------------------------------------------------------------------------
@@ -468,21 +522,54 @@ def main() -> None:
 
     ds = os.path.splitext(os.path.basename(cfg["adata_path"]))[0]  # dataset tag on every output file
     pyd_full_path    = os.path.join(tables_dir, f"overview_pydeseq2_full__{ds}.csv")
+    pyd_raw_path     = os.path.join(tables_dir, f"overview_pydeseq2_raw_full__{ds}.csv")
     pdx_full_path    = os.path.join(tables_dir, f"overview_pdex_full__{ds}.csv")
     pdx_raw_path     = os.path.join(tables_dir, f"overview_pdex_raw_full__{ds}.csv")
     cell_counts_path = os.path.join(tables_dir, f"overview_cell_counts__{ds}.csv")
+    cache_meta_path  = os.path.join(tables_dir, f"overview_cache_meta__{ds}.yaml")
+    expected_meta = {
+        "format_version": OVERVIEW_CACHE_VERSION,
+        "cpm_normalization": "per_cell_then_mean",
+        "min_cpm": 5.0,
+        "pert_col": cfg["pert_col"],
+        "control_pert": cfg["control_pert"],
+        "counts_layer": cfg.get("counts_layer"),
+    }
 
     # ------------------------------------------------------------------ #
     # Full-data DE
     # ------------------------------------------------------------------ #
+    de_pyd_raw: pl.DataFrame | None = None
     de_pdx_raw: pl.DataFrame | None = None  # unfiltered pdex (for MA plot grey dots)
 
     if args.plot_only:
         log.info("--plot-only: loading cached DE tables")
+        required_cache_paths = [
+            pyd_full_path, pyd_raw_path, pdx_full_path, pdx_raw_path,
+            cell_counts_path, cache_meta_path,
+        ]
+        missing = [path for path in required_cache_paths if not os.path.exists(path)]
+        if missing:
+            raise ValueError(
+                "--plot-only requires a complete versioned Overview cache; missing "
+                f"{missing}. Rerun without --plot-only to rebuild all DE tables."
+            )
+        with open(cache_meta_path) as fh:
+            cache_meta = yaml.safe_load(fh) or {}
+        mismatches = {
+            key: (cache_meta.get(key), value)
+            for key, value in expected_meta.items()
+            if cache_meta.get(key) != value
+        }
+        if mismatches:
+            raise ValueError(
+                f"Stale or unsupported Overview cache metadata in {cache_meta_path}: "
+                f"{mismatches}. Rerun without --plot-only to rebuild both backends."
+            )
         de_pyd = pl.read_csv(pyd_full_path)
         de_pdx = pl.read_csv(pdx_full_path)
-        if os.path.exists(pdx_raw_path):
-            de_pdx_raw = pl.read_csv(pdx_raw_path)
+        de_pyd_raw = pl.read_csv(pyd_raw_path)
+        de_pdx_raw = pl.read_csv(pdx_raw_path)
         cc_df  = pl.read_csv(cell_counts_path)
         cell_counts = dict(zip(cc_df["perturbation"].to_list(), cc_df["n_cells"].to_list()))
     else:
@@ -501,18 +588,23 @@ def main() -> None:
         adata_norm = _make_norm_copy(adata_raw)
 
         log.info("Running pydeseq2 (full data) …")
-        de_pyd = _run_de(adata_raw, cfg, "pydeseq2")
+        de_pyd_raw = _run_de(adata_raw, cfg, "pydeseq2")
+        de_pyd_raw.write_csv(pyd_raw_path)
+        log.info("Applying shared CPM filter to pydeseq2 …")
+        de_pyd = _cpm_filter_multi(de_pyd_raw, adata_raw, cfg["pert_col"], cfg["control_pert"], cfg)
         de_pyd.write_csv(pyd_full_path)
-        log.info("  saved → %s", pyd_full_path)
+        log.info("  saved → %s  (raw → %s)", pyd_full_path, pyd_raw_path)
 
-        log.info("Running pdex (full data, unfiltered) …")
+        log.info("Running pdex (full data) …")
         de_pdx_raw = _run_de(adata_norm, cfg, "pdex")
         de_pdx_raw.write_csv(pdx_raw_path)
-
-        log.info("Applying expression filter to pdex …")
-        de_pdx = _pdex_expr_filter_multi(de_pdx_raw, adata_norm, cfg["pert_col"], cfg["control_pert"])
+        log.info("Applying shared CPM filter to pdex …")
+        de_pdx = _cpm_filter_multi(de_pdx_raw, adata_raw, cfg["pert_col"], cfg["control_pert"], cfg)
         de_pdx.write_csv(pdx_full_path)
         log.info("  saved → %s  (raw → %s)", pdx_full_path, pdx_raw_path)
+        with open(cache_meta_path, "w") as fh:
+            yaml.safe_dump(expected_meta, fh, sort_keys=True)
+        log.info("  saved cache metadata → %s", cache_meta_path)
 
     # ------------------------------------------------------------------ #
     # Count significant genes per perturbation
@@ -550,13 +642,56 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     # Correlation matrices (perturbation × perturbation, one panel per backend)
     # ------------------------------------------------------------------ #
-    corr_path = os.path.join(plots_dir, f"test01_corr_matrix__{ds}.png")
-    plot_correlation_matrices({"pdex": de_pdx, "pydeseq2": de_pyd}, cfg, corr_path)
-    log.info("Saved → %s", corr_path)
+    # Gene selection: union-DE complete-case, ranked by cross-method LFC variance.
+    # Both backends (pdex, pydeseq2) use the SAME gene list in every plot so their
+    # correlation coefficients are feature-comparable.
+    # Union membership depends on both methods' FDR; ranking is symmetric (pooled).
+    de_by = {"pdex": de_pdx, "pydeseq2": de_pyd}
+    common_perts = set.intersection(*[set(de["target"].unique().to_list()) for de in de_by.values()])
+    corr_perts = [p for p in common_perts if p != ctrl]
+    ranked_de_ov = _union_de_genes_ranked_ov(de_by, fdr_t, lfc_t, corr_perts)
+    log.info("Union-DE complete-case genes for correlation matrices: %d", len(ranked_de_ov))
+    # All-eligible: complete-case over raw (unfiltered) DE — any gene with finite LFC in
+    # all methods × perturbations, regardless of CPM eligibility or FDR significance.
+    de_by_raw = None
+    genes_all_ov: list[str] = []
+    if de_pdx_raw is not None and de_pyd_raw is not None:
+        de_by_raw = {"pdex": de_pdx_raw, "pydeseq2": de_pyd_raw}
+        genes_all_ov = sorted(_complete_case_genes_ov(de_by_raw, corr_perts))
+        log.info("All-eligible complete-case genes: %d", len(genes_all_ov))
 
-    pearson_path = os.path.join(plots_dir, f"test01_corr_matrix_pearson__{ds}.png")
-    plot_correlation_matrices_pearson({"pdex": de_pdx, "pydeseq2": de_pyd}, cfg, pearson_path)
-    log.info("Saved → %s", pearson_path)
+    for corr_fn, metric_label, fstem in [
+        (_pert_corr,         "Spearman(LFC)", "corr_matrix"),
+        (_pert_corr_pearson, "Pearson(LFC)",  "corr_matrix_pearson"),
+    ]:
+        # Primary: uncapped complete union-DE
+        if len(ranked_de_ov) >= 5:
+            glabel = f"union-DE complete-case, no cap (n={len(ranked_de_ov)})"
+            p = os.path.join(plots_dir, f"test01_{fstem}__{ds}.png")
+            _plot_corr_matrices(de_by, cfg, p, corr_fn, metric_label, ranked_de_ov,
+                                gene_set_label=glabel)
+            log.info("Saved → %s", p)
+        # Sensitivity caps: 400 / 2000 / 4000, ranked by cross-method LFC variance.
+        # Skip when cap ≥ full set (would duplicate the primary).
+        for cap in (400, 2000, 4000):
+            if cap >= len(ranked_de_ov):
+                log.info("Sensitivity cap=%d skipped (cap ≥ full union-DE n=%d)", cap, len(ranked_de_ov))
+                continue
+            capped = ranked_de_ov[:cap]
+            if len(capped) < 5:
+                continue
+            glabel = f"union-DE top-{cap} by cross-method LFC variance (n={len(capped)})"
+            p = os.path.join(plots_dir, f"test01_{fstem}_top{cap}__{ds}.png")
+            _plot_corr_matrices(de_by, cfg, p, corr_fn, metric_label, capped,
+                                gene_set_label=glabel)
+            log.info("Saved sensitivity cap=%d → %s", cap, p)
+        # All-eligible reference matrix: unfiltered DE, no CPM or FDR gate
+        if de_by_raw is not None and len(genes_all_ov) >= 5:
+            glabel = f"all eligible genes — complete-case, no FDR filter (n={len(genes_all_ov)})"
+            p = os.path.join(plots_dir, f"test01_{fstem}_all_genes__{ds}.png")
+            _plot_corr_matrices(de_by_raw, cfg, p, corr_fn, metric_label, genes_all_ov,
+                                gene_set_label=glabel)
+            log.info("Saved all-eligible → %s", p)
 
     # ------------------------------------------------------------------ #
     # MA scatter: mean expression vs LFC for most / median / least cells

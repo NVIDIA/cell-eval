@@ -53,6 +53,37 @@ def _load_runner():
     return rt
 
 
+def _compute_cpm_elig_t5(adata, pos_P, pos_C, cfg, *, min_cpm=5.0):
+    """Return a set of gene names CPM-eligible (shared across DE backends, method-neutral)."""
+    import scipy.sparse as sp_local
+    counts_layer = cfg.get("counts_layer")
+    if counts_layer and counts_layer in adata.layers:
+        X = adata.layers[counts_layer]
+        if not sp_local.issparse(X):
+            X = sp_local.csr_matrix(X)
+        X = X.tocsr()
+    else:
+        X = adata.X
+        if not sp_local.issparse(X):
+            X = sp_local.csr_matrix(X)
+        X = X.tocsr()
+        sample = X.data[:min(5_000, X.data.size)] if X.data.size > 0 else np.array([0.0])
+        if not np.allclose(sample, np.rint(sample)):
+            X = X.copy(); X.data = np.expm1(X.data)
+    def mean_cpm(pos):
+        group = X[pos]
+        library_sizes = np.asarray(group.sum(axis=1)).ravel().astype(float)
+        scales = np.divide(
+            1e6, library_sizes, out=np.zeros_like(library_sizes),
+            where=library_sizes > 0,
+        )
+        return np.asarray(group.multiply(scales[:, None]).mean(axis=0)).ravel()
+
+    m_pert = mean_cpm(pos_P)
+    m_ctrl = mean_cpm(pos_C)
+    return set(adata.var_names[np.where((m_pert >= min_cpm) | (m_ctrl >= min_cpm))[0]])
+
+
 def guide_signatures(adata, cfg, rt, *, min_guides=2, max_genes=None, max_control=None, seed=0):
     """For each guide of a gene with ≥`min_guides` qualifying guides: DE = guide's cells vs control
     cells (full control), via the shared `_de_two`. Returns (sigs, gene_groups):
@@ -97,10 +128,13 @@ def guide_signatures(adata, cfg, rt, *, min_guides=2, max_genes=None, max_contro
             except Exception as e:  # noqa: BLE001
                 print(f"  {gene}.g{k}: DE failed ({e})"); continue
             lbl = f"{gene}.g{k}"  # compact, readable label; raw sgRNA id kept in 'guide'
+            genes_arr = de["feature"].to_numpy().astype(str)
+            elig = _compute_cpm_elig_t5(adata, pos_G, pos_C, cfg)
             sigs[lbl] = {"gene": gene, "guide": gu,
-                         "genes": de["feature"].to_numpy().astype(str),
+                         "genes": genes_arr,
                          "lfc": de["log2_fold_change"].to_numpy().astype(float),
                          "fdr": de["fdr"].to_numpy().astype(float),
+                         "cpm_elig": np.array([g in elig for g in genes_arr]),
                          "n_cells": int(pos_G.size)}
             kept.append(lbl)
             print(f"  {lbl:16s} {gu[:40]:40s} ({pos_G.size} cells)")
@@ -112,13 +146,23 @@ def guide_signatures(adata, cfg, rt, *, min_guides=2, max_genes=None, max_contro
     return sigs, gene_groups
 
 
+def _cpm_elig_mask_t5(signature: dict) -> np.ndarray:
+    """Return the required CPM mask for a guide signature."""
+    cpm_elig = signature.get("cpm_elig")
+    if cpm_elig is None or len(cpm_elig) != len(signature["genes"]):
+        raise ValueError("Guide signature is missing a valid cpm_elig mask; recompute it")
+    return np.asarray(cpm_elig, dtype=bool)
+
+
 def _union_de_genes(sigs, cfg, max_genes):
     """Union of genes DE (FDR<thr & |LFC|>thr) in ANY guide, capped to the `max_genes` most dynamic
-    (highest cross-guide variance of LFC), ordered by mean LFC (blue→red)."""
+    (highest cross-guide variance of LFC), ordered by mean LFC (blue→red). Single-method version
+    used for layer1 per-method heatmap column ordering."""
     fdr, lfc = cfg["fdr_threshold"], cfg["lfc_threshold"]
     union = set()
     for d in sigs.values():
         sig = (d["fdr"] <= fdr) & (np.abs(d["lfc"]) >= lfc)
+        sig &= _cpm_elig_mask_t5(d)
         union.update(d["genes"][sig])
     union = sorted(union)
     idx = {lbl: {g: i for i, g in enumerate(d["genes"])} for lbl, d in sigs.items()}
@@ -129,6 +173,46 @@ def _union_de_genes(sigs, cfg, max_genes):
         mean[g] = float(np.nanmean(vals)) if vals else 0.0
     top = sorted(union, key=lambda g: -var[g])[:max_genes]
     return sorted(top, key=lambda g: mean[g])
+
+
+def _genes_finite_all_t5(sigs_by_method: dict) -> set[str]:
+    """Genes with finite LFC in EVERY method × guide combination (complete-case for layer3)."""
+    common: set[str] | None = None
+    for sigs in sigs_by_method.values():
+        for d in sigs.values():
+            finite = set(d["genes"][np.isfinite(d["lfc"])])
+            common = finite if common is None else common.intersection(finite)
+    return common or set()
+
+
+def _union_de_genes_ranked_t5(sigs_by_method: dict, cfg: dict) -> list[str]:
+    """All union-DE complete-case genes ranked by cross-method LFC variance (desc).
+
+    G = union of genes called DE (FDR+LFC) in any method × guide, intersected with the
+    complete-case set (finite LFC in EVERY method × guide). Ranking is symmetric: LFC
+    pooled across all methods × guides. Union membership depends on both methods' FDR.
+    Returns full ranked list; callers slice [:n] for any cap size.
+    """
+    fdr, lfc = cfg["fdr_threshold"], cfg["lfc_threshold"]
+    union = set()
+    for sigs in sigs_by_method.values():
+        for d in sigs.values():
+            sig = (d["fdr"] <= fdr) & (np.abs(d["lfc"]) >= lfc)
+            sig &= _cpm_elig_mask_t5(d)
+            union.update(d["genes"][sig])
+    union.intersection_update(_genes_finite_all_t5(sigs_by_method))
+    union = sorted(union)
+    if not union:
+        return []
+    idx_by = {m: {lbl: {g: i for i, g in enumerate(d["genes"])} for lbl, d in sigs.items()}
+              for m, sigs in sigs_by_method.items()}
+    var = {}
+    for g in union:
+        vals = [sigs_by_method[m][lbl]["lfc"][idx_by[m][lbl][g]]
+                for m in sigs_by_method for lbl in sigs_by_method[m]
+                if g in idx_by[m][lbl]]
+        var[g] = float(np.nanvar(vals)) if vals else 0.0
+    return sorted(union, key=lambda g: -var[g])
 
 
 def _matrix(sigs, labels, genes):
@@ -144,6 +228,30 @@ def _matrix(sigs, labels, genes):
 
 def _ordered_labels(gene_groups):
     return [lbl for _, guides in gene_groups for lbl in guides]
+
+
+def _common_gene_groups_t5(sigs_by_method: dict, methods: list[str], *, min_guides: int = 2):
+    """One deterministic guide set/order shared by every backend panel."""
+    min_guides = max(2, int(min_guides))
+    common_labels = set.intersection(*(set(sigs_by_method[m]) for m in methods))
+    if not common_labels:
+        raise ValueError("No guides are shared by every requested method")
+    by_gene: dict[str, list[str]] = {}
+    for label in common_labels:
+        genes = {str(sigs_by_method[m][label]["gene"]) for m in methods}
+        if len(genes) != 1:
+            raise ValueError(f"Guide {label!r} has inconsistent target genes across methods: {genes}")
+        by_gene.setdefault(genes.pop(), []).append(label)
+    groups = [
+        (gene, sorted(by_gene[gene]))
+        for gene in sorted(by_gene)
+        if len(by_gene[gene]) >= min_guides
+    ]
+    if not groups:
+        raise ValueError(
+            f"No target genes have at least {min_guides} guides shared by every method"
+        )
+    return groups
 
 
 def _gene_boundaries(gene_groups):
@@ -189,29 +297,35 @@ def layer1_heatmap(sigs, gene_groups, out_png, cfg, method, *, max_genes=400):
 
 def _zoom_row(sc, hm, sigs, guides, genes, cfg, backend):
     """One backend row for a gene: LFC(guide_i) vs LFC(guide_j) scatter (first two guides) + a heatmap
-    strip with one row per guide of the gene (shared global gene order). Returns the heatmap handle."""
+    strip with one row per guide of the gene (shared global gene order). Returns the heatmap handle.
+    Rho is computed over the shared `genes` panel (finite in both guides) so pdex and pydeseq2 values
+    are feature-comparable rather than each using their own pairwise-finite intersection."""
     fdr, lfc = cfg["fdr_threshold"], cfg["lfc_threshold"]
     g1, g2 = guides[0], guides[1]
     d1, d2 = sigs[g1], sigs[g2]
-    # align g1,g2 on shared features for the scatter
-    common = np.intersect1d(d1["genes"], d2["genes"])
     i1 = {g: i for i, g in enumerate(d1["genes"])}
     i2 = {g: i for i, g in enumerate(d2["genes"])}
-    la = np.array([d1["lfc"][i1[g]] for g in common])
-    lb = np.array([d2["lfc"][i2[g]] for g in common])
-    fa = np.array([d1["fdr"][i1[g]] for g in common])
-    fb = np.array([d2["fdr"][i2[g]] for g in common])
-    sig = ((fa <= fdr) & (np.abs(la) >= lfc)) | ((fb <= fdr) & (np.abs(lb) >= lfc))
+    # Restrict to the shared gene panel (LFC = NaN for genes absent from a guide's DE output)
+    la = np.array([d1["lfc"][i1[g]] if g in i1 else np.nan for g in genes])
+    lb = np.array([d2["lfc"][i2[g]] if g in i2 else np.nan for g in genes])
+    fa = np.array([d1["fdr"][i1[g]] if g in i1 else np.nan for g in genes])
+    fb = np.array([d2["fdr"][i2[g]] if g in i2 else np.nan for g in genes])
+    cpm1 = _cpm_elig_mask_t5(d1)
+    cpm2 = _cpm_elig_mask_t5(d2)
+    ce1 = np.array([cpm1[i1[g]] if g in i1 else False for g in genes])
+    ce2 = np.array([cpm2[i2[g]] if g in i2 else False for g in genes])
+    sig = (ce1 & np.isfinite(fa) & (fa <= fdr) & (np.abs(la) >= lfc)) | \
+          (ce2 & np.isfinite(fb) & (fb <= fdr) & (np.abs(lb) >= lfc))
     ok = np.isfinite(la) & np.isfinite(lb)
     rho = float(stats.spearmanr(la[ok], lb[ok]).statistic) if ok.sum() >= 5 else float("nan")
-    # mean pairwise ρ across ALL guides of the gene
+    # mean pairwise ρ across ALL guides of the gene, over the shared panel
     pair_rhos = []
     for a in range(len(guides)):
         for b in range(a + 1, len(guides)):
             da, db = sigs[guides[a]], sigs[guides[b]]
-            c = np.intersect1d(da["genes"], db["genes"])
             ia = {g: k for k, g in enumerate(da["genes"])}; ib = {g: k for k, g in enumerate(db["genes"])}
-            xa = np.array([da["lfc"][ia[g]] for g in c]); xb = np.array([db["lfc"][ib[g]] for g in c])
+            xa = np.array([da["lfc"][ia[g]] if g in ia else np.nan for g in genes])
+            xb = np.array([db["lfc"][ib[g]] if g in ib else np.nan for g in genes])
             m = np.isfinite(xa) & np.isfinite(xb)
             if m.sum() >= 5:
                 pair_rhos.append(stats.spearmanr(xa[m], xb[m]).statistic)
@@ -241,6 +355,9 @@ def _zoom_row(sc, hm, sigs, guides, genes, cfg, backend):
 def layer2_zoom(sigs_by_method, gene_groups, out_png, cfg, genes, *, methods, per_page=1):
     """Per-gene zoom PNG(s): each gene (≥2 guides) contributes one row per backend (scatter of its first
     two guides + a heatmap strip with one row per guide). One gene per PNG by default."""
+    if len(genes) == 0:
+        return []
+
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -274,7 +391,8 @@ def layer2_zoom(sigs_by_method, gene_groups, out_png, cfg, genes, *, methods, pe
     return outs
 
 
-def layer3_corr_matrix(sigs_by_method, gene_groups, out_png, cfg, genes, *, methods):
+def layer3_corr_matrix(sigs_by_method, gene_groups, out_png, cfg, genes, *, methods,
+                       gene_set_label: str = "", min_guides: int = 2):
     """Guide × guide Spearman-LFC correlation per backend (one panel each), guides ordered by gene with
     gene-block separators. Within-gene blocks bright ⇒ guides of a gene agree; cross-gene off-diagonal
     bright ⇒ shared program / low specificity."""
@@ -282,13 +400,16 @@ def layer3_corr_matrix(sigs_by_method, gene_groups, out_png, cfg, genes, *, meth
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    # Ignore backend-specific group omissions and derive one paired axis directly
+    # from signatures present in every method.
+    gene_groups = _common_gene_groups_t5(
+        sigs_by_method, methods, min_guides=min_guides,
+    )
+    labels = _ordered_labels(gene_groups)
     fig, axes = plt.subplots(1, len(methods), figsize=(7.0 * len(methods), 6.8), squeeze=False)
     im = None
     for ax, m in zip(axes[0], methods):
         sigs = sigs_by_method[m]
-        groups = [(g, [lbl for lbl in guides if lbl in sigs]) for g, guides in gene_groups]
-        groups = [(g, gl) for g, gl in groups if len(gl) >= 1]
-        labels = _ordered_labels(groups)
         M = _matrix(sigs, labels, genes)
         n = len(labels)
         C = np.full((n, n), np.nan)
@@ -298,7 +419,7 @@ def layer3_corr_matrix(sigs_by_method, gene_groups, out_png, cfg, genes, *, meth
                 if ok.sum() >= 5:
                     C[i, j] = stats.spearmanr(M[i][ok], M[j][ok]).statistic
         im = ax.imshow(C, cmap="RdBu_r", vmin=-1, vmax=1, interpolation="nearest")
-        bounds, centers, names, _ = _gene_boundaries(groups)
+        bounds, centers, names, _ = _gene_boundaries(gene_groups)
         for b in bounds[1:]:
             ax.axhline(b - 0.5, color="k", lw=0.5); ax.axvline(b - 0.5, color="k", lw=0.5)
         ax.set_xticks(centers); ax.set_xticklabels(names, rotation=90, fontsize=5)
@@ -322,10 +443,13 @@ def layer3_corr_matrix(sigs_by_method, gene_groups, out_png, cfg, genes, *, meth
             f"within-gene off-diagonal ρ̄={wm:.2f}; cross-gene off-diagonal ρ̄={cm:.2f}",
             fontsize=9,
         )
-    fig.colorbar(im, ax=axes[0].tolist(), fraction=0.025, pad=0.02,
-                 label="Spearman(guide i, guide j) over union DE genes")
-    fig.suptitle("Test-5 guide × guide signature correlation — bright WITHIN-gene blocks = same-gene "
-                 "guides agree (on-target); bright cross-gene = shared program / low specificity", fontsize=11)
+    cbar_label = (f"Spearman(guide i, guide j) — {gene_set_label}"
+                  if gene_set_label else "Spearman(guide i, guide j) over shared gene panel")
+    fig.colorbar(im, ax=axes[0].tolist(), fraction=0.025, pad=0.02, label=cbar_label)
+    sup = "Test-5 guide × guide signature correlation — bright WITHIN-gene blocks = same-gene guides agree"
+    if gene_set_label:
+        sup += f"\n{gene_set_label}"
+    fig.suptitle(sup, fontsize=11)
     fig.savefig(out_png, dpi=140, bbox_inches="tight")
     plt.close(fig)
     return out_png
@@ -374,28 +498,71 @@ def main():
 
     plots_dir = os.path.join(a.outdir, "plots")
     os.makedirs(plots_dir, exist_ok=True)
-    sigs_by_method, groups_by_method = {}, {}
+    sigs_by_method = {}
     for m in order:
         print(f"\n=== {m} guide-level DE (min_guides={a.min_guides}) ===")
         sigs, gene_groups = guide_signatures(adata, cfg_for(m), rt, min_guides=a.min_guides,
                                              max_genes=a.max_genes, max_control=a.max_control, seed=a.seed)
         sigs_by_method[m] = sigs
-        groups_by_method[m] = gene_groups
         p1 = os.path.join(plots_dir, f"test5_guide_heatmap_{m}__{ds}.png")
         layer1_heatmap(sigs, gene_groups, p1, cfg_for(m), m, max_genes=a.max_de_genes)
         print("Layer 1 heatmap:", os.path.abspath(p1))
 
-    # shared gene ordering (union of guides across methods, grouped by gene) and gene column order
-    genes = _union_de_genes({**sigs_by_method[methods[0]]}, cfg_for(methods[0]), a.max_de_genes)
-    gene_groups = groups_by_method[methods[0]]
+    # Gene sets for cross-method comparison.
+    # ranked_de: union of genes called DE by any method × guide, intersected with the
+    # complete-case set (finite LFC in EVERY method × guide), ranked by cross-method LFC
+    # variance. Both methods use IDENTICAL genes in every layer3 plot.
+    # genes_zoom: capped shared complete-case union (for layer2 readability).
+    gene_groups = _common_gene_groups_t5(
+        sigs_by_method, methods, min_guides=a.min_guides,
+    )
+    common_labels = _ordered_labels(gene_groups)
+    shared_sigs_by_method = {
+        m: OrderedDict((label, sigs_by_method[m][label]) for label in common_labels)
+        for m in methods
+    }
+    ranked_de = _union_de_genes_ranked_t5(shared_sigs_by_method, cfg_for(methods[0]))
+    genes_all = sorted(_genes_finite_all_t5(shared_sigs_by_method))
+    genes_zoom = ranked_de[:a.max_de_genes]
+    print(f"\nGene sets: union-DE (uncapped) n={len(ranked_de)}, all-eligible n={len(genes_all)}")
 
-    outs = layer2_zoom(sigs_by_method, gene_groups, os.path.join(plots_dir, f"test5_zoom__{ds}.png"),
-                       cfg_for(methods[0]), genes, methods=methods, per_page=a.zoom_per_page)
-    print(f"\nLayer 2 zoom: {len(outs)} PNG(s) — one row per method per gene")
+    if genes_zoom:
+        outs = layer2_zoom(shared_sigs_by_method, gene_groups,
+                           os.path.join(plots_dir, f"test5_zoom__{ds}.png"),
+                           cfg_for(methods[0]), genes_zoom, methods=methods,
+                           per_page=a.zoom_per_page)
+        print(f"\nLayer 2 zoom: {len(outs)} PNG(s) — one row per method per gene")
+    else:
+        print("\nLayer 2 zoom: skipped (shared CPM-eligible union-DE panel is empty)")
 
-    p3 = os.path.join(plots_dir, f"test5_corr_matrix__{ds}.png")
-    layer3_corr_matrix(sigs_by_method, gene_groups, p3, cfg_for(methods[0]), genes, methods=methods)
-    print("Layer 3 correlation matrices:", os.path.abspath(p3))
+    def _emit_l3(genes, suffix, label):
+        p = os.path.join(plots_dir, f"test5_corr_matrix{suffix}__{ds}.png")
+        layer3_corr_matrix(shared_sigs_by_method, gene_groups, p, cfg_for(methods[0]), genes,
+                           methods=methods, gene_set_label=label, min_guides=a.min_guides)
+        print(f"Layer 3 {suffix or 'primary (union-DE)'}: {os.path.abspath(p)}")
+
+    # Primary: uncapped complete union-DE
+    if len(ranked_de) < 5:
+        print(f"Layer 3 primary union-DE: skipped (only {len(ranked_de)} genes)")
+    else:
+        _emit_l3(ranked_de, "", f"union-DE genes, no cap (n={len(ranked_de)})")
+
+    # Sensitivity caps at 400 / 2000 / 4000 (cross-method LFC variance ranking).
+    # Skip when cap ≥ full set (would duplicate the primary).
+    for cap in (400, 2000, 4000):
+        if cap >= len(ranked_de):
+            print(f"Layer 3 sensitivity cap={cap}: skipped (cap ≥ full union-DE n={len(ranked_de)})")
+            continue
+        capped = ranked_de[:cap]
+        if len(capped) < 5:
+            print(f"Layer 3 sensitivity cap={cap}: skipped")
+            continue
+        _emit_l3(capped, f"_top{cap}", f"union-DE top-{cap} by cross-method LFC variance (n={len(capped)})")
+
+    # All-eligible: complete-case genes, no DE filter — unbiased reference panel
+    if len(genes_all) >= 5:
+        _emit_l3(genes_all, "_all_genes",
+                 f"all eligible genes — complete-case, no FDR filter (n={len(genes_all)})")
 
 
 if __name__ == "__main__":

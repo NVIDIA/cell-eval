@@ -104,13 +104,17 @@ def guide_split_half_signatures(adata, cfg, rt, *, max_guides=None, max_control=
         la = j["log2_fold_change"].to_numpy().astype(float)
         lb = j["log2_fold_change_b"].to_numpy().astype(float)
         ok = np.isfinite(la) & np.isfinite(lb)
-        rho = float(stats.spearmanr(la[ok], lb[ok]).statistic) if ok.sum() >= 5 else float("nan")
-        out[lbl] = {"rho": rho, "genes": j["feature"].to_numpy().astype(str),
-                    "lfc_a": la, "lfc_b": lb,
+        rho_pairwise = (float(stats.spearmanr(la[ok], lb[ok]).statistic)
+                        if ok.sum() >= 5 else float("nan"))
+        genes = j["feature"].to_numpy().astype(str)
+        elig = t1._compute_cpm_elig(adata, pos_G, pos_C, cfg)
+        out[lbl] = {"rho": float("nan"), "rho_pairwise": rho_pairwise,
+                    "genes": genes, "lfc_a": la, "lfc_b": lb,
                     "fdr_a": j["fdr"].to_numpy().astype(float),
                     "fdr_b": j["fdr_b"].to_numpy().astype(float),
+                    "cpm_elig": np.array([g in elig for g in genes]),
                     "n_cells": int(ncell)}
-        print(f"  {lbl:16s} ρ={rho:.3f}  ({pos_G.size} cells)  {gu[:36]}")
+        print(f"  {lbl:16s} provisional-overlap ρ={rho_pairwise:.3f}  ({pos_G.size} cells)  {gu[:36]}")
     return out
 
 
@@ -161,24 +165,84 @@ def main():
         print(f"\n=== {m} within-guide split-half DE (seed={a.seed}) ===")
         sigs_by_method[m] = guide_split_half_signatures(adata, cfg_for(m), rt, max_guides=a.max_guides,
                                                         max_control=a.max_control, seed=a.seed)
+
+    # A guide must exist in every backend before it can nominate genes, constrain
+    # the complete-case feature panel, or receive a headline cross-method rho.
+    sigs_by_method = t1._filter_signatures_to_shared_units(sigs_by_method, methods)
+
+    # Compute gene sets: both use the same complete-case intersection so pdex and
+    # pydeseq2 are evaluated on the exact same feature panel in each plot.
+    #
+    # ranked_de: full union-DE set (genes called DE by ≥1 method × guide × split),
+    # ranked by cross-method cross-split LFC variance — method-neutral, no cap.
+    # Callers slice [:n] for sensitivity caps.
+    ranked_de = t1._union_de_genes_ranked(sigs_by_method, cfg_for(methods[0]))
+    genes_all = t1._all_shared_genes(sigs_by_method)
+    t1._set_shared_panel_rhos(sigs_by_method, genes_all)
+    # capped set for layer2 heatmap readability (sorted by mean LFC for display)
+    genes_zoom = t1._union_de_genes_multi(sigs_by_method, cfg_for(methods[0]), a.max_genes)
+    diag = t1._gene_set_diagnostics(sigs_by_method, cfg_for(methods[0]))
+
+    for m in order:
         p1 = os.path.join(plots_dir, f"test4_guide_heatmap_{m}__{ds}.png")
         t1.layer1_heatmap(sigs_by_method[m], p1, cfg_for(m), max_genes=a.max_genes,
                           title_prefix="Test-4", unit="guide")
         print("Layer 1 heatmap:", os.path.abspath(p1))
-        pl.DataFrame({"guide": list(sigs_by_method[m]),
-                      "rho": [sigs_by_method[m][g]["rho"] for g in sigs_by_method[m]]}).sort("rho").write_csv(
-            os.path.join(a.outdir, f"test4_rho_{m}__{ds}.csv"))
+        pl.DataFrame({
+            "guide": list(sigs_by_method[m]),
+            "rho": [sigs_by_method[m][g]["rho"] for g in sigs_by_method[m]],
+            "rho_n_genes": [sigs_by_method[m][g].get("rho_n_genes") for g in sigs_by_method[m]],
+        }).sort("rho").write_csv(os.path.join(a.outdir, f"test4_rho_{m}__{ds}.csv"))
 
-    genes = t1._union_de_genes_multi(sigs_by_method, cfg_for(methods[0]), a.max_genes)
-    outs = t1.layer2_zoom_compare(sigs_by_method, os.path.join(plots_dir, f"test4_zoom__{ds}.png"),
-                                  cfg_for(methods[0]), genes, methods=methods, per_page=a.zoom_per_page,
-                                  title_prefix="Test-4")
-    print(f"\nLayer 2 zoom: {len(outs)} PNG(s) — one row per method ({', '.join(methods)}) per guide")
+    if genes_zoom:
+        outs = t1.layer2_zoom_compare(
+            sigs_by_method, os.path.join(plots_dir, f"test4_zoom__{ds}.png"),
+            cfg_for(methods[0]), genes_zoom, methods=methods,
+            per_page=a.zoom_per_page, title_prefix="Test-4", rho_genes=genes_all,
+        )
+        print(f"\nLayer 2 zoom: {len(outs)} PNG(s) — one row per method "
+              f"({', '.join(methods)}) per guide")
+    else:
+        print("\nLayer 2 zoom: skipped (shared CPM-eligible union-DE panel is empty)")
 
-    p3 = os.path.join(plots_dir, f"test4_corr_matrix__{ds}.png")
-    t1.layer3_corr_matrix(sigs_by_method, p3, cfg_for(methods[0]), genes, methods=methods,
-                          title_prefix="Test-4", unit="guide")
-    print("Layer 3 correlation matrices:", os.path.abspath(p3))
+    def _emit_layer3(genes, suffix, label):
+        p = os.path.join(plots_dir, f"test4_corr_matrix{suffix}__{ds}.png")
+        t1.layer3_corr_matrix(sigs_by_method, p, cfg_for(methods[0]), genes,
+                               methods=methods, title_prefix="Test-4", unit="guide",
+                               gene_set_label=label)
+        print(f"Layer 3 {suffix or 'primary (union-DE)'}: {os.path.abspath(p)}")
+
+    # Layer 3a — Union-DE PRIMARY: all union-DE complete-case genes, no cap.
+    if len(ranked_de) < 5:
+        print(f"Layer 3 primary union-DE: skipped (only {len(ranked_de)} genes in complete-case union)")
+    else:
+        de_label_full = (
+            f"union-DE genes — called by ≥1 method in ≥1 guide "
+            f"(n={len(ranked_de)}; {diag['de_sfx']})"
+            if len(methods) > 1 else
+            f"union DE genes (n={len(ranked_de)}; {diag['de_sfx']})"
+        )
+        _emit_layer3(ranked_de, "", de_label_full)
+
+    # Layer 3a sensitivity: caps at 400 / 2000 / 4000 (ranked by cross-method LFC variance).
+    # Skip when cap ≥ full set (would duplicate the primary).
+    for cap in (400, 2000, 4000):
+        if cap >= len(ranked_de):
+            print(f"Layer 3 sensitivity cap={cap}: skipped (cap ≥ full union-DE n={len(ranked_de)})")
+            continue
+        capped = ranked_de[:cap]
+        if len(capped) < 5:
+            print(f"Layer 3 sensitivity cap={cap}: skipped (only {len(capped)} genes available)")
+            continue
+        _emit_layer3(capped, f"_top{cap}",
+                     f"union-DE genes — top {cap} by cross-method LFC variance "
+                     f"(n={len(capped)}; {diag['de_sfx']})")
+
+    # Layer 3b — All eligible genes: unbiased overall LFC agreement, complete-case across all
+    # methods and guides (no FDR/LFC filter; same panel for pdex and pydeseq2).
+    _emit_layer3(genes_all, "_all_genes",
+                 f"all eligible genes — complete-case, no FDR filter "
+                 f"(n={len(genes_all)}; {diag['all_sfx']})")
 
 
 if __name__ == "__main__":

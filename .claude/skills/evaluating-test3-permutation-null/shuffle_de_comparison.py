@@ -51,6 +51,7 @@ from cell_eval._de_backends import build_de_frame
 
 log = logging.getLogger("shuffle_de_cmp")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+LFC_ARCHIVE_VERSION = 2
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -90,38 +91,54 @@ def _sig_mask(lfc, fdr, fdr_thr, lfc_thr) -> np.ndarray:
     return np.isfinite(fdr) & (fdr <= fdr_thr) & (np.abs(lfc) >= lfc_thr)
 
 
-def _pdex_expr_filter(de_frame: pl.DataFrame, adata: ad.AnnData,
-                      groupby: str, pert_label: str, ctrl_label: str,
-                      *, min_cpm: float = 5.0) -> pl.DataFrame:
-    """Remove pdex DE genes where mean CPM < min_cpm in both groups.
-    adata.X must be log1p-normalized; expm1 recovers the pre-log values."""
+def _cpm_eligible_genes(adata: ad.AnnData, groupby: str, pert_label: str,
+                         ctrl_label: str, counts_layer, *, min_cpm: float = 5.0) -> set:
+    """Return the set of genes with mean CPM ≥ min_cpm in either perturbed or control cells.
+
+    Shared eligibility filter applied identically to both pdex and pyDESeq2.  Uses raw
+    counts from counts_layer when available; otherwise uses expm1(adata.X) for log-normalised
+    X or adata.X directly for integer-count X.
+    """
     obs_g = adata.obs[groupby].astype(str).to_numpy()
-    X = adata.X
-    if not sp.issparse(X):
-        X = sp.csr_matrix(X)
-    X = X.tocsr()
+    if counts_layer and counts_layer in adata.layers:
+        X = adata.layers[counts_layer]
+        if not sp.issparse(X):
+            X = sp.csr_matrix(X)
+        X = X.tocsr()
+    else:
+        X = adata.X
+        if not sp.issparse(X):
+            X = sp.csr_matrix(X)
+        X = X.tocsr()
+        sample = X.data[:min(5_000, X.data.size)] if X.data.size > 0 else np.array([0.0])
+        if not np.allclose(sample, np.rint(sample)):
+            X = X.copy()
+            X.data = np.expm1(X.data)
 
-    def _mean_norm(idx):
-        sub = X[idx, :].copy()
-        sub.data = np.expm1(sub.data)
-        return sub
+    pos_p = np.where(obs_g == pert_label)[0]
+    pos_c = np.where(obs_g == ctrl_label)[0]
+    if pos_p.size == 0 or pos_c.size == 0:
+        return set(adata.var_names)
 
-    Xp = _mean_norm(np.where(obs_g == pert_label)[0])
-    Xc = _mean_norm(np.where(obs_g == ctrl_label)[0])
-    median_lib = float(np.asarray(Xc.sum(axis=1)).mean())
-    min_norm = min_cpm / 1e6 * median_lib
-    m_pert = np.asarray(Xp.mean(axis=0)).ravel()
-    m_ctrl = np.asarray(Xc.mean(axis=0)).ravel()
-    g2i = {g: i for i, g in enumerate(adata.var_names)}
-    keep = {str(g) for g in de_frame["feature"].to_list()
-            if (i := g2i.get(str(g))) is not None
-            and (m_pert[i] >= min_norm or m_ctrl[i] >= min_norm)}
-    return de_frame.filter(pl.col("feature").is_in(keep))
+    def mean_cpm(pos):
+        group = X[pos]
+        library_sizes = np.asarray(group.sum(axis=1)).ravel().astype(float)
+        scales = np.divide(
+            1e6, library_sizes, out=np.zeros_like(library_sizes),
+            where=library_sizes > 0,
+        )
+        return np.asarray(group.multiply(scales[:, None]).mean(axis=0)).ravel()
+
+    m_pert = mean_cpm(pos_p)
+    m_ctrl = mean_cpm(pos_c)
+    eligible_idx = np.where((m_pert >= min_cpm) | (m_ctrl >= min_cpm))[0]
+    return set(adata.var_names[eligible_idx])
 
 
 def _run_de(adata: ad.AnnData, method: str, groupby: str, reference: str,
             n_threads: int, counts_layer, replicate_col) -> pl.DataFrame:
-    result = build_de_frame(
+    """Run DE and preserve every returned LFC for complete-case analyses."""
+    return build_de_frame(
         mode="real",
         adata=adata,
         control_pert=reference,
@@ -133,16 +150,11 @@ def _run_de(adata: ad.AnnData, method: str, groupby: str, reference: str,
         counts_layer=counts_layer,
         replicate_col=replicate_col,
     )
-    if method == "pdex":
-        labels = adata.obs[groupby].astype(str).unique().tolist()
-        pert_label = next((lb for lb in labels if lb != reference), None)
-        if pert_label is not None:
-            result = _pdex_expr_filter(result, adata, groupby, pert_label, reference)
-    return result
 
 
-def _count_sig_for_target(de, target_label: str, fdr_thr: float, lfc_thr: float):
-    """Count DE genes and return their set for a specific target label."""
+def _count_sig_for_target(de, target_label: str, fdr_thr: float, lfc_thr: float,
+                          cpm_eligible: set[str] | None = None):
+    """Count CPM-eligible DE genes and return their set for a target label."""
     sub = de.filter(de["target"] == target_label)
     if sub.height == 0:
         return 0, set()
@@ -150,6 +162,8 @@ def _count_sig_for_target(de, target_label: str, fdr_thr: float, lfc_thr: float)
     fdr = sub["fdr"].to_numpy().astype(float)
     feats = sub["feature"].to_numpy().astype(str)
     sig = _sig_mask(lfc, fdr, fdr_thr, lfc_thr)
+    if cpm_eligible is not None:
+        sig &= np.fromiter((g in cpm_eligible for g in feats), dtype=bool, count=len(feats))
     return int(sig.sum()), set(feats[sig])
 
 
@@ -226,6 +240,12 @@ def _run_shuffled_null(adata_raw: ad.AnnData, adata_norm: ad.AnnData,
         a_raw = adata_raw[combined].copy()
         a_raw.obs["_group"] = a_norm.obs["_group"].values
 
+        # CPM affects only the definition of a DE call. Keep the unfiltered DE
+        # tables below so complete-case LFC matrices include all finite estimates.
+        cpm_eligible = _cpm_eligible_genes(
+            a_raw, "_group", "target", "ref", counts_layer,
+        )
+
         log.info("  %s vs %s  (n_target=%d, n_ref=%d)", p, ref_label, n_p, n_ref)
 
         n_pdex, genes_pdex = 0, set()
@@ -237,7 +257,9 @@ def _run_shuffled_null(adata_raw: ad.AnnData, adata_norm: ad.AnnData,
             try:
                 de_pdex = _run_de(a_norm, "pdex", "_group", "ref",
                                   n_threads, counts_layer, replicate_col)
-                n_pdex, genes_pdex = _count_sig_for_target(de_pdex, "target", fdr_thr, lfc_thr)
+                n_pdex, genes_pdex = _count_sig_for_target(
+                    de_pdex, "target", fdr_thr, lfc_thr, cpm_eligible,
+                )
                 if gene_idx:
                     sub = de_pdex.filter(de_pdex["target"] == "target")
                     for feat, lfc_val in zip(sub["feature"].to_list(), sub["log2_fold_change"].to_list()):
@@ -251,7 +273,9 @@ def _run_shuffled_null(adata_raw: ad.AnnData, adata_norm: ad.AnnData,
             try:
                 de_pydx = _run_de(a_raw, "pydeseq2", "_group", "ref",
                                   n_threads, counts_layer, replicate_col)
-                n_pydx, genes_pydx = _count_sig_for_target(de_pydx, "target", fdr_thr, lfc_thr)
+                n_pydx, genes_pydx = _count_sig_for_target(
+                    de_pydx, "target", fdr_thr, lfc_thr, cpm_eligible,
+                )
                 if gene_idx:
                     sub = de_pydx.filter(de_pydx["target"] == "target")
                     for feat, lfc_val in zip(sub["feature"].to_list(), sub["log2_fold_change"].to_list()):
@@ -356,14 +380,50 @@ def _plot(results: dict[str, dict], out_png: str, title: str,
 
 # ── correlation matrix plot ────────────────────────────────────────────────────
 
+def _cc_mask_and_ranked(results: dict, gene_names: list[str],
+                        methods: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    """Compute the shared complete-case gene mask and a variance-ranked index array.
+
+    complete-case: gene has finite LFC in BOTH pdex AND pydeseq2 for EVERY fake perturbation.
+    Ranking: cross-method LFC variance pooled from all fake-perts × both methods — symmetric,
+    neither method's calling dominates. Returns (cc_mask, ranked_cc_idx) where cc_mask is a
+    boolean over gene_names and ranked_cc_idx is the descending-variance order within cc_mask.
+    """
+    n = len(gene_names)
+    cc = np.ones(n, dtype=bool)
+    method_keys = [k for k, m in (("lfc_pdex", "pdex"), ("lfc_pydx", "pydeseq2")) if m in methods]
+    for p in results:
+        for key in method_keys:
+            v = results[p].get(key)
+            if v is not None:
+                cc &= np.isfinite(v)
+            else:
+                cc[:] = False  # method absent entirely — no complete-case genes
+    cc_idx = np.where(cc)[0]
+    if cc_idx.size == 0:
+        return cc, np.array([], dtype=int)
+    # Pool LFC from all methods × fake-perts for variance ranking
+    pool = np.stack([results[p][key][cc_idx]
+                     for p in results for key in method_keys
+                     if results[p].get(key) is not None])
+    var_cc = np.nanvar(pool, axis=0)
+    ranked_cc_idx = cc_idx[np.argsort(-var_cc)]
+    return cc, ranked_cc_idx
+
+
 def _plot_corr_matrix(results: dict[str, dict], method_key: str,
-                      out_png: str, title: str) -> None:
+                      out_png: str, title: str,
+                      genes_mask: np.ndarray | None = None,
+                      gene_set_label: str = "") -> None:
     """Pairwise Spearman correlation matrix between fake-pert LFC vectors.
 
     Each cell [i, j] = Spearman r between the LFC vector of fake pert i and fake pert j
     (both compared against their randomly-chosen reference within the same shuffled null).
     A calibrated null — clean diagonal, zero elsewhere.
-    Compare with test-1's real split-half matrix which shows a clear diagonal.
+
+    genes_mask: boolean array over gene_names. When provided, both methods use IDENTICAL
+    genes so the two panels are feature-comparable. Should be the shared complete-case mask
+    from _cc_mask_and_ranked. When None, falls back to pairwise-finite filtering (old behaviour).
     """
     from scipy import stats
 
@@ -376,6 +436,16 @@ def _plot_corr_matrix(results: dict[str, dict], method_key: str,
     n = len(perts)
 
     vecs = [results[p][method_key] for p in perts]
+    if genes_mask is not None:
+        vecs = [v[genes_mask] for v in vecs]
+        n_features = int(genes_mask.sum())
+    else:
+        n_features = len(vecs[0]) if vecs else 0
+
+    if n_features < 20:
+        log.warning("Skipping %s: only %d genes available", out_png, n_features)
+        return
+
     mat = np.full((n, n), np.nan)
     for i in range(n):
         for j in range(i, n):
@@ -401,7 +471,8 @@ def _plot_corr_matrix(results: dict[str, dict], method_key: str,
     ax.set_xlabel("fake perturbation (shuffled labels)", fontsize=9)
     ax.set_ylabel("fake perturbation (shuffled labels)", fontsize=9)
     cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cb.set_label("Spearman r (LFC vectors)", fontsize=8)
+    glabel = gene_set_label or f"{n_features} genes"
+    cb.set_label(f"Spearman r (LFC)  [{glabel}]", fontsize=8)
     method_label = "pdex (cell-level Wilcoxon)" if method_key == "lfc_pdex" else "pydeseq2 (pseudobulk DESeq2)"
     ax.set_title(f"{title}\n{method_label}  (mean diagonal ρ = {mean_diagonal:.3f}; "
                  f"off-diagonal ρ = {mean_off:.3f})\n"
@@ -503,18 +574,34 @@ def main() -> None:
                 log.warning("--replot: %s not found, skipping", npz_path)
                 continue
             d = np.load(npz_path, allow_pickle=False)
+            archive_version = (int(np.asarray(d["format_version"]).item())
+                               if "format_version" in d else None)
+            if archive_version != LFC_ARCHIVE_VERSION:
+                d.close()
+                raise ValueError(
+                    f"Stale or unsupported Test-3 LFC archive {npz_path}: "
+                    f"format_version={archive_version!r}. Rerun without --replot "
+                    "to regenerate unfiltered LFC vectors."
+                )
             pert_names = d["pert_names"].tolist()
-            results_replot = {p: {"lfc_pdex": d["lfc_pdex"][i], "lfc_pydx": d["lfc_pydx"][i]}
+            gene_names_r = d["gene_names"].tolist() if "gene_names" in d else []
+            results_replot = {p: {"lfc_pdex": d["lfc_pdex"][i] if "lfc_pdex" in d else None,
+                                  "lfc_pydx": d["lfc_pydx"][i] if "lfc_pydx" in d else None}
                               for i, p in enumerate(pert_names)}
+            d.close()
             mode_label = "global shuffle" if mode == "global" else "within-batch shuffle"
             corr_title = f"calibrated null — clean diagonal, zero elsewhere\n{mode_label} — {dataset_name}"
             os.makedirs(os.path.join(args.outdir, "plots"), exist_ok=True)
+            cc_mask_r, _ = _cc_mask_and_ranked(results_replot, gene_names_r, methods)
+            n_cc_r = int(cc_mask_r.sum())
+            cc_label_r = f"all complete-case genes (n={n_cc_r})"
             for method_key, method_tag in (("lfc_pdex", "pdex"), ("lfc_pydx", "pydeseq2")):
                 _plot_corr_matrix(
                     results_replot, method_key,
                     out_png=os.path.join(args.outdir, "plots",
                                          f"test_3_corr_matrix__{mode}__{method_tag}.png"),
                     title=corr_title,
+                    genes_mask=cc_mask_r, gene_set_label=cc_label_r,
                 )
             log.info("Replotted corr matrices for mode=%s", mode)
         log.info("Done (--replot).")
@@ -539,6 +626,7 @@ def main() -> None:
         # save LFC matrices so corr-matrix plots can be regenerated without re-running DE
         perts_with_lfc = [p for p in results if results[p].get("lfc_pdex") is not None]
         lfc_save: dict = {
+            "format_version": np.asarray(LFC_ARCHIVE_VERSION, dtype=np.int64),
             "gene_names": np.array(gene_names),
             "pert_names": np.array(perts_with_lfc),
         }
@@ -559,16 +647,42 @@ def main() -> None:
                        f"Null: shuffled fake-pert X vs random shuffled fake-pert Y  ({mode_label})"),
                 fdr_thr=fdr_thr, lfc_thr=lfc_thr,
             )
+        cc_mask, ranked_cc_idx = _cc_mask_and_ranked(results, gene_names, methods)
+        n_cc = int(cc_mask.sum())
+        log.info("Test-3 complete-case genes (both methods, all fake-perts): %d / %d",
+                 n_cc, len(gene_names))
+
         corr_title = (f"Test-3 permutation-null LFC correlation — {dataset_name}\n"
                       f"{mode_label}")
         method_map = [("lfc_pdex", "pdex"), ("lfc_pydx", "pydeseq2")]
+
+        # Primary: all complete-case genes shared between both methods
+        cc_label = f"all complete-case genes (n={n_cc}; from {len(gene_names)} total)"
         for method_key, method_tag in [(k, t) for k, t in method_map if t in methods]:
             _plot_corr_matrix(
                 results, method_key,
                 out_png=os.path.join(args.outdir, "plots",
                                      f"test_3_corr_matrix__{mode}__{method_tag}.png"),
                 title=corr_title,
+                genes_mask=cc_mask, gene_set_label=cc_label,
             )
+
+        # Sensitivity caps: top 400 / 2000 / 4000 by cross-method LFC variance
+        for cap in (400, 2000, 4000):
+            if cap >= n_cc:
+                log.info("Test-3 sensitivity cap=%d skipped (cap ≥ n_cc=%d)", cap, n_cc)
+                continue
+            cap_mask = np.zeros(len(gene_names), dtype=bool)
+            cap_mask[ranked_cc_idx[:cap]] = True
+            cap_label = f"top {cap} genes by cross-method LFC variance (n={cap}; from {n_cc} cc)"
+            for method_key, method_tag in [(k, t) for k, t in method_map if t in methods]:
+                _plot_corr_matrix(
+                    results, method_key,
+                    out_png=os.path.join(args.outdir, "plots",
+                                         f"test_3_corr_matrix__{mode}_top{cap}__{method_tag}.png"),
+                    title=corr_title,
+                    genes_mask=cap_mask, gene_set_label=cap_label,
+                )
     log.info("Done.")
 
 

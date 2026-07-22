@@ -37,39 +37,8 @@ def maybe_normalize(adata: ad.AnnData, cfg: dict) -> None:
         sc.pp.log1p(adata)
 
 
-def _pdex_expr_filter(de_frame: pl.DataFrame, adata: ad.AnnData,
-                      groupby: str, pert_label: str, ctrl_label: str,
-                      *, min_cpm: float = 5.0) -> pl.DataFrame:
-    """Remove pdex DE genes where mean CPM < min_cpm in both groups.
-    adata.X must be log1p-normalized; expm1 recovers the pre-log values."""
-    obs_g = adata.obs[groupby].astype(str).to_numpy()
-    X = adata.X
-    if not sp.issparse(X):
-        X = sp.csr_matrix(X)
-    X = X.tocsr()
-
-    def _mean_norm(idx):
-        sub = X[idx, :].copy()
-        sub.data = np.expm1(sub.data)
-        return sub
-
-    Xp = _mean_norm(np.where(obs_g == pert_label)[0])
-    Xc = _mean_norm(np.where(obs_g == ctrl_label)[0])
-    # median_lib: after normalize_total each cell sums to median library size
-    median_lib = float(np.asarray(Xc.sum(axis=1)).mean())
-    min_norm = min_cpm / 1e6 * median_lib  # convert CPM threshold to normalized-count units
-    m_pert = np.asarray(Xp.mean(axis=0)).ravel()
-    m_ctrl = np.asarray(Xc.mean(axis=0)).ravel()
-    g2i = {g: i for i, g in enumerate(adata.var_names)}
-    keep = {str(g) for g in de_frame["feature"].to_list()
-            if (i := g2i.get(str(g))) is not None
-            and (m_pert[i] >= min_norm or m_ctrl[i] >= min_norm)}
-    return de_frame.filter(pl.col("feature").is_in(keep))
-
-
-
 def run_de(adata: ad.AnnData, cfg: dict, groupby: str, reference: str) -> pl.DataFrame:
-    result = build_de_frame(
+    return build_de_frame(
         mode="real",
         adata=adata,
         control_pert=reference,
@@ -81,12 +50,6 @@ def run_de(adata: ad.AnnData, cfg: dict, groupby: str, reference: str) -> pl.Dat
         counts_layer=cfg.get("counts_layer"),
         replicate_col=cfg.get("replicate_col"),
     )
-    if cfg["de_method"] == "pdex":
-        labels = adata.obs[groupby].astype(str).unique().tolist()
-        pert_label = next((lb for lb in labels if lb != reference), None)
-        if pert_label is not None:
-            result = _pdex_expr_filter(result, adata, groupby, pert_label, reference)
-    return result
 
 
 def _sig_mask(lfc, fdr, cfg):

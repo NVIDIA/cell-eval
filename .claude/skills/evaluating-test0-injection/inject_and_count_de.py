@@ -44,31 +44,36 @@ def _dense(X):
     return np.asarray(X.todense()) if sp.issparse(X) else np.asarray(X)
 
 
-def _pdex_expr_filter(de_frame, adata, groupby, pert_label, ctrl_label, *, min_cpm=5.0):
-    """Remove pdex DE genes where mean CPM < min_cpm in both groups.
-    adata.X must be log1p-normalized; expm1 recovers the pre-log values."""
+def _cpm_eligible_genes(adata, groupby, pert_label, ctrl_label, *,
+                        counts_layer=None, min_cpm=5.0):
+    """Genes with mean per-cell CPM >= ``min_cpm`` in either comparison arm."""
     obs_g = adata.obs[groupby].astype(str).to_numpy()
-    X = adata.X
+    X = _counts_matrix(adata, counts_layer)
     if not sp.issparse(X):
         X = sp.csr_matrix(X)
-    X = X.tocsr()
+    X = X.tocsr().astype(float)
 
-    def _mean_norm(idx):
-        sub = X[idx, :].copy()
-        sub.data = np.expm1(sub.data)
-        return sub
+    def mean_cpm(label):
+        idx = np.where(obs_g == label)[0]
+        if idx.size == 0:
+            raise ValueError(f"CPM group {label!r} is absent from {groupby!r}")
+        sub = X[idx, :]
+        library_sizes = np.asarray(sub.sum(axis=1)).ravel()
+        scales = np.divide(
+            1e6, library_sizes, out=np.zeros_like(library_sizes),
+            where=library_sizes > 0,
+        )
+        return np.asarray(sub.multiply(scales[:, None]).mean(axis=0)).ravel()
 
-    Xp = _mean_norm(np.where(obs_g == pert_label)[0])
-    Xc = _mean_norm(np.where(obs_g == ctrl_label)[0])
-    median_lib = float(np.asarray(Xc.sum(axis=1)).mean())
-    min_norm = min_cpm / 1e6 * median_lib
-    m_pert = np.asarray(Xp.mean(axis=0)).ravel()
-    m_ctrl = np.asarray(Xc.mean(axis=0)).ravel()
-    g2i = {g: i for i, g in enumerate(adata.var_names)}
-    keep = {str(g) for g in de_frame["feature"].to_list()
-            if (i := g2i.get(str(g))) is not None
-            and (m_pert[i] >= min_norm or m_ctrl[i] >= min_norm)}
-    return de_frame.filter(pl.col("feature").is_in(keep))
+    m_pert = mean_cpm(pert_label)
+    m_ctrl = mean_cpm(ctrl_label)
+    eligible = (m_pert >= min_cpm) | (m_ctrl >= min_cpm)
+    return set(np.asarray(adata.var_names, dtype=str)[eligible])
+
+
+def _filter_to_cpm_eligible(de_frame, eligible_genes):
+    """Apply one precomputed, backend-neutral eligibility universe to a DE table."""
+    return de_frame.filter(pl.col("feature").cast(pl.String).is_in(eligible_genes))
 
 
 # --------------------------------------------------------------------------- #
@@ -144,16 +149,18 @@ def _recover_one(adata, delta, seed, *, n_genes, pert_col, control_label, replic
                                              counts_layer=counts_layer, block_cols=block_cols)
     anchor_set = set(anchors)
     n_untouched = inj.n_vars - len(anchor_set)
+    cpm_eligible = _cpm_eligible_genes(inj, "_arm", "B", "A")
     ln = inj.copy()
     sc.pp.normalize_total(ln)
     sc.pp.log1p(ln)
     de_w = build_de_frame(mode="real", adata=ln, control_pert="A", pert_col="_arm",
                           num_threads=num_threads, allow_discrete=False, de_method="pdex",
                           de_kwargs=None, counts_layer=None, replicate_col=replicate_col)
-    de_w = _pdex_expr_filter(de_w, ln, "_arm", "B", "A")
     de_p = build_de_frame(mode="real", adata=inj, control_pert="A", pert_col="_arm",
                           num_threads=num_threads, allow_discrete=True, de_method="pydeseq2",
                           de_kwargs=None, counts_layer=None, replicate_col=replicate_col)
+    de_w = _filter_to_cpm_eligible(de_w, cpm_eligible)
+    de_p = _filter_to_cpm_eligible(de_p, cpm_eligible)
     out = []
     for method, de in (("wilcoxon", de_w), ("pydeseq2", de_p)):
         sig = de.filter((pl.col("fdr") <= fdr) & (pl.col("log2_fold_change").abs() >= lfc))
@@ -323,6 +330,7 @@ def _recover_one_binned(adata, delta, seed, *, n_genes_per_bin, n_bins, pert_col
             C_inj[np.ix_(b_mask, anchors_idx)] * (2.0 ** delta)
         )
         inj = ad.AnnData(X=sp.csr_matrix(C_inj), obs=ctrl.obs.copy(), var=ctrl.var.copy())
+        cpm_eligible = _cpm_eligible_genes(inj, "_arm", "B", "A")
 
         ln = inj.copy()
         sc.pp.normalize_total(ln)
@@ -330,10 +338,11 @@ def _recover_one_binned(adata, delta, seed, *, n_genes_per_bin, n_bins, pert_col
         de_w = build_de_frame(mode="real", adata=ln, control_pert="A", pert_col="_arm",
                               num_threads=num_threads, allow_discrete=False, de_method="pdex",
                               de_kwargs=None, counts_layer=None, replicate_col=replicate_col)
-        de_w = _pdex_expr_filter(de_w, ln, "_arm", "B", "A")
         de_p = build_de_frame(mode="real", adata=inj, control_pert="A", pert_col="_arm",
                               num_threads=num_threads, allow_discrete=True, de_method="pydeseq2",
                               de_kwargs=None, counts_layer=None, replicate_col=replicate_col)
+        de_w = _filter_to_cpm_eligible(de_w, cpm_eligible)
+        de_p = _filter_to_cpm_eligible(de_p, cpm_eligible)
 
         for method, de in (("wilcoxon", de_w), ("pydeseq2", de_p)):
             sig_genes = {str(f) for f in de.filter(

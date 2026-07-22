@@ -31,28 +31,47 @@ from cell_eval._de_backends import build_de_frame
 # DE computation
 # ------------------------------------------------------------------ #
 
-def _pdex_expr_filter_multi(de_frame: pl.DataFrame, adata: ad.AnnData,
-                            groupby: str, ctrl_label: str, *, min_cpm: float = 5.0) -> pl.DataFrame:
-    """Per-perturbation pdex expression filter: remove genes with mean CPM < min_cpm in
-    BOTH the perturbation's cells AND the control cells.
-    adata.X must be log1p-normalized; expm1 recovers the pre-log values."""
+def _cpm_filter_multi(de_frame: pl.DataFrame, adata: ad.AnnData,
+                      groupby: str, ctrl_label: str, counts_layer,
+                      *, min_cpm: float = 5.0) -> pl.DataFrame:
+    """Per-perturbation CPM eligibility filter applied identically to both pdex and pyDESeq2.
+
+    Removes genes with mean CPM < min_cpm in BOTH perturbation AND control cells.
+    Uses raw counts from counts_layer when available; auto-detects log-normalised X and
+    applies expm1; otherwise uses X directly as raw counts.
+    """
     obs_g = adata.obs[groupby].astype(str).to_numpy()
-    X = adata.X
-    if not sp.issparse(X):
-        X = sp.csr_matrix(X)
-    X = X.tocsr()
+    if counts_layer and counts_layer in adata.layers:
+        X = adata.layers[counts_layer]
+        if not sp.issparse(X):
+            X = sp.csr_matrix(X)
+        X = X.tocsr()
+    else:
+        X = adata.X
+        if not sp.issparse(X):
+            X = sp.csr_matrix(X)
+        X = X.tocsr()
+        sample = X.data[:min(5_000, X.data.size)] if X.data.size > 0 else np.array([0.0])
+        if not np.allclose(sample, np.rint(sample)):
+            X = X.copy()
+            X.data = np.expm1(X.data)
     var_names = list(adata.var_names)
 
+    def mean_cpm(idx: np.ndarray) -> np.ndarray:
+        group = X[idx, :]
+        library_sizes = np.asarray(group.sum(axis=1)).ravel().astype(float)
+        scales = np.divide(
+            1e6, library_sizes, out=np.zeros_like(library_sizes),
+            where=library_sizes > 0,
+        )
+        return np.asarray(group.multiply(scales[:, None]).mean(axis=0)).ravel()
+
     ctrl_idx = np.where(obs_g == ctrl_label)[0]
-    Xc = X[ctrl_idx, :].copy(); Xc.data = np.expm1(Xc.data)
-    # median_lib: after normalize_total each cell sums to median library size
-    median_lib = float(np.asarray(Xc.sum(axis=1)).mean())
-    min_norm = min_cpm / 1e6 * median_lib  # convert CPM threshold to normalized-count units
-    m_ctrl = np.asarray(Xc.mean(axis=0)).ravel()
+    m_ctrl = mean_cpm(ctrl_idx)
 
     targets = de_frame["target"].unique().to_list() if "target" in de_frame.columns else []
     if not targets:
-        ctrl_pass = {g for g, mc in zip(var_names, m_ctrl) if mc >= min_norm}
+        ctrl_pass = {g for g, mc in zip(var_names, m_ctrl) if mc >= min_cpm}
         return de_frame.filter(pl.col("feature").is_in(ctrl_pass))
 
     pass_pairs: set[tuple[str, str]] = set()
@@ -60,10 +79,9 @@ def _pdex_expr_filter_multi(de_frame: pl.DataFrame, adata: ad.AnnData,
         tidx = np.where(obs_g == str(tgt))[0]
         if len(tidx) == 0:
             continue
-        Xp = X[tidx, :].copy(); Xp.data = np.expm1(Xp.data)
-        m_pert = np.asarray(Xp.mean(axis=0)).ravel()
+        m_pert = mean_cpm(tidx)
         for g, mc, mp in zip(var_names, m_ctrl, m_pert):
-            if mc >= min_norm or mp >= min_norm:
+            if mc >= min_cpm or mp >= min_cpm:
                 pass_pairs.add((str(tgt), g))
 
     keep_mask = pl.Series([
@@ -88,14 +106,18 @@ def _run_de(adata: ad.AnnData, method: str, pert_col: str, control: str,
             num_threads=8, allow_discrete=False, de_method="pdex",
             de_kwargs=None, counts_layer=None,
         )
-        result = _pdex_expr_filter_multi(result, a, pert_col, control)
+        # Apply shared CPM filter using raw counts from counts_layer (or adata directly).
+        result = _cpm_filter_multi(result, adata, pert_col, control, counts_layer)
         return result.to_pandas()
     else:
-        return build_de_frame(
+        result = build_de_frame(
             mode="real", adata=adata, control_pert=control, pert_col=pert_col,
             num_threads=8, allow_discrete=True, de_method="pydeseq2",
             de_kwargs=None, counts_layer=counts_layer, replicate_col=replicate_col,
-        ).to_pandas()
+        )
+        # Apply shared CPM filter identically to pydeseq2.
+        result = _cpm_filter_multi(result, adata, pert_col, control, counts_layer)
+        return result.to_pandas()
 
 
 def _looks_raw(X) -> bool:
@@ -142,8 +164,11 @@ def _target_cpm(adata: ad.AnnData, pert_col: str, control: str,
             result[tgt] = (np.nan, np.nan)
             continue
         gene_col = np.asarray(X[:, gi].todense()).ravel().astype(float)
-        cpm_pert = float(np.mean(gene_col[pert_mask] / totals[pert_mask] * 1e6))
-        cpm_ctrl = float(np.mean(gene_col[ctrl_mask] / totals[ctrl_mask] * 1e6))
+        cell_cpm = np.divide(
+            gene_col * 1e6, totals, out=np.zeros_like(gene_col), where=totals > 0,
+        )
+        cpm_pert = float(np.mean(cell_cpm[pert_mask]))
+        cpm_ctrl = float(np.mean(cell_cpm[ctrl_mask]))
         result[tgt] = (cpm_pert, cpm_ctrl)
     return result
 
