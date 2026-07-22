@@ -70,7 +70,15 @@ Final visualization decisions:
 - Do not emit repeat-0-only plots.
 - Average each arm's target-program native effects across all repeats and plot mean arm A and mean arm B separately.
 - Calculate each repeat's perturbation-by-perturbation A-versus-B Spearman matrix, then average those matrices cell by cell across repeats.
-- Calculate every correlation over all aligned retained pathway coefficients. Never select correlation features by FDR, significance, effect size, or pair-specific pathway unions.
+- Before calculating either map family, establish one shared target order and complete-case pathway
+  basis across every requested method, arm, and repeat. Report targets and pathways removed by this
+  intersection. Reuse that basis in combined and single-method panels.
+- Keep the primary correlation maps over every retained complete-case pathway. Also emit an
+  FDR-filtered family: for each repeat and target-pair cell, correlate native effects over the union
+  of pathways called at FDR <= 0.05 in either compared profile by any requested method, so every
+  method uses the same cell-specific feature set; require at least three finite, nonconstant values
+  and leave underpowered cells missing. Average the resulting Spearman and Pearson matrices cell by
+  cell.
 - Emit one combined mean correlation map and explicit separate OLS and pdex Mann–Whitney maps.
 - Fix pdex rank-biserial heatmap colors to `[-1, 1]`. Scale OLS symmetrically to the observed maximum absolute mean effect in that arm.
 - Fix all correlation-map colors to `[-1, 1]` and annotate diagonal cells with total perturbation cell counts.
@@ -85,6 +93,9 @@ pathways_test1_mean_armb__<dataset>.png
 pathways_test1_corr_matrix_mean__<dataset>.png
 pathways_test1_corr_matrix_mean_ols__<dataset>.png
 pathways_test1_corr_matrix_mean_pdex_mwu__<dataset>.png
+pathways_test1_corr_matrix_mean_fdr05__<dataset>.png
+pathways_test1_corr_matrix_mean_ols_fdr05__<dataset>.png
+pathways_test1_corr_matrix_mean_pdex_mwu_fdr05__<dataset>.png
 ```
 
 Validated `cell_eval2` run:

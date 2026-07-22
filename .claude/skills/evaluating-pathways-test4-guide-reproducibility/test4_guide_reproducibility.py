@@ -243,12 +243,8 @@ def main() -> None:
         group_separator=" | g",
     )
     for method in methods:
-        method_results = [
-            {arm: {method: result[arm][method]} for arm in ("A", "B")}
-            for result in plot_repeat_results
-        ]
         pu.plot_target_corr_matrix(
-            method_results,
+            plot_repeat_results,
             os.path.join(
                 plots, f"pathways_test4_corr_matrix_mean_{method}__{dataset}.png"
             ),
@@ -257,6 +253,7 @@ def main() -> None:
             unit="guide",
             sort_by_diagonal=False,
             group_separator=" | g",
+            methods_to_plot=(method,),
         )
     for arm in ("A", "B"):
         pu.plot_effect_heatmaps(

@@ -551,8 +551,18 @@ def plot_target_corr_matrix(
     unit: str = "perturbation",
     sort_by_diagonal: bool = True,
     group_separator: str | None = None,
+    methods_to_plot: Sequence[str] | None = None,
+    fdr_threshold: float | None = None,
 ) -> None:
-    """Plot repeat-mean A-by-B correlations over all aligned pathway effects."""
+    """Plot repeat-mean A-by-B correlations on one cross-method basis.
+
+    Targets are intersected across every method, arm, and repeat. Pathways are
+    additionally required to have finite effects for every retained target in
+    every method, arm, and repeat. When ``fdr_threshold`` is supplied, each
+    target-pair cell uses the union of pathways called in either compared
+    profile by any method. Thus all method panels use identical targets,
+    pathways, finite masks, FDR-selected features, and target ordering.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
@@ -562,54 +572,208 @@ def plot_target_corr_matrix(
     if not repeat_results:
         raise ValueError("At least one repeat is required for a correlation map")
     methods = list(repeat_results[0]["A"])
-    fig, axes = plt.subplots(
-        1, len(methods), figsize=(7.2 * len(methods), 6.8), squeeze=False
+    if not methods:
+        raise ValueError("At least one method is required for a correlation map")
+    method_set = set(methods)
+    target_sets: list[set[str]] = []
+    program_sets: list[set[str]] = []
+    all_targets: set[str] = set()
+    all_programs: set[str] = set()
+    for repeat_index, result in enumerate(repeat_results):
+        if set(result) != {"A", "B"}:
+            raise ValueError(
+                f"Repeat {repeat_index} must contain exactly split arms A and B"
+            )
+        for arm in ("A", "B"):
+            if set(result[arm]) != method_set:
+                raise ValueError(
+                    f"Repeat {repeat_index} arm {arm} has methods "
+                    f"{sorted(result[arm])}, expected {sorted(method_set)}"
+                )
+            for method in methods:
+                frame = result[arm][method]
+                missing = {"target", "program", "effect"} - set(frame.columns)
+                if missing:
+                    raise ValueError(
+                        f"{method} repeat {repeat_index} arm {arm} is missing "
+                        f"columns {sorted(missing)}"
+                    )
+                frame_targets = set(frame["target"].astype(str))
+                frame_programs = set(frame["program"].astype(str))
+                target_sets.append(frame_targets)
+                program_sets.append(frame_programs)
+                all_targets.update(frame_targets)
+                all_programs.update(frame_programs)
+
+    targets = sorted(set.intersection(*target_sets))
+    structurally_shared_programs = sorted(set.intersection(*program_sets))
+    if not targets:
+        raise ValueError("No target is shared across all methods, arms, and repeats")
+    if not structurally_shared_programs:
+        raise ValueError("No pathway is shared across all methods, arms, and repeats")
+
+    finite_programs = np.ones(len(structurally_shared_programs), dtype=bool)
+    for result in repeat_results:
+        for arm in ("A", "B"):
+            for method in methods:
+                matrix = effect_matrix(result[arm][method]).reindex(
+                    index=targets, columns=structurally_shared_programs
+                )
+                finite_programs &= np.isfinite(matrix.to_numpy(float)).all(axis=0)
+    programs = [
+        program
+        for program, keep in zip(structurally_shared_programs, finite_programs)
+        if keep
+    ]
+    if len(programs) < 3:
+        raise ValueError(
+            "Fewer than three complete-case pathways remain across all methods, "
+            "arms, repeats, and targets"
+        )
+
+    dropped_targets = sorted(all_targets - set(targets))
+    dropped_programs = sorted(all_programs - set(programs))
+    print(
+        "Shared correlation basis: "
+        f"{len(targets)} targets, {len(programs)} finite pathways; "
+        f"dropped {len(dropped_targets)} targets and {len(dropped_programs)} pathways"
     )
-    matrix_archive = {"methods": np.asarray(methods, dtype=str)}
-    for ax, method in zip(axes[0], methods):
-        target_sets = []
-        program_sets = []
-        for result in repeat_results:
-            left = effect_matrix(result["A"][method])
-            right = effect_matrix(result["B"][method])
-            target_sets.append(set(left.index) & set(right.index))
-            program_sets.append(set(left.columns) & set(right.columns))
-        targets = sorted(set.intersection(*target_sets))
-        programs = sorted(set.intersection(*program_sets))
+    if dropped_targets:
+        print(f"Dropped targets: {', '.join(dropped_targets)}")
+    if dropped_programs:
+        print(f"Dropped pathways: {', '.join(dropped_programs)}")
+
+    plotted_methods = list(methods if methods_to_plot is None else methods_to_plot)
+    unknown = set(plotted_methods) - method_set
+    if unknown:
+        raise ValueError(f"Cannot plot unavailable methods: {sorted(unknown)}")
+    if not plotted_methods:
+        raise ValueError("methods_to_plot cannot be empty")
+    if fdr_threshold is not None:
+        validate_probability(fdr_threshold, "fdr_threshold")
+
+    effects: dict[tuple[int, str, str], pd.DataFrame] = {}
+    fdrs: dict[tuple[int, str, str], pd.DataFrame] = {}
+    for repeat_index, result in enumerate(repeat_results):
+        for arm in ("A", "B"):
+            for method in methods:
+                frame = result[arm][method]
+                effects[(repeat_index, arm, method)] = effect_matrix(frame).loc[
+                    targets, programs
+                ]
+                if fdr_threshold is not None:
+                    if "fdr" not in frame:
+                        raise ValueError(
+                            f"{method} repeat {repeat_index} arm {arm} lacks fdr"
+                        )
+                    fdrs[(repeat_index, arm, method)] = effect_matrix(
+                        frame, value="fdr"
+                    ).loc[targets, programs]
+
+    matrices: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    feature_counts = np.full(
+        (len(repeat_results), len(targets), len(targets)), len(programs), dtype=int
+    )
+    repeat_masks: list[list[list[np.ndarray]]] = []
+    for repeat_index in range(len(repeat_results)):
+        repeat_mask_rows: list[list[np.ndarray]] = []
+        for target_a in targets:
+            mask_row: list[np.ndarray] = []
+            for target_b in targets:
+                if fdr_threshold is None:
+                    active = np.ones(len(programs), dtype=bool)
+                else:
+                    active = np.zeros(len(programs), dtype=bool)
+                    for method in methods:
+                        active |= (
+                            fdrs[(repeat_index, "A", method)].loc[target_a].to_numpy(float)
+                            <= fdr_threshold
+                        )
+                        active |= (
+                            fdrs[(repeat_index, "B", method)].loc[target_b].to_numpy(float)
+                            <= fdr_threshold
+                        )
+                mask_row.append(active)
+            repeat_mask_rows.append(mask_row)
+        repeat_masks.append(repeat_mask_rows)
+
+    for method in methods:
         repeat_spearman = []
         repeat_pearson = []
-        cell_counts = {target: [] for target in targets}
-        for result in repeat_results:
-            left_frame = result["A"][method]
-            right_frame = result["B"][method]
-            left = effect_matrix(left_frame).loc[targets, programs]
-            right = effect_matrix(right_frame).loc[targets, programs]
+        for repeat_index in range(len(repeat_results)):
+            left = effects[(repeat_index, "A", method)]
+            right = effects[(repeat_index, "B", method)]
             spearman_matrix = np.full((len(targets), len(targets)), np.nan)
             pearson_matrix = np.full((len(targets), len(targets)), np.nan)
             for i, target_a in enumerate(targets):
                 for j, target_b in enumerate(targets):
-                    effects_a = left.loc[target_a].to_numpy(float)
-                    effects_b = right.loc[target_b].to_numpy(float)
+                    active = repeat_masks[repeat_index][i][j]
+                    feature_counts[repeat_index, i, j] = int(active.sum())
+                    effects_a = left.loc[target_a].to_numpy(float)[active]
+                    effects_b = right.loc[target_b].to_numpy(float)[active]
                     spearman_matrix[i, j] = safe_spearman(effects_a, effects_b)
                     pearson_matrix[i, j] = safe_pearson(effects_a, effects_b)
             repeat_spearman.append(spearman_matrix)
             repeat_pearson.append(pearson_matrix)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            matrices[method] = (
+                np.nanmean(np.stack(repeat_spearman), axis=0),
+                np.nanmean(np.stack(repeat_pearson), axis=0),
+            )
+
+    if sort_by_diagonal:
+        diagonals = np.stack([np.diag(matrices[m][0]) for m in methods])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            shared_diagonal = np.nanmean(diagonals, axis=0)
+        order = np.argsort(
+            np.where(np.isfinite(shared_diagonal), shared_diagonal, np.inf),
+            kind="stable",
+        )
+    else:
+        order = np.arange(len(targets))
+    ordered_targets = [targets[index] for index in order]
+
+    fig, axes = plt.subplots(
+        1,
+        len(plotted_methods),
+        figsize=(7.2 * len(plotted_methods), 6.8),
+        squeeze=False,
+    )
+    matrix_archive = {
+        "methods": np.asarray(plotted_methods, dtype=str),
+        "basis_methods": np.asarray(methods, dtype=str),
+        "basis_targets": np.asarray(ordered_targets, dtype=str),
+        "basis_programs": np.asarray(programs, dtype=str),
+        "dropped_targets": np.asarray(dropped_targets, dtype=str),
+        "dropped_programs": np.asarray(dropped_programs, dtype=str),
+        "feature_count": np.mean(feature_counts, axis=0)[np.ix_(order, order)],
+        "feature_count_by_repeat": feature_counts[:, order][:, :, order],
+        "selection": np.asarray(
+            "all_complete_case" if fdr_threshold is None else "shared_fdr_union"
+        ),
+        "fdr_threshold": np.asarray(
+            np.nan if fdr_threshold is None else fdr_threshold, dtype=float
+        ),
+    }
+    for ax, method in zip(axes[0], plotted_methods):
+        spearman, pearson = matrices[method]
+        spearman = spearman[np.ix_(order, order)]
+        pearson = pearson[np.ix_(order, order)]
+        cell_counts = {target: [] for target in targets}
+        for result in repeat_results:
+            left_frame = result["A"][method]
+            right_frame = result["B"][method]
             n_left = left_frame.groupby("target")["n_target"].first()
             n_right = right_frame.groupby("target")["n_target"].first()
             for target in targets:
                 cell_counts[target].append(float(n_left[target] + n_right[target]))
-        with np.errstate(invalid="ignore"):
-            spearman = np.nanmean(np.stack(repeat_spearman), axis=0)
-            pearson = np.nanmean(np.stack(repeat_pearson), axis=0)
-        diagonal = np.diag(spearman)
-        order = (
-            np.argsort(np.where(np.isfinite(diagonal), diagonal, np.inf))
-            if sort_by_diagonal
-            else np.arange(len(targets))
+        correlation_basis = (
+            "all shared complete-case pathways"
+            if fdr_threshold is None
+            else f"shared FDR <= {fdr_threshold:g} union"
         )
-        spearman = spearman[np.ix_(order, order)]
-        pearson = pearson[np.ix_(order, order)]
-        ordered_targets = [targets[index] for index in order]
         sns.heatmap(
             spearman,
             cmap="RdBu_r",
@@ -620,7 +784,7 @@ def plot_target_corr_matrix(
             xticklabels=ordered_targets,
             yticklabels=ordered_targets,
             cbar_kws={
-                "label": "Mean repeat-wise Spearman over all pathway coefficients",
+                "label": f"Mean repeat-wise Spearman ({correlation_basis})",
                 "shrink": 0.75,
             },
             ax=ax,
@@ -650,6 +814,7 @@ def plot_target_corr_matrix(
         matrix_archive[f"targets__{method}"] = np.asarray(
             ordered_targets, dtype=str
         )
+        matrix_archive[f"programs__{method}"] = np.asarray(programs, dtype=str)
         matrix_archive[f"spearman__{method}"] = spearman
         matrix_archive[f"pearson__{method}"] = pearson
         ax.set_title(
@@ -665,7 +830,7 @@ def plot_target_corr_matrix(
     fig.suptitle(
         f"{title}\n"
         f"diagonal = within-{unit} reproducibility (cell count annotated); "
-        f"off-diagonal = cross-{unit} similarity; all aligned pathway coefficients used",
+        f"off-diagonal = cross-{unit} similarity; {correlation_basis}",
         fontsize=11,
     )
     fig.savefig(path, dpi=160, bbox_inches="tight")

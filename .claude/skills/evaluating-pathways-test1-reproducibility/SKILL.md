@@ -1,6 +1,6 @@
 ---
 name: evaluating-pathways-test1-reproducibility
-description: Run or reproduce pathway Test 1 comparing perturbation split-half reproducibility for official ArcInstitute Bioconcord OLS and pdex Mann-Whitney on one fixed Bioconcord score matrix. Use for within-method effect-vector Spearman, significant-pathway Jaccard, direction agreement, cell-count dependence, arm-level cross-method agreement, mean arm effects, and repeat-averaged perturbation maps using all aligned pathway coefficients and reporting diagonal/off-diagonal Spearman and Pearson correlations.
+description: Run or reproduce pathway Test 1 comparing perturbation split-half reproducibility for official ArcInstitute Bioconcord OLS and pdex Mann-Whitney on one fixed Bioconcord score matrix. Use for within-method effect-vector Spearman, significant-pathway Jaccard, direction agreement, cell-count dependence, arm-level cross-method agreement, mean arm effects, and repeat-averaged all-pathway and FDR-union perturbation maps reporting diagonal/off-diagonal Spearman and Pearson correlations.
 ---
 
 # Pathway Test 1 — Perturbation Split-Half Reproducibility
@@ -60,25 +60,22 @@ Assess within-method reproducibility before interpreting cross-method agreement.
 
 ## Correlation-map construction
 
-For each method:
+For all requested methods together:
 
-1. Intersect perturbations and pathways across both arms and all repeats.
-2. Within each repeat, build two square matrices whose entry `(i, j)` compares all aligned pathway coefficients for perturbation `i` in arm A with perturbation `j` in arm B: one Spearman matrix and one Pearson matrix. Apply finite/nonconstant safeguards to both. Never restrict the correlation vectors by FDR, significance, effect size, or a pair-specific pathway union.
-3. Average each matrix cell by cell across repeats; do not correlate effects after averaging.
-4. Interpret the diagonal as within-perturbation reproducibility and off-diagonals as cross-perturbation similarity. Compute the finite mean of all diagonal cells and all off-diagonal cells separately for both correlation metrics.
-5. Render the Spearman matrix. In every method-panel title, report `Spearman: diag=<mean>, off=<mean>; Pearson: diag=<mean>, off=<mean>`.
-6. Sort both axes by increasing mean Spearman diagonal value, preserving target alignment.
-7. Annotate each diagonal cell with the perturbation's mean total cell count across repeats.
-8. Use `RdBu_r` centered at zero with fixed limits `[-1, 1]`.
-9. Save the exact averaged Spearman and Pearson matrices beside every PNG as an NPZ archive. The
-   archive contains `methods`, plus `targets__<method>`, `spearman__<method>`, and
-   `pearson__<method>` arrays. This makes downstream distribution plots reproducible without
-   recovering values from raster heatmaps.
+1. Intersect perturbations across every method, arm, and repeat. Intersect pathways across the same inputs, then require each pathway effect to be finite for every retained perturbation in every method, arm, and repeat. Report dropped perturbations/pathways. This is the shared complete-case basis for combined and single-method outputs.
+2. Build the primary all-pathway family. Within each repeat, each entry `(i, j)` compares every pathway on the shared complete-case basis for perturbation `i` in arm A with perturbation `j` in arm B, once by Spearman and once by Pearson.
+3. Build the FDR-union family. Within each repeat and target-pair cell, select the union of pathways called at `fdr <= --fdr` in either compared profile by any requested method. Use that identical cell-specific feature set for every method; require at least three values and apply finite/nonconstant safeguards, leaving underpowered cells missing.
+4. Average each matrix cell by cell across repeats; do not correlate effects after averaging.
+5. Interpret the diagonal as within-perturbation reproducibility and off-diagonals as cross-perturbation similarity. Compute the finite mean of all diagonal cells and all off-diagonal cells separately for both correlation metrics.
+6. Render the Spearman matrix. In every method-panel title, report `Spearman: diag=<mean>, off=<mean>; Pearson: diag=<mean>, off=<mean>`.
+7. Derive one target order from the across-method mean Spearman diagonal and use it for every method panel in that family.
+8. Annotate each diagonal cell with the perturbation's mean total cell count across repeats.
+9. Use `RdBu_r` centered at zero with fixed limits `[-1, 1]`.
+10. Save the exact averaged Spearman and Pearson matrices beside every PNG as an NPZ archive. The archive contains the plotted and basis methods, shared targets/pathways, dropped targets/pathways, mean and repeat-level per-cell feature counts, selection family, FDR threshold, plus `targets__<method>`, `programs__<method>`, `spearman__<method>`, and `pearson__<method>` arrays. This makes the common comparison basis auditable without recovering values from raster heatmaps.
 
 Also average native effects by `method, arm, target, program` across repeats and produce one overview-style effect heatmap per arm. Keep pdex limits fixed to `[-1, 1]`; use observed symmetric OLS limits.
 
-Use FDR only for significant-set Jaccard, direction agreement, and significant-count summaries.
-Do not use FDR to select pathways for any correlation matrix.
+Use FDR for significant-set Jaccard, direction agreement, significant-count summaries, and the explicitly secondary FDR-union correlation-map family. Keep the all-pathway maps primary.
 
 ## Output contract
 
@@ -91,6 +88,8 @@ Do not use FDR to select pathways for any correlation matrix.
   Spearman/Pearson matrices underlying the all-pathway heatmap. Every other correlation-map PNG has
   a same-stem NPZ archive with the same schema.
 - `plots/pathways_test1_corr_matrix_mean_ols__<dataset>.png` and `..._pdex_mwu__<dataset>.png`: single-method versions with the same four title statistics.
+- `plots/pathways_test1_corr_matrix_mean_fdr05__<dataset>.png`: both methods using the shared per-cell FDR-union feature sets at the default threshold.
+- `plots/pathways_test1_corr_matrix_mean_ols_fdr05__<dataset>.png` and `..._pdex_mwu_fdr05__<dataset>.png`: single-method views of the same shared FDR-union matrices.
 - `plots/pathways_test1_mean_arma__<dataset>.png` and `..._armb__<dataset>.png`: mean native-effect heatmaps.
 - `pathways_test1_metadata__<dataset>.json`: shared score and argument metadata.
 
@@ -100,5 +99,6 @@ Do not use FDR to select pathways for any correlation matrix.
 - Require disjoint A/B indices within a repeat and group-specific cell totals equal to the retained original cells, except cells dropped by the per-arm threshold.
 - Calculate correlation maps per repeat before averaging.
 - Calculate both Spearman and Pearson matrices per repeat; average matrix cells first, then summarize diagonal and off-diagonal cells separately. Keep heatmap colors Spearman-only.
-- Use every aligned pathway coefficient in every correlation vector; never select correlation features using FDR calls.
+- Use every shared complete-case pathway in the primary family. In the secondary family, use the shared cross-method FDR union defined above.
+- Assert that every combined and single-method archive in a family has the same targets, pathway basis, finite mask, and order; inspect the archived dropped-pathway diagnostics when inputs are incomplete.
 - Never compare OLS and rank-biserial magnitudes directly; reproducibility is within method.

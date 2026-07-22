@@ -48,7 +48,7 @@ required user-supplied CSV because pathway definitions are not committed with th
 11. For each method, calculate Test 1 split metrics by guide: total cells, native-effect Spearman, significant-set Jaccard, sign agreement over the significant union, and arm-specific significant counts.
 12. If both methods run, calculate the bundled cross-method comparison within every arm and repeat.
 13. Preserve every repeat's split results. Average native effects by `method, arm, guide, program` across repeats and produce one overview-style effect heatmap per arm, with guides grouped by gene and black horizontal gene boundaries.
-14. For each method and repeat, compute full split-A guide by split-B guide Spearman and Pearson matrices across shared pathway effects. Average both matrices cell by cell across repeats. Render Spearman colors and report mean diagonal/off-diagonal values for both metrics in every panel title. Order both axes by target gene and within-gene guide number, draw black boundaries between genes, and annotate diagonal cells with mean total guide-cell count. Emit combined and separate method maps with fixed correlation limits `[-1, 1]`.
+14. Establish one guide order and complete-case pathway basis across every method, arm, and repeat, reporting any dropped guides/pathways. For each method and repeat, compute full split-A guide by split-B guide Spearman and Pearson matrices on that identical basis. Average both matrices cell by cell across repeats. Render Spearman colors and report mean diagonal/off-diagonal values for both metrics in every panel title. Order both axes by target gene and within-gene guide number, draw black boundaries between genes, and annotate diagonal cells with mean total guide-cell count. Emit combined and separate method maps with fixed correlation limits `[-1, 1]`.
 15. Preserve raw guide constructs in native result tables. For plots, map guides within each modal target gene to compact deterministic labels `GENE | g1`, `GENE | g2`, and so on. Same-gene guides must be adjacent in heatmaps and correlation maps, share an obvious gene prefix, and be separated from the next gene group by a visible boundary. Store the mapping in metadata and a dedicated guide-map table.
 
 ## Output contract
@@ -75,6 +75,6 @@ Follow finalized pathway Test 1 at guide resolution: do not emit the obsolete re
 - Use `--normalize-raw` only for a raw-count X; never renormalize an already log-normalized layer.
 - Require each retained non-control guide to meet the per-arm threshold; `split_groups` drops guides that fail it.
 - Reuse fixed pathway scores and disjoint guide-specific halves.
-- Require correlation maps to intersect guides and programs across both arms and every repeat, then average repeat-specific correlations rather than correlating already averaged effects.
+- Require correlation maps to intersect guides and finite programs across every method, arm, and repeat; reuse that shared basis and order for combined and single-method panels, then average repeat-specific correlations rather than correlating already averaged effects.
 - Keep pdex mean-effect heatmaps fixed to `[-1, 1]`, OLS heatmaps symmetric to their observed arm-specific range, and every correlation map fixed to `[-1, 1]`.
 - Interpret low guide reproducibility alongside `n_cells_total`; it is the empirical ceiling for guide-level conclusions.

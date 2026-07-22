@@ -10,30 +10,6 @@ import pandas as pd
 import pathway_utils as pu
 
 
-def safe_pearson(left, right) -> float:
-    """Finite, nonconstant Pearson correlation matching safe_spearman guards."""
-    left = np.asarray(left, dtype=float)
-    right = np.asarray(right, dtype=float)
-    keep = np.isfinite(left) & np.isfinite(right)
-    if (
-        keep.sum() < 3
-        or np.unique(left[keep]).size < 2
-        or np.unique(right[keep]).size < 2
-    ):
-        return float("nan")
-    return float(np.corrcoef(left[keep], right[keep])[0, 1])
-
-
-def diagonal_offdiagonal_means(matrix: np.ndarray) -> tuple[float, float]:
-    """Return finite means for matching and nonmatching target pairs."""
-    matrix = np.asarray(matrix, dtype=float)
-    diagonal_mask = np.eye(matrix.shape[0], dtype=bool)
-    return (
-        float(np.nanmean(matrix[diagonal_mask])),
-        float(np.nanmean(matrix[~diagonal_mask])),
-    )
-
-
 def split_metrics(left: pd.DataFrame, right: pd.DataFrame, fdr: float) -> pd.DataFrame:
     rows = []
     for target in sorted(set(left.target) & set(right.target)):
@@ -61,143 +37,6 @@ def split_metrics(left: pd.DataFrame, right: pd.DataFrame, fdr: float) -> pd.Dat
     return pd.DataFrame(rows)
 
 
-def plot_target_corr_matrix(
-    repeat_results: list[dict[str, dict[str, pd.DataFrame]]],
-    path: str,
-    title: str,
-    unit: str = "perturbation",
-    sort_by_diagonal: bool = True,
-    group_separator: str | None = None,
-) -> None:
-    """Plot the mean split-A × split-B target correlation map.
-
-    Spearman and Pearson maps are calculated independently for every repeat,
-    then averaged cell by cell. Colors encode repeat-wise Spearman; panel
-    titles report mean diagonal and off-diagonal values for both metrics. Every
-    matrix cell uses all aligned pathway coefficients; FDR calls do not select
-    the correlation feature set.
-    """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-
-    if not repeat_results:
-        raise ValueError("At least one repeat is required for a correlation map")
-    methods = list(repeat_results[0]["A"])
-    fig, axes = plt.subplots(
-        1, len(methods), figsize=(7.2 * len(methods), 6.8), squeeze=False
-    )
-    matrix_archive = {
-        "methods": np.asarray(methods, dtype=str),
-    }
-    for ax, method in zip(axes[0], methods):
-        target_sets = []
-        program_sets = []
-        for result in repeat_results:
-            left = pu.effect_matrix(result["A"][method])
-            right = pu.effect_matrix(result["B"][method])
-            target_sets.append(set(left.index) & set(right.index))
-            program_sets.append(set(left.columns) & set(right.columns))
-        targets = sorted(set.intersection(*target_sets))
-        programs = sorted(set.intersection(*program_sets))
-
-        repeat_corrs = []
-        repeat_pearsons = []
-        cell_counts = {target: [] for target in targets}
-        for result in repeat_results:
-            left_frame = result["A"][method]
-            right_frame = result["B"][method]
-            left = pu.effect_matrix(left_frame).loc[targets, programs]
-            right = pu.effect_matrix(right_frame).loc[targets, programs]
-            spearman_matrix = np.full((len(targets), len(targets)), np.nan)
-            pearson_matrix = np.full((len(targets), len(targets)), np.nan)
-            for i, target_a in enumerate(targets):
-                for j, target_b in enumerate(targets):
-                    effect_a = left.loc[target_a].to_numpy(float)
-                    effect_b = right.loc[target_b].to_numpy(float)
-                    spearman_matrix[i, j] = pu.safe_spearman(effect_a, effect_b)
-                    pearson_matrix[i, j] = safe_pearson(effect_a, effect_b)
-            repeat_corrs.append(spearman_matrix)
-            repeat_pearsons.append(pearson_matrix)
-            n_left = left_frame.groupby("target")["n_target"].first()
-            n_right = right_frame.groupby("target")["n_target"].first()
-            for target in targets:
-                cell_counts[target].append(float(n_left[target] + n_right[target]))
-        corr = np.nanmean(np.stack(repeat_corrs), axis=0)
-        pearson_corr = np.nanmean(np.stack(repeat_pearsons), axis=0)
-        diagonal = np.diag(corr)
-        order = (
-            np.argsort(np.where(np.isfinite(diagonal), diagonal, np.inf))
-            if sort_by_diagonal
-            else np.arange(len(targets))
-        )
-        corr = corr[np.ix_(order, order)]
-        pearson_corr = pearson_corr[np.ix_(order, order)]
-        ordered_targets = [targets[i] for i in order]
-
-        sns.heatmap(
-            corr,
-            cmap="RdBu_r",
-            center=0,
-            vmin=-1,
-            vmax=1,
-            square=True,
-            xticklabels=ordered_targets,
-            yticklabels=ordered_targets,
-            cbar_kws={
-                "label": "Mean repeat-wise Spearman over all pathway coefficients",
-                "shrink": 0.75,
-            },
-            ax=ax,
-        )
-        for i, target in enumerate(ordered_targets):
-            n_cells = int(round(float(np.mean(cell_counts[target]))))
-            ax.text(
-                i + 0.5,
-                i + 0.5,
-                str(n_cells),
-                ha="center",
-                va="center",
-                fontsize=5,
-                color="white",
-                fontweight="bold",
-            )
-        if group_separator:
-            groups = [target.split(group_separator, 1)[0] for target in ordered_targets]
-            for boundary in range(1, len(groups)):
-                if groups[boundary] != groups[boundary - 1]:
-                    ax.axhline(boundary, color="black", linewidth=1.1)
-                    ax.axvline(boundary, color="black", linewidth=1.1)
-        spearman_diagonal, spearman_offdiagonal = diagonal_offdiagonal_means(corr)
-        pearson_diagonal, pearson_offdiagonal = diagonal_offdiagonal_means(pearson_corr)
-        matrix_archive[f"targets__{method}"] = np.asarray(ordered_targets, dtype=str)
-        matrix_archive[f"spearman__{method}"] = corr
-        matrix_archive[f"pearson__{method}"] = pearson_corr
-        ax.set_title(
-            f"{method}\n"
-            f"Spearman: diag={spearman_diagonal:.2f}, off={spearman_offdiagonal:.2f}; "
-            f"Pearson: diag={pearson_diagonal:.2f}, off={pearson_offdiagonal:.2f}",
-            fontsize=9,
-        )
-        ax.set_xlabel(f"split B {unit}")
-        ax.set_ylabel(f"split A {unit}")
-        ax.tick_params(axis="x", labelsize=6, rotation=90)
-        ax.tick_params(axis="y", labelsize=6, rotation=0)
-
-    fig.suptitle(
-        f"{title}\n"
-        f"diagonal = within-{unit} reproducibility (cell count annotated); "
-        f"off-diagonal = cross-{unit} similarity; all aligned pathway coefficients used",
-        fontsize=11,
-    )
-    fig.savefig(path, dpi=160, bbox_inches="tight")
-    plt.close(fig)
-    matrix_path = os.path.splitext(path)[0] + ".npz"
-    np.savez_compressed(matrix_path, **matrix_archive)
-    print(f"Saved correlation values: {matrix_path}")
-
-
 def average_split_effects(
     repeat_results: list[dict[str, dict[str, pd.DataFrame]]],
     methods: tuple[str, ...],
@@ -220,6 +59,14 @@ def average_split_effects(
             frame.insert(0, "method", method)
             averaged[arm][method] = frame
     return averaged
+
+
+def fdr_filename_label(threshold: float) -> str:
+    """Return a stable filename label such as ``fdr05`` for 0.05."""
+    percent = f"{100 * threshold:g}".replace(".", "p")
+    if "p" not in percent:
+        percent = percent.zfill(2)
+    return f"fdr{percent}"
 
 
 def main() -> None:
@@ -306,22 +153,41 @@ def main() -> None:
             os.path.join(tables, f"pathways_test1_crossmethod__{dataset}.csv"), index=False
         )
     mean_results = average_split_effects(repeat_results, methods)
-    plot_target_corr_matrix(
+    pu.plot_target_corr_matrix(
         repeat_results,
         os.path.join(plots, f"pathways_test1_corr_matrix_mean__{dataset}.png"),
         f"Pathway Test 1 mean across {args.n_repeats} repeats — {dataset}",
     )
     for method in methods:
-        method_results = [
-            {arm: {method: result[arm][method]} for arm in ("A", "B")}
-            for result in repeat_results
-        ]
-        plot_target_corr_matrix(
-            method_results,
+        pu.plot_target_corr_matrix(
+            repeat_results,
             os.path.join(
                 plots, f"pathways_test1_corr_matrix_mean_{method}__{dataset}.png"
             ),
             f"Pathway Test 1 mean across {args.n_repeats} repeats — {dataset} — {method}",
+            methods_to_plot=(method,),
+        )
+    fdr_label = fdr_filename_label(args.fdr)
+    pu.plot_target_corr_matrix(
+        repeat_results,
+        os.path.join(
+            plots, f"pathways_test1_corr_matrix_mean_{fdr_label}__{dataset}.png"
+        ),
+        f"Pathway Test 1 mean across {args.n_repeats} repeats — {dataset} — "
+        f"shared FDR <= {args.fdr:g} union",
+        fdr_threshold=args.fdr,
+    )
+    for method in methods:
+        pu.plot_target_corr_matrix(
+            repeat_results,
+            os.path.join(
+                plots,
+                f"pathways_test1_corr_matrix_mean_{method}_{fdr_label}__{dataset}.png",
+            ),
+            f"Pathway Test 1 mean across {args.n_repeats} repeats — {dataset} — "
+            f"{method} — shared FDR <= {args.fdr:g} union",
+            methods_to_plot=(method,),
+            fdr_threshold=args.fdr,
         )
     for arm in ("A", "B"):
         pu.plot_effect_heatmaps(
