@@ -92,7 +92,8 @@ def _cpm_filter_multi(de_frame: pl.DataFrame, adata: ad.AnnData,
 
 
 def _run_de(adata: ad.AnnData, method: str, pert_col: str, control: str,
-            replicate_col: str | None, counts_layer: str | None) -> pd.DataFrame:
+            replicate_col: str | None, counts_layer: str | None,
+            non_parametric_engine: str = "pdex", num_threads: int = 8) -> pd.DataFrame:
     if method == "pdex":
         a = adata.copy()
         if counts_layer and counts_layer in a.layers:
@@ -103,8 +104,8 @@ def _run_de(adata: ad.AnnData, method: str, pert_col: str, control: str,
             sc.pp.log1p(a)
         result = build_de_frame(
             mode="real", adata=a, control_pert=control, pert_col=pert_col,
-            num_threads=8, allow_discrete=False, de_method="pdex",
-            de_kwargs=None, counts_layer=None,
+            num_threads=num_threads, allow_discrete=False, de_method="pdex",
+            de_kwargs={"engine": non_parametric_engine}, counts_layer=None,
         )
         # Apply shared CPM filter using raw counts from counts_layer (or adata directly).
         result = _cpm_filter_multi(result, adata, pert_col, control, counts_layer)
@@ -112,7 +113,7 @@ def _run_de(adata: ad.AnnData, method: str, pert_col: str, control: str,
     else:
         result = build_de_frame(
             mode="real", adata=adata, control_pert=control, pert_col=pert_col,
-            num_threads=8, allow_discrete=True, de_method="pydeseq2",
+            num_threads=num_threads, allow_discrete=True, de_method="pydeseq2",
             de_kwargs=None, counts_layer=counts_layer, replicate_col=replicate_col,
         )
         # Apply shared CPM filter identically to pydeseq2.
@@ -348,8 +349,14 @@ def main() -> None:
     ap.add_argument("--fdr",             type=float, default=0.05)
     ap.add_argument("--lfc",             type=float, default=0.1,
                     help="minimum |LFC| threshold for counting DE genes (default: 0.1)")
+    ap.add_argument("--non-parametric-engine", choices=("pdex", "rsc"), default="pdex",
+                    help="non-parametric engine; pdex uses Arc pdex and rsc uses RAPIDS GPU Wilcoxon")
+    ap.add_argument("--threads", type=int, default=8,
+                    help="CPU threads for the shared multi-contrast DE model")
     ap.add_argument("--outdir",          default=".")
     a = ap.parse_args()
+    if a.threads < 1:
+        ap.error("--threads must be at least 1")
 
     methods = [m.strip() for m in a.methods.split(",") if m.strip()]
     dataset = os.path.splitext(os.path.basename(a.adata))[0]
@@ -364,9 +371,14 @@ def main() -> None:
     # run pydeseq2 first (needs raw counts, before pdex normalises in-place)
     for m in [x for x in methods if x != "pdex"] + (["pdex"] if "pdex" in methods else []):
         print(f"[t6] {m} DE …")
-        de[m] = _run_de(adata, m, a.pert_col, a.control, a.replicate_col, counts_layer)
+        de[m] = _run_de(
+            adata, m, a.pert_col, a.control, a.replicate_col, counts_layer,
+            non_parametric_engine=a.non_parametric_engine, num_threads=a.threads,
+        )
 
     df = build_table(adata, de, a.pert_col, a.control, a.fdr, lfc_thr=a.lfc, counts_layer=counts_layer)
+    if "pdex" in methods:
+        df.insert(0, "non_parametric_engine", a.non_parametric_engine)
 
     os.makedirs(a.outdir, exist_ok=True)
     base = os.path.join(a.outdir, f"test6_knockdown_recovery_crossmethod__{dataset}")

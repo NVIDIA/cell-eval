@@ -33,6 +33,9 @@ python .claude/skills/evaluating-test3-permutation-null/shuffle_de_comparison.py
 ```
 
 ## Parameters (in `config.yaml`)
+
+`--comparison-workers N --n-threads 1` runs independent shuffled comparisons concurrently for CPU
+PyDESeq2. Do not combine comparison workers with the RSC non-parametric engine.
 | key | what it controls | default |
 |---|---|---|
 | `adata_path` | path to the h5ad | required |
@@ -42,6 +45,7 @@ python .claude/skills/evaluating-test3-permutation-null/shuffle_de_comparison.py
 | `block_cols` | columns used for within-batch shuffle variant | [batch] |
 | `fdr_threshold / lfc_threshold` | DEG-calling cutoffs | 0.05 / 0.1 |
 | `seed` | RNG seed | 0 |
+| `non_parametric_engine` / `--non-parametric-engine` | `pdex` for Arc pdex or `rsc` for RAPIDS GPU Wilcoxon | pdex |
 
 ## Outputs (in `--outdir/plots/`)
 - `test_3_shuffle_de_comparison__global.png` — scatter: n_sig_pydeseq2 vs n_sig_pdex, global shuffle
@@ -49,5 +53,6 @@ python .claude/skills/evaluating-test3-permutation-null/shuffle_de_comparison.py
 - `test_3_corr_matrix__<mode>__<method>.png` — fake-perturbation Spearman correlation map; every
   title reports finite mean diagonal and off-diagonal rho separately.
 - `test3_lfc_vectors_<mode>_<method>.parquet` — long-form shuffled-comparison LFC vectors with one
-  row per feature. Existing versioned `test_3_lfc_matrix__<mode>.npz` archives remain available for
-  fast correlation-matrix replotting.
+  row per feature and execution-engine provenance. Version-5
+  `test_3_lfc_matrix__<mode>.npz` archives record `non_parametric_engine=pdex|rsc` for fast
+  correlation-matrix replotting; reject and recompute older `cpu`-labeled archives.

@@ -1,7 +1,6 @@
 ---
 name: evaluating-test6-knockdown-recovery
 description: Run ONLY Test 6 (target-gene knockdown recovery) from the cell-eval metric-robustness battery and emit a single-test report. For each perturbation, checks whether the targeted gene itself is detected as differentially expressed in the expected (knock-down) direction, reporting recovery and direction rates. Use when someone wants to check target-gene knockdown / on-target recovery of a DE pipeline without running the whole battery. Needs a target-gene column matching var_names.
-type: skill
 ---
 
 # Test 6 — Target Gene Knockdown Recovery
@@ -30,6 +29,8 @@ python .claude/skills/evaluating-test6-knockdown-recovery/knockdown_recovery.py 
 ```
 
 ## Parameters
+
+`--threads N` controls CPU inference for the single shared multi-contrast PyDESeq2 model.
 | flag | what it controls | default |
 |---|---|---|
 | `--pert-col` | obs column with perturbation labels (must match var_names) | gene |
@@ -38,6 +39,7 @@ python .claude/skills/evaluating-test6-knockdown-recovery/knockdown_recovery.py 
 | `--counts-layer` | raw-counts layer (auto-detects 'counts') | auto |
 | `--fdr` | FDR cutoff to call the target significant | 0.05 |
 | `--methods` | comma-sep backends | pdex,pydeseq2 |
+| `--non-parametric-engine` | `pdex` or numerically matched RAPIDS GPU Wilcoxon (`rsc`) | pdex |
 
 ## Outputs (in `--outdir`)
 - `test6_knockdown_recovery_crossmethod__<dataset>.png` — matplotlib table: one row per perturbation, columns = LFC / p-value / FDR / rank stats per method; rows where methods disagree highlighted

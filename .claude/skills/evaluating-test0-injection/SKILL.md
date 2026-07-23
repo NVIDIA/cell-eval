@@ -1,7 +1,6 @@
 ---
 name: evaluating-test0-injection
 description: Run ONLY Test 0 (controlled effect-size injection / calibration curve) from the cell-eval metric-robustness battery and emit a single-test report. Spikes a known log2FC into ~a dozen genes in a control-vs-control split at several delta tiers (incl. delta=0) and measures the null false-positive rate and the TPR-vs-effect-size curve (smallest resolvable delta), plus compositional-coupling of untouched genes. Use when someone wants to calibrate a DE metric's false-positive rate / resolving power, or check injection/FPR/TPR calibration, without running the whole battery.
-type: skill
 ---
 
 # Test 0 — Controlled Effect-Size Injection / Calibration Curve
@@ -42,6 +41,9 @@ python "$SCRIPT" \
 ```
 
 ## Parameters
+
+`--pydeseq-workers N --threads 1` parallelizes independent injection tasks for CPU PyDESeq2. The
+injection implementation keeps the count matrix sparse, including while modifying anchor columns.
 | flag | what it controls | default |
 |---|---|---|
 | `--deltas` | log2FC tiers injected (comma-sep; 0 = null FPR baseline) | `0,0.5,1,2` |
@@ -50,6 +52,8 @@ python "$SCRIPT" \
 | `--fdr / --lfc` | DEG-calling cutoffs | 0.05 / 0.1 |
 | `--replicate-col` | pseudobulk unit (required for pydeseq2 within each repeat) | batch |
 | `--counts-layer` | raw-counts layer; falls back to `.X` if absent | auto |
+| `--non-parametric-engine` | `pdex` or numerically matched RAPIDS GPU Wilcoxon (`rsc`) | pdex |
+| `--methods` | comma-separated backends; useful for engine-parity runs | pdex,pydeseq2 |
 
 ## Outputs (in `$RUN_DIR`)
 - `injection_recovery__<dataset>__recovered_box.png` — # anchors recovered (TPR) vs δ, pdex vs pydeseq2

@@ -91,7 +91,8 @@ def run_de(adata: ad.AnnData, cfg: dict, groupby: str, reference: str) -> pl.Dat
         num_threads=cfg["num_threads"],
         allow_discrete=cfg["allow_discrete"],
         de_method=cfg["de_method"],
-        de_kwargs=None,
+        de_kwargs=({"engine": cfg.get("non_parametric_engine", "pdex")}
+                   if cfg["de_method"] == "pdex" else None),
         counts_layer=cfg.get("counts_layer"),
         replicate_col=cfg.get("replicate_col"),
     )

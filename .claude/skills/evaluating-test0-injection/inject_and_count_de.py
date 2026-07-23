@@ -21,6 +21,7 @@ standalone: ``python inject_and_count_de.py --adata <h5ad>`` (100 repeats by def
 from __future__ import annotations
 
 import argparse
+import multiprocessing as mp
 import os
 
 import anndata as ad
@@ -29,6 +30,8 @@ import polars as pl
 import scipy.sparse as sp
 
 from cell_eval._de_backends import build_de_frame
+
+_T0_WORKER_STATE = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -42,6 +45,20 @@ def _counts_matrix(adata, counts_layer):
 
 def _dense(X):
     return np.asarray(X.todense()) if sp.issparse(X) else np.asarray(X)
+
+
+def _inject_sparse_columns(X, row_mask, column_indices, factor):
+    """Multiply selected sparse column entries for selected rows without densifying."""
+    out = sp.csc_matrix(X, dtype=float, copy=True)
+    row_mask = np.asarray(row_mask, dtype=bool)
+    for column in np.asarray(column_indices, dtype=int):
+        start, end = out.indptr[column], out.indptr[column + 1]
+        stored_rows = out.indices[start:end]
+        selected = row_mask[stored_rows]
+        values = out.data[start:end]
+        values[selected] = np.rint(values[selected] * factor)
+    out.eliminate_zeros()
+    return out.tocsr()
 
 
 def _cpm_eligible_genes(adata, groupby, pert_label, ctrl_label, *,
@@ -127,11 +144,11 @@ def inject_effect_on_controls(adata, delta, *, n_genes=12, seed=0,
     arm = _stratified_split(ctrl.obs, block_cols or [], rng)
     ctrl.obs["_arm"] = arm
     # work on raw counts
-    C = _dense(_counts_matrix(ctrl, counts_layer)).astype(float)
+    C = sp.csr_matrix(_counts_matrix(ctrl, counts_layer), dtype=float)
     anchors_idx = np.sort(rng.choice(ctrl.n_vars, size=min(n_genes, ctrl.n_vars), replace=False))
     b = arm == "B"
-    C[np.ix_(b, anchors_idx)] = np.rint(C[np.ix_(b, anchors_idx)] * (2.0 ** delta))
-    inj = ad.AnnData(X=sp.csr_matrix(C), obs=ctrl.obs.copy(), var=ctrl.var.copy())
+    C = _inject_sparse_columns(C, b, anchors_idx, 2.0 ** delta)
+    inj = ad.AnnData(X=C, obs=ctrl.obs.copy(), var=ctrl.var.copy())
     anchors = list(ctrl.var_names[anchors_idx])
     return inj, anchors
 
@@ -140,7 +157,8 @@ def inject_effect_on_controls(adata, delta, *, n_genes=12, seed=0,
 # (2) injection recovery: inject known anchors, run DE on the arms, measure TPR/FPR
 # --------------------------------------------------------------------------- #
 def _recover_one(adata, delta, seed, *, n_genes, pert_col, control_label, replicate_col,
-                 counts_layer, fdr, lfc, num_threads, block_cols=None):
+                 counts_layer, fdr, lfc, num_threads, block_cols=None,
+                 non_parametric_engine="pdex", methods=("pdex", "pydeseq2")):
     """One injection→DE recovery at (delta, seed): returns per-method dicts (TPR/FPR + raw counts)."""
     import scanpy as sc
 
@@ -153,30 +171,48 @@ def _recover_one(adata, delta, seed, *, n_genes, pert_col, control_label, replic
     ln = inj.copy()
     sc.pp.normalize_total(ln)
     sc.pp.log1p(ln)
-    de_w = build_de_frame(mode="real", adata=ln, control_pert="A", pert_col="_arm",
-                          num_threads=num_threads, allow_discrete=False, de_method="pdex",
-                          de_kwargs=None, counts_layer=None, replicate_col=replicate_col)
-    de_p = build_de_frame(mode="real", adata=inj, control_pert="A", pert_col="_arm",
-                          num_threads=num_threads, allow_discrete=True, de_method="pydeseq2",
-                          de_kwargs=None, counts_layer=None, replicate_col=replicate_col)
-    de_w = _filter_to_cpm_eligible(de_w, cpm_eligible)
-    de_p = _filter_to_cpm_eligible(de_p, cpm_eligible)
+    de_by_method = {}
+    if "pdex" in methods:
+        de_by_method["wilcoxon"] = build_de_frame(
+            mode="real", adata=ln, control_pert="A", pert_col="_arm",
+            num_threads=num_threads, allow_discrete=False, de_method="pdex",
+            de_kwargs={"engine": non_parametric_engine}, counts_layer=None,
+            replicate_col=replicate_col,
+        )
+    if "pydeseq2" in methods:
+        de_by_method["pydeseq2"] = build_de_frame(
+            mode="real", adata=inj, control_pert="A", pert_col="_arm",
+            num_threads=num_threads, allow_discrete=True, de_method="pydeseq2",
+            de_kwargs=None, counts_layer=None, replicate_col=replicate_col,
+        )
     out = []
-    for method, de in (("wilcoxon", de_w), ("pydeseq2", de_p)):
+    for method, de in de_by_method.items():
+        de = _filter_to_cpm_eligible(de, cpm_eligible)
         sig = de.filter((pl.col("fdr") <= fdr) & (pl.col("log2_fold_change").abs() >= lfc))
         sig_genes = {str(f) for f in sig["feature"].to_list()}
         rec = len(sig_genes & anchor_set)
         fp = len(sig_genes - anchor_set)
         out.append({"delta": float(delta), "seed": int(seed), "method": method,
+                    "engine": non_parametric_engine if method == "wilcoxon" else "cpu",
                     "n_anchors": len(anchor_set), "n_anchors_recovered": rec,
                     "TPR": rec / len(anchor_set), "n_false_positives": fp, "FPR": fp / n_untouched})
     return out
 
 
+def _recover_task_worker(task):
+    repeat, delta = task
+    state = _T0_WORKER_STATE
+    return repeat, delta, _recover_one(
+        state["adata"], delta, state["seed"] + repeat,
+        **state["kwargs"],
+    )
+
+
 def recover_injected(adata, *, deltas=(0.0, 0.5, 1.0, 2.0), n_genes=12, n_repeats=100, seed=0,
                      pert_col="gene", control_label="non-targeting", replicate_col="batch",
                      counts_layer="counts", fdr=0.05, lfc=0.1, num_threads=8, per_repeat_out=None,
-                     block_cols=None):
+                     block_cols=None, non_parametric_engine="pdex",
+                     methods=("pdex", "pydeseq2"), workers=1):
     """Sanity-check the injection, **pooled over ``n_repeats`` repeats** (default 100). Each repeat uses a
     different seed (``seed + r``), so both the control/control A/B split AND the ``n_genes`` anchor set
     change; at each δ, DE (arm B vs arm A) is run with **wilcoxon (pdex)** and **pydeseq2** and we record
@@ -187,23 +223,47 @@ def recover_injected(adata, *, deltas=(0.0, 0.5, 1.0, 2.0), n_genes=12, n_repeat
     ``agg`` = one row per (delta, method) with mean±SD TPR/FPR over the repeats + the pooled TPR
     (total anchors recovered / total injected); ``per_repeat`` = the raw per-(repeat, delta, method) rows.
     """
+    tasks = [(r, delta) for r in range(n_repeats) for delta in deltas]
+    kwargs = {
+        "n_genes": n_genes, "pert_col": pert_col,
+        "control_label": control_label, "replicate_col": replicate_col,
+        "counts_layer": counts_layer, "fdr": fdr, "lfc": lfc,
+        "num_threads": num_threads, "block_cols": block_cols,
+        "non_parametric_engine": non_parametric_engine, "methods": methods,
+    }
+    use_pool = workers > 1 and not (
+        "pdex" in methods and non_parametric_engine == "rsc"
+    )
+    if use_pool:
+        _T0_WORKER_STATE.clear()
+        _T0_WORKER_STATE.update(adata=adata, seed=seed, kwargs=kwargs)
+        pool = mp.get_context("fork").Pool(processes=workers)
+        results = pool.imap(_recover_task_worker, tasks, chunksize=1)
+    else:
+        pool = None
+        results = (
+            (r, delta, _recover_one(adata, delta, seed + r, **kwargs))
+            for r, delta in tasks
+        )
     rows = []
-    for r in range(n_repeats):
-        for delta in deltas:
-            rows += _recover_one(adata, delta, seed + r, n_genes=n_genes, pert_col=pert_col,
-                                 control_label=control_label, replicate_col=replicate_col,
-                                 counts_layer=counts_layer, fdr=fdr, lfc=lfc, num_threads=num_threads,
-                                 block_cols=block_cols)
+    try:
+        for r, delta, fitted in results:
+            rows.extend(fitted)
+            print(f"  delta={delta:g}  repeat={r + 1}/{n_repeats}", flush=True)
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
     per = pl.DataFrame(rows)
     if per_repeat_out:
         per.write_csv(per_repeat_out)
-    agg = (per.group_by(["delta", "method"]).agg(
+    agg = (per.group_by(["delta", "method", "engine"]).agg(
         pl.len().alias("n_repeats"),
         pl.col("TPR").mean().alias("mean_TPR"), pl.col("TPR").std().alias("sd_TPR"),
         (pl.col("n_anchors_recovered").sum() / pl.col("n_anchors").sum()).alias("pooled_TPR"),
         pl.col("FPR").mean().alias("mean_FPR"), pl.col("FPR").std().alias("sd_FPR"),
         pl.col("n_false_positives").mean().alias("mean_false_positives"),
-    ).sort(["delta", "method"]))
+    ).sort(["delta", "method", "engine"]))
     return agg, per
 
 
@@ -278,7 +338,8 @@ def plot_recovery_box(per_repeat_csv, out_png, *, metric="n_anchors_recovered"):
 # (3) expression-bin-stratified injection: same delta, anchors sampled from each bin
 # --------------------------------------------------------------------------- #
 def _recover_one_binned(adata, delta, seed, *, n_genes_per_bin, n_bins, pert_col, control_label,
-                        replicate_col, counts_layer, fdr, lfc, num_threads, block_cols=None):
+                        replicate_col, counts_layer, fdr, lfc, num_threads, block_cols=None,
+                        non_parametric_engine="pdex", methods=("pdex", "pydeseq2")):
     """Per-bin injection→DE recovery: for each bin independently inject n_genes_per_bin
     anchors (only those 12 genes) and run a separate DE experiment. Returns per-bin-per-method rows."""
     import pandas as pd
@@ -297,10 +358,10 @@ def _recover_one_binned(adata, delta, seed, *, n_genes_per_bin, n_bins, pert_col
     arm = _stratified_split(ctrl.obs, block_cols or [], rng)
     ctrl.obs["_arm"] = arm
 
-    C = _dense(_counts_matrix(ctrl, counts_layer)).astype(float)
+    C = sp.csr_matrix(_counts_matrix(ctrl, counts_layer), dtype=float)
     a_mask = arm == "A"
     b_mask = arm == "B"
-    gene_means = C[a_mask].mean(axis=0)
+    gene_means = np.asarray(C[a_mask].mean(axis=0)).ravel()
 
     # log-scale equal-width bins (same logic as before)
     nonzero_idx = np.where(gene_means > 0)[0]
@@ -325,26 +386,30 @@ def _recover_one_binned(adata, delta, seed, *, n_genes_per_bin, n_bins, pert_col
         bin_mean = float(gene_means[bin_gene_idx].mean())
 
         # inject ONLY this bin's anchors into arm B — separate experiment per bin
-        C_inj = C.copy()
-        C_inj[np.ix_(b_mask, anchors_idx)] = np.rint(
-            C_inj[np.ix_(b_mask, anchors_idx)] * (2.0 ** delta)
-        )
-        inj = ad.AnnData(X=sp.csr_matrix(C_inj), obs=ctrl.obs.copy(), var=ctrl.var.copy())
+        C_inj = _inject_sparse_columns(C, b_mask, anchors_idx, 2.0 ** delta)
+        inj = ad.AnnData(X=C_inj, obs=ctrl.obs.copy(), var=ctrl.var.copy())
         cpm_eligible = _cpm_eligible_genes(inj, "_arm", "B", "A")
 
         ln = inj.copy()
         sc.pp.normalize_total(ln)
         sc.pp.log1p(ln)
-        de_w = build_de_frame(mode="real", adata=ln, control_pert="A", pert_col="_arm",
-                              num_threads=num_threads, allow_discrete=False, de_method="pdex",
-                              de_kwargs=None, counts_layer=None, replicate_col=replicate_col)
-        de_p = build_de_frame(mode="real", adata=inj, control_pert="A", pert_col="_arm",
-                              num_threads=num_threads, allow_discrete=True, de_method="pydeseq2",
-                              de_kwargs=None, counts_layer=None, replicate_col=replicate_col)
-        de_w = _filter_to_cpm_eligible(de_w, cpm_eligible)
-        de_p = _filter_to_cpm_eligible(de_p, cpm_eligible)
+        de_by_method = {}
+        if "pdex" in methods:
+            de_by_method["wilcoxon"] = build_de_frame(
+                mode="real", adata=ln, control_pert="A", pert_col="_arm",
+                num_threads=num_threads, allow_discrete=False, de_method="pdex",
+                de_kwargs={"engine": non_parametric_engine}, counts_layer=None,
+                replicate_col=replicate_col,
+            )
+        if "pydeseq2" in methods:
+            de_by_method["pydeseq2"] = build_de_frame(
+                mode="real", adata=inj, control_pert="A", pert_col="_arm",
+                num_threads=num_threads, allow_discrete=True, de_method="pydeseq2",
+                de_kwargs=None, counts_layer=None, replicate_col=replicate_col,
+            )
 
-        for method, de in (("wilcoxon", de_w), ("pydeseq2", de_p)):
+        for method, de in de_by_method.items():
+            de = _filter_to_cpm_eligible(de, cpm_eligible)
             sig_genes = {str(f) for f in de.filter(
                 (pl.col("fdr") <= fdr) & (pl.col("log2_fold_change").abs() >= lfc)
             )["feature"].to_list()}
@@ -353,6 +418,7 @@ def _recover_one_binned(adata, delta, seed, *, n_genes_per_bin, n_bins, pert_col
             n_non = ctrl.n_vars - k
             rows.append({
                 "delta": float(delta), "seed": int(seed), "method": method,
+                "engine": non_parametric_engine if method == "wilcoxon" else "cpu",
                 "bin": b, "bin_mean_count": bin_mean,
                 "n_anchors": k, "n_recovered": rec,
                 "TPR": rec / k,
@@ -362,31 +428,64 @@ def _recover_one_binned(adata, delta, seed, *, n_genes_per_bin, n_bins, pert_col
     return rows
 
 
+def _recover_binned_task_worker(task):
+    repeat, delta = task
+    state = _T0_WORKER_STATE
+    return repeat, delta, _recover_one_binned(
+        state["adata"], delta, state["seed"] + repeat,
+        **state["kwargs"],
+    )
+
+
 def recover_injected_binned(adata, *, deltas=(0.5, 1.0, 2.0), n_genes_per_bin=5, n_bins=10,
                             n_repeats=30, seed=0, pert_col, control_label, replicate_col,
                             counts_layer, fdr, lfc, num_threads, per_repeat_out=None,
-                            block_cols=None):
+                            block_cols=None, non_parametric_engine="pdex",
+                            methods=("pdex", "pydeseq2"), workers=1):
     """Run binned injection over n_repeats × deltas and return (agg, per_repeat) DataFrames.
     Each repeat samples fresh anchors from each expression-quantile bin of control cells,
     injects delta into arm B, runs DE, and records per-bin TPR."""
+    tasks = [(r, delta) for r in range(n_repeats) for delta in deltas]
+    kwargs = {
+        "n_genes_per_bin": n_genes_per_bin, "n_bins": n_bins,
+        "pert_col": pert_col, "control_label": control_label,
+        "replicate_col": replicate_col, "counts_layer": counts_layer,
+        "fdr": fdr, "lfc": lfc, "num_threads": num_threads,
+        "block_cols": block_cols, "non_parametric_engine": non_parametric_engine,
+        "methods": methods,
+    }
+    use_pool = workers > 1 and not (
+        "pdex" in methods and non_parametric_engine == "rsc"
+    )
+    if use_pool:
+        _T0_WORKER_STATE.clear()
+        _T0_WORKER_STATE.update(adata=adata, seed=seed, kwargs=kwargs)
+        pool = mp.get_context("fork").Pool(processes=workers)
+        results = pool.imap(_recover_binned_task_worker, tasks, chunksize=1)
+    else:
+        pool = None
+        results = (
+            (r, delta, _recover_one_binned(adata, delta, seed + r, **kwargs))
+            for r, delta in tasks
+        )
     rows = []
-    for r in range(n_repeats):
-        for delta in deltas:
-            rows += _recover_one_binned(adata, delta, seed + r, n_genes_per_bin=n_genes_per_bin,
-                                        n_bins=n_bins, pert_col=pert_col, control_label=control_label,
-                                        replicate_col=replicate_col, counts_layer=counts_layer,
-                                        fdr=fdr, lfc=lfc, num_threads=num_threads,
-                                        block_cols=block_cols)
+    try:
+        for r, delta, fitted in results:
+            rows.extend(fitted)
             print(f"  [binned] delta={delta:g}  repeat={r + 1}/{n_repeats}", flush=True)
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
     per = pl.DataFrame(rows)
     if per_repeat_out:
         per.write_csv(per_repeat_out)
-    agg = (per.group_by(["delta", "method", "bin"]).agg(
+    agg = (per.group_by(["delta", "method", "engine", "bin"]).agg(
         pl.col("bin_mean_count").mean().alias("bin_mean_count"),
         pl.col("TPR").mean().alias("mean_TPR"),
         pl.col("TPR").std().alias("sd_TPR"),
         pl.len().alias("n_repeats"),
-    ).sort(["delta", "method", "bin"]))
+    ).sort(["delta", "method", "engine", "bin"]))
     return agg, per
 
 
@@ -551,9 +650,32 @@ def main():
     ap.add_argument("--n-bins", type=int, default=10, help="number of expression quantile bins")
     ap.add_argument("--n-repeats-binned", type=int, default=10, help="repeats for binned TPR analysis")
     ap.add_argument("--deltas", default="0,0.5,1,2", help="comma-sep log2FC tiers to inject")
+    ap.add_argument("--non-parametric-engine", choices=("pdex", "rsc"), default="pdex",
+                    help="non-parametric engine; pdex uses Arc pdex and rsc uses RAPIDS GPU Wilcoxon")
+    ap.add_argument("--methods", default="pdex,pydeseq2",
+                    help="comma-separated backends to run")
+    ap.add_argument("--threads", type=int, default=8,
+                    help="CPU threads supplied to each DE fit")
+    ap.add_argument("--pydeseq-workers", type=int, default=1,
+                    help="parallel injection tasks for CPU PyDESeq2; use --threads 1")
     ap.add_argument("--out", default="injection_recovery.csv")
     a = ap.parse_args()
     deltas = tuple(float(x) for x in a.deltas.split(","))
+    methods = tuple(m.strip() for m in a.methods.split(",") if m.strip())
+    unknown = sorted(set(methods) - {"pdex", "pydeseq2"})
+    if not methods or unknown:
+        ap.error(f"--methods must contain pdex and/or pydeseq2; unknown={unknown}")
+    if a.threads < 1 or a.pydeseq_workers < 1:
+        ap.error("--threads and --pydeseq-workers must be at least 1")
+    available_cpus = (
+        len(os.sched_getaffinity(0))
+        if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    )
+    worker_cap = max(1, available_cpus // a.threads)
+    if a.pydeseq_workers > worker_cap:
+        print(f"[safety] capping --pydeseq-workers from {a.pydeseq_workers} "
+              f"to {worker_cap} ({available_cpus} CPUs, {a.threads} threads/fit)")
+        a.pydeseq_workers = worker_cap
 
     adata = ad.read_h5ad(a.adata)
     print(f"loaded {a.adata}: {adata.n_obs} cells × {adata.n_vars} genes")
@@ -578,8 +700,10 @@ def main():
     agg, per = recover_injected(adata, deltas=deltas, n_genes=a.n_genes, n_repeats=a.n_repeats,
                                 seed=0, pert_col=a.pert_col, control_label=a.control,
                                 replicate_col=a.replicate_col, counts_layer=counts_layer,
-                                fdr=a.fdr, lfc=a.lfc, num_threads=8,
-                                per_repeat_out=per_csv, block_cols=block_cols)
+                                fdr=a.fdr, lfc=a.lfc, num_threads=a.threads,
+                                per_repeat_out=per_csv, block_cols=block_cols,
+                                non_parametric_engine=a.non_parametric_engine, methods=methods,
+                                workers=a.pydeseq_workers)
     print(f"\n[injection recovery] {a.n_repeats} repeats × {a.n_genes} anchors, control-vs-control, "
           f"FDR<{a.fdr} & |log2FC|>{a.lfc}. TPR = injected anchors recovered; FPR = untouched genes falsely called.")
     with pl.Config(tbl_rows=40, float_precision=4):
@@ -604,8 +728,9 @@ def main():
         n_genes_per_bin=a.n_genes_per_bin, n_bins=a.n_bins, n_repeats=a.n_repeats_binned,
         seed=200, pert_col=a.pert_col, control_label=a.control,
         replicate_col=a.replicate_col, counts_layer=counts_layer,
-        fdr=a.fdr, lfc=a.lfc, num_threads=8, per_repeat_out=bin_per_csv,
-        block_cols=block_cols)
+        fdr=a.fdr, lfc=a.lfc, num_threads=a.threads, per_repeat_out=bin_per_csv,
+        block_cols=block_cols, non_parametric_engine=a.non_parametric_engine, methods=methods,
+        workers=a.pydeseq_workers)
     bin_png = base_png + "__tpr_by_bin.png"
     plot_tpr_by_bin(bin_per_csv, bin_png, fdr=a.fdr, lfc=a.lfc)
     print(f"plot:    {os.path.abspath(bin_png)}")

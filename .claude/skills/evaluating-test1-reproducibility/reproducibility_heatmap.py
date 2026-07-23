@@ -89,7 +89,8 @@ from scipy import stats
 _RT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "de_helpers.py")
 
 CAP = 2.0  # ±log2FC colour cap
-SIGNATURE_CACHE_VERSION = 4
+MAX_DIAGONAL_COUNT_LABELS = 40
+SIGNATURE_CACHE_VERSION = 6
 CPM_NORMALIZATION = "per_cell_then_mean"
 MIN_CPM = 5.0
 
@@ -99,6 +100,12 @@ MIN_CPM = 5.0
 _REPEAT_ADATA = None
 _REPEAT_CFG = None
 _REPEAT_RT = None
+_PERT_WORKER_STATE = {}
+_PAIR_LFC_A = None
+_PAIR_LFC_B = None
+_PAIR_DE_A = None
+_PAIR_DE_B = None
+PAIR_SPECIFIC_MIN_GENES = 5
 
 
 def _load_runner():
@@ -118,20 +125,20 @@ def _compute_cpm_elig(adata, pos_P, pos_C, cfg, *, min_cpm=MIN_CPM):
     perturbation and shared across DE backends so the CPM gate is method-neutral.
     """
     import scipy.sparse as sp_local
-    counts_layer = cfg.get("counts_layer")
-    if counts_layer and counts_layer in adata.layers:
-        X = adata.layers[counts_layer]
-        if not sp_local.issparse(X):
-            X = sp_local.csr_matrix(X)
-        X = X.tocsr()
-    else:
-        X = adata.X
-        if not sp_local.issparse(X):
-            X = sp_local.csr_matrix(X)
-        X = X.tocsr()
-        sample = X.data[:min(5_000, X.data.size)] if X.data.size > 0 else np.array([0.0])
+    cache = cfg.setdefault("_cpm_cache", {})
+    source_key = (id(adata), cfg.get("counts_layer"))
+    if cache.get("source_key") != source_key:
+        counts_layer = cfg.get("counts_layer")
+        X = (adata.layers[counts_layer]
+             if counts_layer and counts_layer in adata.layers else adata.X)
+        X = sp_local.csr_matrix(X) if not sp_local.issparse(X) else X.tocsr()
+        sample = X.data[:min(5_000, X.data.size)] if X.data.size else np.array([0.0])
         if not np.allclose(sample, np.rint(sample)):
-            X = X.copy(); X.data = np.expm1(X.data)
+            X = X.copy()
+            X.data = np.expm1(X.data)
+        cache.clear()
+        cache.update(source_key=source_key, X=X, control_means={})
+    X = cache["X"]
     def mean_cpm(pos):
         group = X[pos]
         library_sizes = np.asarray(group.sum(axis=1)).ravel().astype(float)
@@ -141,12 +148,51 @@ def _compute_cpm_elig(adata, pos_P, pos_C, cfg, *, min_cpm=MIN_CPM):
         )
         return np.asarray(group.multiply(scales[:, None]).mean(axis=0)).ravel()
 
+    control_pos = np.asarray(pos_C, dtype=np.int64)
+    control_key = control_pos.tobytes()
+    if control_key not in cache["control_means"]:
+        cache["control_means"][control_key] = mean_cpm(control_pos)
     m_pert = mean_cpm(pos_P)
-    m_ctrl = mean_cpm(pos_C)
+    m_ctrl = cache["control_means"][control_key]
     return set(adata.var_names[np.where((m_pert >= min_cpm) | (m_ctrl >= min_cpm))[0]])
 
 
-def split_half_signatures(adata, cfg, rt, *, seed=0):
+def _fit_perturbation_split(task, adata, cfg, rt, pos_C, ctrl_obs, seed):
+    """Fit both halves for one perturbation; add CPM eligibility in the parent."""
+    i, pert, pos_P = task
+    arm = rt.stratified_split(adata.obs.iloc[pos_P], cfg["block_cols"], seed + i)
+    ai, bi = np.where(arm == "A")[0], np.where(arm == "B")[0]
+    carm = rt.stratified_split(ctrl_obs, cfg["block_cols"], seed + i + 7)
+    cai, cbi = np.where(carm == "A")[0], np.where(carm == "B")[0]
+    mcg = cfg["min_cells_per_group"]
+    if min(ai.size, bi.size, cai.size, cbi.size) < mcg:
+        return task, None, "insufficient cells after split"
+    try:
+        de_A = rt._de_two(adata, pos_P[ai], pos_C[cai], cfg, "pert", "ctrl")
+        de_B = rt._de_two(adata, pos_P[bi], pos_C[cbi], cfg, "pert", "ctrl")
+    except Exception as exc:  # noqa: BLE001
+        return task, None, str(exc)
+    j = de_A.join(de_B, on="feature", how="inner", suffix="_b")
+    la = j["log2_fold_change"].to_numpy().astype(float)
+    lb = j["log2_fold_change_b"].to_numpy().astype(float)
+    ok = np.isfinite(la) & np.isfinite(lb)
+    rho_pairwise = (float(stats.spearmanr(la[ok], lb[ok]).statistic)
+                    if ok.sum() >= 5 else float("nan"))
+    return task, {
+        "rho_pairwise": rho_pairwise,
+        "genes": j["feature"].to_numpy().astype(str),
+        "lfc_a": la,
+        "lfc_b": lb,
+        "fdr_a": j["fdr"].to_numpy().astype(float),
+        "fdr_b": j["fdr_b"].to_numpy().astype(float),
+    }, None
+
+
+def _fit_perturbation_split_worker(task):
+    return _fit_perturbation_split(task, **_PERT_WORKER_STATE)
+
+
+def split_half_signatures(adata, cfg, rt, *, seed=0, perturbation_workers=1):
     """For each perturbation: batch-stratified A/B split (controls also split), run DE_A = A vs
     ctrl_half_A and DE_B = B vs ctrl_half_B via the shared `_de_two`, and collect per-gene LFC_A/LFC_B
     (+ FDRs) and the split-half Spearman ρ. Returns a dict pert -> {rho, lfc_a, lfc_b, fdr_a, fdr_b}
@@ -154,40 +200,58 @@ def split_half_signatures(adata, cfg, rt, *, seed=0):
     rt.maybe_normalize(adata, cfg)  # pdex expects log-norm; no-op for pydeseq2
     pc, mcg, ctrl = cfg["pert_col"], cfg["min_cells_per_group"], cfg["control_pert"]
     labels = adata.obs[pc].astype(str).to_numpy()
-    pos_C = np.where(labels == ctrl)[0]
+    grouped = adata.obs.assign(_cell_eval_label=labels).groupby(
+        "_cell_eval_label", observed=True, sort=True,
+    ).indices
+    pos_C = np.asarray(grouped[ctrl], dtype=int)
     ctrl_obs = adata.obs.iloc[pos_C]
-    perts = [g for g in sorted(set(labels)) if g != ctrl]
+    perts = [g for g in sorted(grouped) if g != ctrl]
+    tasks = [
+        (i, pert, np.asarray(grouped[pert], dtype=int))
+        for i, pert in enumerate(perts)
+        if len(grouped[pert]) >= 2 * mcg
+    ]
+
+    if cfg["de_method"] == "pydeseq2" and perturbation_workers > 1:
+        _PERT_WORKER_STATE.clear()
+        _PERT_WORKER_STATE.update(
+            adata=adata, cfg=cfg, rt=rt, pos_C=pos_C,
+            ctrl_obs=ctrl_obs, seed=seed,
+        )
+        pool = multiprocessing.get_context("fork").Pool(
+            processes=perturbation_workers,
+        )
+        results = pool.imap(_fit_perturbation_split_worker, tasks, chunksize=1)
+    else:
+        pool = None
+        results = (
+            _fit_perturbation_split(task, adata, cfg, rt, pos_C, ctrl_obs, seed)
+            for task in tasks
+        )
+
     out = {}
-    for i, pert in enumerate(perts):
-        pos_P = np.where(labels == pert)[0]
-        if pos_P.size < 2 * mcg:
-            continue
-        arm = rt.stratified_split(adata.obs.iloc[pos_P], cfg["block_cols"], seed + i)
-        ai, bi = np.where(arm == "A")[0], np.where(arm == "B")[0]
-        carm = rt.stratified_split(ctrl_obs, cfg["block_cols"], seed + i + 7)
-        cai, cbi = np.where(carm == "A")[0], np.where(carm == "B")[0]
-        if min(ai.size, bi.size, cai.size, cbi.size) < mcg:
-            continue
-        try:
-            de_A = rt._de_two(adata, pos_P[ai], pos_C[cai], cfg, "pert", "ctrl")
-            de_B = rt._de_two(adata, pos_P[bi], pos_C[cbi], cfg, "pert", "ctrl")
-        except Exception as e:  # noqa: BLE001
-            print(f"  {pert}: DE failed ({e})"); continue
-        j = de_A.join(de_B, on="feature", how="inner", suffix="_b")
-        la = j["log2_fold_change"].to_numpy().astype(float)
-        lb = j["log2_fold_change_b"].to_numpy().astype(float)
-        ok = np.isfinite(la) & np.isfinite(lb)
-        rho_pairwise = (float(stats.spearmanr(la[ok], lb[ok]).statistic)
-                        if ok.sum() >= 5 else float("nan"))
-        genes = j["feature"].to_numpy().astype(str)
-        elig = _compute_cpm_elig(adata, pos_P, pos_C, cfg)
-        out[pert] = {"rho": float("nan"), "rho_pairwise": rho_pairwise,
-                     "genes": genes, "lfc_a": la, "lfc_b": lb,
-                     "fdr_a": j["fdr"].to_numpy().astype(float),
-                     "fdr_b": j["fdr_b"].to_numpy().astype(float),
-                     "cpm_elig": np.array([g in elig for g in genes]),
-                     "n_cells": int(pos_P.size)}
-        print(f"  {pert:20s} provisional-overlap ρ={rho_pairwise:.3f}  ({pos_P.size} cells)")
+    try:
+        for task, fitted, error in results:
+            _, pert, pos_P = task
+            if fitted is None:
+                print(f"  {pert}: DE failed ({error})", flush=True)
+                continue
+            genes = fitted["genes"]
+            elig = _compute_cpm_elig(adata, pos_P, pos_C, cfg)
+            out[pert] = {"rho": float("nan"),
+                         "rho_pairwise": fitted["rho_pairwise"],
+                         "genes": genes, "lfc_a": fitted["lfc_a"],
+                         "lfc_b": fitted["lfc_b"],
+                         "fdr_a": fitted["fdr_a"], "fdr_b": fitted["fdr_b"],
+                         "cpm_elig": np.array([g in elig for g in genes]),
+                         "n_cells": int(pos_P.size)}
+            print(f"  {pert:20s} provisional-overlap "
+                  f"ρ={fitted['rho_pairwise']:.3f}  ({pos_P.size} cells)",
+                  flush=True)
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
     if not out:
         raise ValueError(
             f"No perturbation produced a valid split-half signature. Check control "
@@ -196,13 +260,14 @@ def split_half_signatures(adata, cfg, rt, *, seed=0):
     return out
 
 
-def _write_lfc_vectors(signatures_by_repeat, method, base_seed, out_path):
+def _write_lfc_vectors(signatures_by_repeat, method, engine, base_seed, out_path):
     """Stream one long-form Parquet row per repeat-perturbation-feature LFC pair."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     schema = pa.schema([
         ("method", pa.string()),
+        ("engine", pa.string()),
         ("repeat", pa.int32()),
         ("seed", pa.int64()),
         ("perturbation", pa.string()),
@@ -220,6 +285,7 @@ def _write_lfc_vectors(signatures_by_repeat, method, base_seed, out_path):
                 n = len(d["genes"])
                 table = pa.Table.from_pydict({
                     "method": [method] * n,
+                    "engine": [engine] * n,
                     "repeat": np.full(n, repeat, dtype=np.int32),
                     "seed": np.full(n, base_seed + repeat, dtype=np.int64),
                     "perturbation": [perturbation] * n,
@@ -244,7 +310,8 @@ def _run_repeat_worker(task):
     print(f"\n=== {_REPEAT_CFG['de_method']} split-half DE "
           f"(repeat={repeat}, seed={seed}) ===", flush=True)
     return repeat, split_half_signatures(
-        _REPEAT_ADATA, _REPEAT_CFG, _REPEAT_RT, seed=seed
+        _REPEAT_ADATA, _REPEAT_CFG, _REPEAT_RT, seed=seed,
+        perturbation_workers=_REPEAT_CFG.get("perturbation_workers", 1),
     )
 
 
@@ -267,6 +334,9 @@ def _write_signature_cache(path, signatures_by_repeat, *, method, dataset, args,
         "cpm_normalization": CPM_NORMALIZATION,
         "min_cpm": MIN_CPM,
         "counts_layer": counts_layer,
+        "non_parametric_engine": (
+            args.non_parametric_engine if method == "pdex" else "not_applicable"
+        ),
         "signatures_by_repeat": dict(sorted(signatures_by_repeat.items())),
     }
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -281,10 +351,12 @@ def _read_signature_cache(path, *, method, dataset, args, counts_layer):
     with open(path, "rb") as handle:
         payload = pickle.load(handle)  # trusted local checkpoint from this skill
     version = payload.get("format_version")
-    if version != SIGNATURE_CACHE_VERSION:
+    legacy_pydeseq2 = method == "pydeseq2" and version in {4, 5}
+    if version != SIGNATURE_CACHE_VERSION and not legacy_pydeseq2:
         raise ValueError(
             f"Unsupported signature cache format {version!r} in {path}; "
-            f"version {SIGNATURE_CACHE_VERSION} is required after the per-cell CPM change"
+            f"version {SIGNATURE_CACHE_VERSION} is required after the "
+            "non-parametric engine schema change"
         )
     expected = {
         "method": method,
@@ -298,6 +370,11 @@ def _read_signature_cache(path, *, method, dataset, args, counts_layer):
         "min_cpm": MIN_CPM,
         "counts_layer": counts_layer,
     }
+    if not legacy_pydeseq2:
+        expected["non_parametric_engine"] = (
+            args.non_parametric_engine
+            if method == "pdex" else "not_applicable"
+        )
     mismatches = {
         key: (payload.get(key), value)
         for key, value in expected.items()
@@ -779,9 +856,465 @@ def _filter_signatures_to_shared_units(sigs_by_method: dict, methods: list[str])
     return filtered
 
 
+def _variant_output_path(path: str, variant: str, extension: str = ".png") -> str:
+    """Insert an output variant before the terminal ``__dataset`` tag."""
+    stem = os.path.splitext(path)[0]
+    prefix, separator, dataset = stem.rpartition("__")
+    if separator:
+        return f"{prefix}_{variant}__{dataset}{extension}"
+    return f"{stem}_{variant}{extension}"
+
+
+def _finite_correlation_groups(matrix: np.ndarray):
+    """Return finite diagonal and off-diagonal values from a square matrix."""
+    diagonal = np.diag(matrix)
+    off_diagonal = matrix[~np.eye(matrix.shape[0], dtype=bool)]
+    return (
+        diagonal[np.isfinite(diagonal)],
+        off_diagonal[np.isfinite(off_diagonal)],
+    )
+
+
+def _correlation_distribution_summary(method, metric, group, values):
+    """One CSV-ready distribution summary, including empty-group safeguards."""
+    values = np.asarray(values, dtype=float)
+    if values.size == 0:
+        return {
+            "method": method, "metric": metric, "group": group, "n": 0,
+            "mean": np.nan, "std": np.nan, "min": np.nan, "q05": np.nan,
+            "q25": np.nan, "median": np.nan, "q75": np.nan,
+            "q95": np.nan, "max": np.nan,
+        }
+    q05, q25, median, q75, q95 = np.quantile(
+        values, [0.05, 0.25, 0.50, 0.75, 0.95]
+    )
+    return {
+        "method": method, "metric": metric, "group": group,
+        "n": int(values.size), "mean": float(np.mean(values)),
+        "std": float(np.std(values)), "min": float(np.min(values)),
+        "q05": float(q05), "q25": float(q25), "median": float(median),
+        "q75": float(q75), "q95": float(q95), "max": float(np.max(values)),
+    }
+
+
+def correlation_distribution_boxplots(
+    matrices_by_method, out_png, *, methods, title_prefix="Test-1",
+    unit="perturbation", panel_label="global union-DE", seed=0,
+):
+    """Plot diagonal/off-diagonal distributions for every method and metric.
+
+    Boxes and summary statistics use every finite matrix cell. The scatter
+    layer also renders every finite value (rasterized for compact PNG output);
+    it is never subsampled.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    rows = len(methods)
+    fig, axes = plt.subplots(
+        rows, 2, figsize=(11.0, 5.6 * rows), sharey=True, squeeze=False
+    )
+    colors = ("#D95F59", "#4C78A8")
+    rng = np.random.default_rng(seed)
+    summaries = []
+    n_units = None
+    for row, method in enumerate(methods):
+        matrices = matrices_by_method[method]
+        for column, (metric, key) in enumerate(
+            (("Spearman", "spearman"), ("Pearson", "pearson"))
+        ):
+            ax = axes[row, column]
+            matrix = np.asarray(matrices[key], dtype=float)
+            if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+                raise ValueError(
+                    f"{method} {metric} matrix must be square, got {matrix.shape}"
+                )
+            n_units = matrix.shape[0] if n_units is None else n_units
+            diagonal, off_diagonal = _finite_correlation_groups(matrix)
+            summaries.extend([
+                _correlation_distribution_summary(
+                    method, metric, "diagonal", diagonal
+                ),
+                _correlation_distribution_summary(
+                    method, metric, "off_diagonal", off_diagonal
+                ),
+            ])
+            box_values = [
+                values if values.size else np.asarray([np.nan])
+                for values in (diagonal, off_diagonal)
+            ]
+            boxes = ax.boxplot(
+                box_values,
+                tick_labels=[
+                    f"Diagonal\n(within {unit})",
+                    f"Off-diagonal\n(cross {unit})",
+                ],
+                patch_artist=True, showfliers=False, whis=(5, 95),
+                widths=0.58,
+                medianprops={"color": "black", "linewidth": 1.8},
+                whiskerprops={"linewidth": 1.1},
+                capprops={"linewidth": 1.1},
+            )
+            for patch, color in zip(boxes["boxes"], colors):
+                patch.set_facecolor(color)
+                patch.set_alpha(0.82)
+            for x_position, values, color in zip(
+                (1, 2), (diagonal, off_diagonal), colors
+            ):
+                if values.size == 0:
+                    continue
+                jitter = rng.uniform(
+                    x_position - 0.17, x_position + 0.17, size=values.size
+                )
+                ax.scatter(
+                    jitter, values,
+                    s=5 if x_position == 1 else 1,
+                    color=color,
+                    alpha=(
+                        0.22 if x_position == 1
+                        else max(0.002, min(0.055, 1_000 / values.size))
+                    ),
+                    edgecolors="none", rasterized=True, zorder=3,
+                )
+            ax.axhline(0, color="#777777", linestyle="--", linewidth=1)
+            ax.set_ylim(-1.02, 1.02)
+            ax.grid(axis="y", color="#dddddd", linewidth=0.7)
+            ax.set_title(f"{method} — {metric}")
+            for x_position, values in enumerate(
+                (diagonal, off_diagonal), start=1
+            ):
+                median = float(np.median(values)) if values.size else np.nan
+                mean = float(np.mean(values)) if values.size else np.nan
+                ax.text(
+                    x_position, -0.96,
+                    f"n={values.size:,}\nmedian={median:.2f}\nmean={mean:.2f}",
+                    ha="center", va="bottom", fontsize=9,
+                    bbox={
+                        "facecolor": "white", "edgecolor": "none", "alpha": 0.8
+                    },
+                )
+        axes[row, 0].set_ylabel("Correlation")
+    fig.suptitle(
+        f"{title_prefix} {panel_label} correlations\n"
+        f"all {n_units or 0:,} {unit}s; boxes = IQR, whiskers = "
+        "5th–95th percentiles; non-finite cells excluded; "
+        "points = all finite diagonal and off-diagonal values",
+        fontsize=13,
+    )
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(os.path.abspath(out_png)), exist_ok=True)
+    fig.savefig(out_png, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    csv_path = os.path.splitext(out_png)[0] + ".csv"
+    pl.DataFrame(summaries).write_csv(csv_path)
+    print(f"  saved correlation boxplots: {out_png}")
+    print(f"  saved correlation summaries: {csv_path}")
+    return out_png
+
+
+def _pair_specific_signature_matrices(sigs, units, cfg):
+    """Dense LFC and DE masks for exact pair-specific DE-union panels."""
+    feature_set = set()
+    for unit in units:
+        feature_set.update(np.asarray(sigs[unit]["genes"], dtype=str))
+    features = np.asarray(sorted(feature_set), dtype=str)
+    feature_index = {feature: index for index, feature in enumerate(features)}
+    shape = (len(units), len(features))
+    lfc_a = np.full(shape, np.nan, dtype=np.float64)
+    lfc_b = np.full(shape, np.nan, dtype=np.float64)
+    de_a = np.zeros(shape, dtype=bool)
+    de_b = np.zeros(shape, dtype=bool)
+    fdr_threshold = float(cfg["fdr_threshold"])
+    lfc_threshold = float(cfg["lfc_threshold"])
+    for row, unit_name in enumerate(units):
+        signature = sigs[unit_name]
+        genes = np.asarray(signature["genes"], dtype=str)
+        columns = np.fromiter(
+            (feature_index[feature] for feature in genes),
+            dtype=np.int64, count=len(genes),
+        )
+        current_a = np.asarray(signature["lfc_a"], dtype=float)
+        current_b = np.asarray(signature["lfc_b"], dtype=float)
+        fdr_a = np.asarray(signature["fdr_a"], dtype=float)
+        fdr_b = np.asarray(signature["fdr_b"], dtype=float)
+        cpm_elig = _cpm_elig_mask(signature)
+        if not all(
+            len(values) == len(genes)
+            for values in (current_a, current_b, fdr_a, fdr_b, cpm_elig)
+        ):
+            raise ValueError(
+                f"{unit_name}: pair-specific signature arrays have "
+                "inconsistent lengths"
+            )
+        lfc_a[row, columns] = current_a
+        lfc_b[row, columns] = current_b
+        de_a[row, columns] = (
+            cpm_elig & np.isfinite(current_a) & np.isfinite(fdr_a)
+            & (fdr_a <= fdr_threshold)
+            & (np.abs(current_a) >= lfc_threshold)
+        )
+        de_b[row, columns] = (
+            cpm_elig & np.isfinite(current_b) & np.isfinite(fdr_b)
+            & (fdr_b <= fdr_threshold)
+            & (np.abs(current_b) >= lfc_threshold)
+        )
+    return features, lfc_a, lfc_b, de_a, de_b
+
+
+def _vector_correlation(left, right, *, rank):
+    """Correlation coefficient with finite/constant-vector safeguards."""
+    if left.size < PAIR_SPECIFIC_MIN_GENES:
+        return np.nan
+    if rank:
+        left = stats.rankdata(left)
+        right = stats.rankdata(right)
+    left = left - left.mean()
+    right = right - right.mean()
+    denominator = np.sqrt(np.dot(left, left) * np.dot(right, right))
+    if denominator == 0:
+        return np.nan
+    return float(np.clip(np.dot(left, right) / denominator, -1.0, 1.0))
+
+
+def _pair_specific_rows(bounds):
+    """Fork-worker row block for pair-specific Spearman/Pearson matrices."""
+    start, stop = bounds
+    n_units = _PAIR_LFC_A.shape[0]
+    spearman = np.full((stop - start, n_units), np.nan, dtype=np.float32)
+    pearson = np.full_like(spearman, np.nan)
+    n_genes = np.zeros((stop - start, n_units), dtype=np.uint32)
+    for local_row, row in enumerate(range(start, stop)):
+        finite_a = np.isfinite(_PAIR_LFC_A[row])
+        for column in range(n_units):
+            panel = (
+                (_PAIR_DE_A[row] | _PAIR_DE_B[column])
+                & finite_a & np.isfinite(_PAIR_LFC_B[column])
+            )
+            count = int(panel.sum())
+            n_genes[local_row, column] = count
+            if count < PAIR_SPECIFIC_MIN_GENES:
+                continue
+            left = _PAIR_LFC_A[row, panel]
+            right = _PAIR_LFC_B[column, panel]
+            spearman[local_row, column] = _vector_correlation(
+                left, right, rank=True
+            )
+            pearson[local_row, column] = _vector_correlation(
+                left, right, rank=False
+            )
+    return start, stop, spearman, pearson, n_genes
+
+
+def _pair_specific_repeat(sigs, units, cfg, *, workers=1, rows_per_task=4):
+    """Compute one repeat's pair-specific correlation matrices."""
+    global _PAIR_LFC_A, _PAIR_LFC_B, _PAIR_DE_A, _PAIR_DE_B
+    features, _PAIR_LFC_A, _PAIR_LFC_B, _PAIR_DE_A, _PAIR_DE_B = (
+        _pair_specific_signature_matrices(sigs, units, cfg)
+    )
+    n_units = len(units)
+    spearman = np.full((n_units, n_units), np.nan, dtype=np.float32)
+    pearson = np.full_like(spearman, np.nan)
+    n_genes = np.zeros((n_units, n_units), dtype=np.uint32)
+    bounds = [
+        (start, min(start + rows_per_task, n_units))
+        for start in range(0, n_units, rows_per_task)
+    ]
+    use_fork = (
+        workers > 1 and n_units >= 64
+        and "fork" in multiprocessing.get_all_start_methods()
+    )
+    if use_fork:
+        context = multiprocessing.get_context("fork")
+        with context.Pool(processes=min(workers, len(bounds))) as pool:
+            blocks = pool.imap_unordered(
+                _pair_specific_rows, bounds, chunksize=1
+            )
+            for start, stop, block_s, block_p, block_n in blocks:
+                spearman[start:stop] = block_s
+                pearson[start:stop] = block_p
+                n_genes[start:stop] = block_n
+    else:
+        for start, stop in bounds:
+            _, _, block_s, block_p, block_n = _pair_specific_rows((start, stop))
+            spearman[start:stop] = block_s
+            pearson[start:stop] = block_p
+            n_genes[start:stop] = block_n
+    _PAIR_LFC_A = _PAIR_LFC_B = _PAIR_DE_A = _PAIR_DE_B = None
+    return features, spearman, pearson, n_genes
+
+
+def _nanmean_stacks(arrays):
+    """Cellwise nanmean without all-NaN RuntimeWarnings."""
+    stack = np.stack(arrays)
+    finite = np.isfinite(stack)
+    counts = finite.sum(axis=0)
+    totals = np.where(finite, stack, 0).sum(axis=0, dtype=np.float64)
+    output = np.full(counts.shape, np.nan, dtype=np.float32)
+    np.divide(totals, counts, out=output, where=counts > 0)
+    return output, counts.astype(np.uint16)
+
+
+def _finite_mean(values):
+    """Mean of finite values, or NaN without emitting empty-slice warnings."""
+    values = np.asarray(values, dtype=float)
+    finite = values[np.isfinite(values)]
+    return float(np.mean(finite)) if finite.size else np.nan
+
+
+def pair_specific_de_union_corr_matrix(
+    sigs_by_method, out_png, cfg, *, methods, title_prefix="Test-1",
+    unit="perturbation", workers=1, rows_per_task=4,
+):
+    """Emit exact pair-specific DE-union matrices and their boxplots.
+
+    Cell ``(i, j)`` uses the union of split-A DE calls for unit ``i`` and
+    split-B DE calls for unit ``j`` within that method and repeat. DE calls
+    require the configured FDR/LFC cutoffs and each unit's CPM eligibility.
+    Genes must have finite LFCs in both compared vectors. Test 1 computes each
+    repeat separately and averages corresponding cells; Test 4 supplies one
+    repeat and therefore needs no averaging.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    repeats_by_method, units = _shared_unit_order(sigs_by_method, methods)
+    n_units = len(units)
+    matrices_by_method = {}
+    matrix_archive = {
+        "format_version": np.asarray(1, dtype=np.int32),
+        "methods": np.asarray(methods, dtype=str),
+        "targets": np.asarray(units, dtype=str),
+        "fdr_threshold": np.asarray(cfg["fdr_threshold"], dtype=float),
+        "lfc_threshold": np.asarray(cfg["lfc_threshold"], dtype=float),
+        "min_genes": np.asarray(PAIR_SPECIFIC_MIN_GENES, dtype=np.int32),
+        "panel_definition": np.asarray(
+            "cell(i,j) uses DE_A(unit i) union DE_B(unit j) within each "
+            "method/repeat; calls require FDR, absolute LFC, and unit-specific "
+            "CPM eligibility; retained genes are finite in both compared LFC "
+            "vectors; repeat matrices are averaged cellwise",
+            dtype=str,
+        ),
+    }
+    fig, axes = plt.subplots(
+        1, len(methods), figsize=(6.8 * len(methods), 6.4), squeeze=False
+    )
+    image = None
+    for ax, method in zip(axes[0], methods):
+        repeat_spearman = []
+        repeat_pearson = []
+        repeat_n_genes = []
+        feature_union = set()
+        for repeat, sigs in enumerate(repeats_by_method[method]):
+            print(
+                f"  {method}: pair-specific DE-union repeat "
+                f"{repeat + 1}/{len(repeats_by_method[method])}",
+                flush=True,
+            )
+            features, spearman, pearson, n_genes = _pair_specific_repeat(
+                sigs, units, cfg, workers=workers,
+                rows_per_task=rows_per_task,
+            )
+            feature_union.update(features)
+            repeat_spearman.append(spearman)
+            repeat_pearson.append(pearson)
+            repeat_n_genes.append(n_genes)
+        mean_spearman, finite_spearman_repeats = _nanmean_stacks(
+            repeat_spearman
+        )
+        mean_pearson, finite_pearson_repeats = _nanmean_stacks(repeat_pearson)
+        mean_n_genes = np.mean(
+            np.stack(repeat_n_genes).astype(np.float64), axis=0
+        ).astype(np.float32)
+        matrices_by_method[method] = {
+            "spearman": mean_spearman, "pearson": mean_pearson,
+        }
+        matrix_archive[f"targets__{method}"] = np.asarray(units, dtype=str)
+        matrix_archive[f"feature_universe__{method}"] = np.asarray(
+            sorted(feature_union), dtype=str
+        )
+        matrix_archive[f"spearman__{method}"] = mean_spearman
+        matrix_archive[f"pearson__{method}"] = mean_pearson
+        matrix_archive[f"n_genes_mean__{method}"] = mean_n_genes
+        matrix_archive[f"finite_spearman_repeats__{method}"] = (
+            finite_spearman_repeats
+        )
+        matrix_archive[f"finite_pearson_repeats__{method}"] = (
+            finite_pearson_repeats
+        )
+        matrix_archive[f"n_repeats__{method}"] = np.asarray(
+            len(repeat_spearman), dtype=np.int32
+        )
+        image = ax.imshow(
+            mean_spearman, cmap="RdBu_r", vmin=-1, vmax=1,
+            interpolation="nearest",
+        )
+        ax.set_xticks(range(n_units))
+        ax.set_yticks(range(n_units))
+        ax.set_xticklabels(units, rotation=90, fontsize=5)
+        ax.set_yticklabels(units, fontsize=5)
+        ax.set_xlabel(f"split B {unit}")
+        ax.set_ylabel(f"split A {unit}")
+        diagonal = np.eye(n_units, dtype=bool)
+        values = {
+            "spearman_diagonal": _finite_mean(mean_spearman[diagonal]),
+            "spearman_off": _finite_mean(mean_spearman[~diagonal]),
+            "pearson_diagonal": _finite_mean(mean_pearson[diagonal]),
+            "pearson_off": _finite_mean(mean_pearson[~diagonal]),
+        }
+        ax.set_title(
+            f"{method}\n"
+            f"Spearman: diag={values['spearman_diagonal']:.2f}, "
+            f"off={values['spearman_off']:.2f}; "
+            f"Pearson: diag={values['pearson_diagonal']:.2f}, "
+            f"off={values['pearson_off']:.2f}",
+            fontsize=9,
+        )
+        finite_panels = mean_n_genes[np.isfinite(mean_spearman)]
+        if finite_panels.size:
+            print(
+                f"  {method}: pair-specific panel n median="
+                f"{np.median(finite_panels):.0f}, "
+                f"range={np.min(finite_panels):.0f}–"
+                f"{np.max(finite_panels):.0f}",
+                flush=True,
+            )
+    fig.colorbar(
+        image, ax=axes[0].tolist(), fraction=0.025, pad=0.02,
+        label="Spearman ρ on pair-specific DE-union genes",
+    )
+    repeats = [len(repeats_by_method[method]) for method in methods]
+    repeat_label = str(repeats[0]) if len(set(repeats)) == 1 else "/".join(
+        map(str, repeats)
+    )
+    fig.suptitle(
+        f"{title_prefix} mean across {repeat_label} repeat(s) — "
+        "pair-specific DE-union correlations\n"
+        f"cell (i,j) uses DE_A({unit} i) ∪ DE_B({unit} j); "
+        f"FDR ≤ {cfg['fdr_threshold']:g}, "
+        f"|LFC| ≥ {cfg['lfc_threshold']:g}, CPM eligible; "
+        f"all {n_units:,} {unit}s",
+        fontsize=10,
+    )
+    fig.savefig(out_png, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    matrix_path = os.path.splitext(out_png)[0] + ".npz"
+    np.savez_compressed(matrix_path, **matrix_archive)
+    print(f"  saved pair-specific correlation values: {matrix_path}")
+    boxplot_path = _variant_output_path(out_png, "boxplots")
+    correlation_distribution_boxplots(
+        matrices_by_method, boxplot_path, methods=methods,
+        title_prefix=title_prefix, unit=unit,
+        panel_label="pair-specific DE-union", seed=0,
+    )
+    return out_png
+
+
 def layer3_corr_matrix(sigs_by_method, out_png, cfg, genes, *, methods,
                        title_prefix="Test-1", unit="perturbation",
-                       gene_set_label: str = "union DE genes"):
+                       gene_set_label: str = "union DE genes",
+                       emit_boxplots: bool = False):
     """Mean split-A × split-B signature correlation matrix per backend.
 
     ``sigs_by_method[method]`` may be one signature dict (backwards
@@ -807,6 +1340,7 @@ def layer3_corr_matrix(sigs_by_method, out_png, cfg, genes, *, methods,
         "gene_set_label": np.asarray(gene_set_label, dtype=str),
         "targets": np.asarray(perts, dtype=str),
     }
+    matrices_by_method = {}
     if not isinstance(genes, dict):
         matrix_archive["features"] = np.asarray(genes, dtype=str)
     for ax, m in zip(axes[0], methods):
@@ -856,14 +1390,21 @@ def layer3_corr_matrix(sigs_by_method, out_png, cfg, genes, *, methods,
             C = np.nanmean(np.stack(repeat_spearman), axis=0)
             P = np.nanmean(np.stack(repeat_pearson), axis=0)
         im = ax.imshow(C, cmap="RdBu_r", vmin=-1, vmax=1, interpolation="nearest")
-        # annotate each diagonal cell with that unit's cell count (n cells before the A/B split)
-        for i, p in enumerate(perts):
-            counts = [sigs[p].get("n_cells") for sigs in repeat_sigs]
-            counts = [x for x in counts if x is not None]
-            if counts:
-                nc = int(round(float(np.mean(counts))))
-                ax.text(i, i, str(nc), ha="center", va="center", fontsize=4,
-                        color="white", fontweight="bold")
+        # Counts are useful for small panels, but overlapping text obscures the
+        # diagonal on large matrices. Axis labels remain complete at every size.
+        if n <= MAX_DIAGONAL_COUNT_LABELS:
+            for i, p in enumerate(perts):
+                counts = [sigs[p].get("n_cells") for sigs in repeat_sigs]
+                counts = [x for x in counts if x is not None]
+                if counts:
+                    nc = int(round(float(np.mean(counts))))
+                    ax.text(i, i, str(nc), ha="center", va="center", fontsize=4,
+                            color="white", fontweight="bold")
+        else:
+            print(
+                f"  {m}: suppressed {n} diagonal count labels "
+                f"(threshold={MAX_DIAGONAL_COUNT_LABELS})"
+            )
         ax.set_xticks(range(n)); ax.set_xticklabels(perts, rotation=90, fontsize=5)
         ax.set_yticks(range(n)); ax.set_yticklabels(perts, fontsize=5)
         ax.set_xlabel(f"split B {unit}"); ax.set_ylabel(f"split A {unit}")
@@ -875,6 +1416,7 @@ def layer3_corr_matrix(sigs_by_method, out_png, cfg, genes, *, methods,
         matrix_archive[f"targets__{m}"] = np.asarray(perts, dtype=str)
         matrix_archive[f"spearman__{m}"] = C
         matrix_archive[f"pearson__{m}"] = P
+        matrices_by_method[m] = {"spearman": C, "pearson": P}
         print(
             f"  {m} {gene_set_label}: mean across {len(repeat_sigs)} repeat(s); "
             f"Spearman diag={spearman_diagonal:.4f}, off={spearman_offdiagonal:.4f}; "
@@ -892,13 +1434,20 @@ def layer3_corr_matrix(sigs_by_method, out_png, cfg, genes, *, methods,
                      else "/".join(map(str, repeat_counts)))
     fig.suptitle(f"{title_prefix} mean across {repeats_label} repeats — "
                  f"split-A × split-B signature correlation — {gene_set_label}\n"
-                 f"diagonal = within-{unit} reproducibility (bright = reproducible), "
+                 f"diagonal = within-{unit} reproducibility "
+                 "(dark red = higher positive correlation), "
                  "off-diagonal = cross-" + unit + "; heatmap colors = Spearman", fontsize=10)
     fig.savefig(out_png, dpi=140, bbox_inches="tight")
     plt.close(fig)
     matrix_path = os.path.splitext(out_png)[0] + ".npz"
     np.savez_compressed(matrix_path, **matrix_archive)
     print(f"  saved correlation values: {matrix_path}")
+    if emit_boxplots:
+        correlation_distribution_boxplots(
+            matrices_by_method, _variant_output_path(out_png, "boxplots"),
+            methods=methods, title_prefix=title_prefix, unit=unit,
+            panel_label="global union-DE", seed=0,
+        )
     return out_png
 
 
@@ -922,8 +1471,14 @@ def main():
                     help="independent A/B splits used for the averaged Layer-3 correlation maps")
     ap.add_argument("--threads", type=int, default=8,
                     help="worker threads passed to each DE backend fit")
+    ap.add_argument("--non-parametric-engine", choices=("pdex", "rsc"), default="pdex",
+                    help="non-parametric engine; pdex uses Arc pdex and rsc uses RAPIDS GPU Wilcoxon")
     ap.add_argument("--parallel-repeats", type=int, default=1,
                     help="repeat-level fork workers; use up to n-repeats on large multicore hosts")
+    ap.add_argument("--perturbation-workers", type=int, default=1,
+                    help="within-repeat PyDESeq2 perturbation workers; use --threads 1")
+    ap.add_argument("--pairwise-workers", type=int, default=8,
+                    help="fork workers for pair-specific DE-union correlation rows")
     ap.add_argument("--signature-cache-dir", default=None,
                     help="optional directory for method-level repeat signature checkpoints")
     ap.add_argument("--resume-signatures", action="store_true",
@@ -955,10 +1510,34 @@ def main():
         ap.error("--threads must be at least 1")
     if a.parallel_repeats < 1:
         ap.error("--parallel-repeats must be at least 1")
+    if a.perturbation_workers < 1:
+        ap.error("--perturbation-workers must be at least 1")
+    if a.pairwise_workers < 1:
+        ap.error("--pairwise-workers must be at least 1")
+    if a.perturbation_workers > 1 and a.parallel_repeats > 1:
+        print("[safety] nested fork pools are unsupported; forcing --parallel-repeats=1")
+        a.parallel_repeats = 1
+    if a.non_parametric_engine == "rsc" and a.parallel_repeats > 1:
+        print("[safety] RSC uses one CUDA context; forcing --parallel-repeats=1")
+        a.parallel_repeats = 1
     available_cpus = (
         len(os.sched_getaffinity(0))
         if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
     )
+    max_perturbation_workers = max(1, available_cpus // a.threads)
+    if a.perturbation_workers > max_perturbation_workers:
+        print(
+            f"[safety] capping --perturbation-workers from "
+            f"{a.perturbation_workers} to {max_perturbation_workers} "
+            f"({available_cpus} CPUs, {a.threads} threads/backend)"
+        )
+        a.perturbation_workers = max_perturbation_workers
+    if a.pairwise_workers > available_cpus:
+        print(
+            f"[safety] capping --pairwise-workers from {a.pairwise_workers} "
+            f"to {available_cpus}"
+        )
+        a.pairwise_workers = available_cpus
     # Repeat workers each invoke a backend configured with ``--threads``.
     # Keep a quarter of the host free for the OS, plotting, and interactive
     # work; otherwise workers × threads can make the machine unreachable.
@@ -1053,9 +1632,13 @@ def main():
         return {"pert_col": a.pert_col, "control_pert": a.control, "replicate_col": a.replicate_col,
                 "block_cols": [c for c in a.block_cols.split(",") if c], "de_method": m,
                 "allow_discrete": m == "pydeseq2", "normalize_if_raw": m == "pdex",
+                "non_parametric_engine": a.non_parametric_engine,
                 "counts_layer": counts_layer, "min_cells_per_group": a.min_cells,
                 "fdr_threshold": a.fdr, "lfc_threshold": a.lfc, "seed": a.seed,
-                "num_threads": a.threads}
+                "num_threads": a.threads,
+                "perturbation_workers": (
+                    a.perturbation_workers if m == "pydeseq2" else 1
+                )}
 
     plots_dir = os.path.join(a.outdir, "plots")
     os.makedirs(plots_dir, exist_ok=True)
@@ -1099,7 +1682,10 @@ def main():
             for repeat, repeat_seed in tasks:
                 print(f"\n=== {m} split-half DE (repeat={repeat}, seed={repeat_seed}) ===")
                 repeat_results.append((repeat, split_half_signatures(
-                    adata, cfg_for(m), rt, seed=repeat_seed
+                    adata, cfg_for(m), rt, seed=repeat_seed,
+                    perturbation_workers=(
+                        a.perturbation_workers if m == "pydeseq2" else 1
+                    ),
                 )))
                 if cache_path:
                     _write_signature_cache(
@@ -1156,7 +1742,10 @@ def main():
                         f"(repeat={repeat}, seed={repeat_seed}) ==="
                     )
                     repeat_results.append((repeat, split_half_signatures(
-                        adata, cfg_for(m), rt, seed=repeat_seed
+                        adata, cfg_for(m), rt, seed=repeat_seed,
+                        perturbation_workers=(
+                            a.perturbation_workers if m == "pydeseq2" else 1
+                        ),
                     )))
                     if cache_path:
                         _write_signature_cache(
@@ -1185,7 +1774,8 @@ def main():
         repeat_sigs_by_method[m] = repeats
         display_sigs_by_method[m] = repeats[0]
         lfc_path = os.path.join(a.outdir, f"test1_lfc_vectors_{m}__{ds}.parquet")
-        n_lfc_rows = _write_lfc_vectors(repeats, m, a.seed, lfc_path)
+        engine = a.non_parametric_engine if m == "pdex" else "cpu"
+        n_lfc_rows = _write_lfc_vectors(repeats, m, engine, a.seed, lfc_path)
         print(f"LFC vectors: {os.path.abspath(lfc_path)} ({n_lfc_rows} rows)")
 
     # Remove method-only/repeat-only units before they can nominate DE genes,
@@ -1260,7 +1850,8 @@ def main():
     def _emit_layer3(genes, suffix, label):
         p = os.path.join(plots_dir, f"test1_corr_matrix{suffix}{matrix_method_suffix}__{ds}.png")
         layer3_corr_matrix(repeat_sigs_by_method, p, cfg_for(methods[0]), genes,
-                           methods=methods, gene_set_label=label)
+                           methods=methods, gene_set_label=label,
+                           emit_boxplots=(suffix == ""))
         print(f"Layer 3 {suffix or 'primary'}: {os.path.abspath(p)}")
 
     # Layer-3a — Union-DE genes, PRIMARY: all union-DE complete-case genes, no cap.
@@ -1298,6 +1889,22 @@ def main():
                        gene_set_label=f"all eligible genes — complete-case, no FDR filter "
                                       f"(n={len(genes_all)}; {diag['all_sfx']})")
     print("Layer 3b all-eligible comparison:", os.path.abspath(p3b))
+
+    # Layer 3c — each A×B cell selects its own exact DE panel:
+    # DE_A(unit i) union DE_B(unit j), with the configured CPM/FDR/LFC gates.
+    # This is intentionally separate from the fixed-panel canonical matrix
+    # because pair-specific feature selection changes the question being asked.
+    pair_path = os.path.join(
+        plots_dir,
+        f"test1_corr_matrix_pair_specific_de_union"
+        f"{matrix_method_suffix}__{ds}.png",
+    )
+    pair_specific_de_union_corr_matrix(
+        repeat_sigs_by_method, pair_path, cfg_for(methods[0]),
+        methods=methods, title_prefix="Test-1", unit="perturbation",
+        workers=a.pairwise_workers,
+    )
+    print("Layer 3c pair-specific DE-union:", os.path.abspath(pair_path))
 
 
 if __name__ == "__main__":

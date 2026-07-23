@@ -33,7 +33,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 from cell_eval._de_backends import build_de_frame  # noqa: E402
 
 log = logging.getLogger("overview")
-OVERVIEW_CACHE_VERSION = 2
+OVERVIEW_CACHE_VERSION = 4
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -130,7 +130,8 @@ def _run_de(adata: ad.AnnData, cfg: dict, method: str) -> pl.DataFrame:
         num_threads=cfg.get("num_threads", 8),
         allow_discrete=(method == "pydeseq2"),
         de_method=method,
-        de_kwargs=None,
+        de_kwargs=({"engine": cfg.get("non_parametric_engine", "pdex")}
+                   if method == "pdex" else None),
         counts_layer=cfg.get("counts_layer"),
         replicate_col=cfg.get("replicate_col") if method == "pydeseq2" else None,
     )
@@ -507,12 +508,29 @@ def main() -> None:
                     help="output PNG path (relative to outdir from config)")
     ap.add_argument("--plot-only", action="store_true",
                     help="skip DE computation, use cached tables in tables/")
+    ap.add_argument("--threads", type=int, default=None,
+                    help="CPU threads for DE; overrides config num_threads")
+    ap.add_argument(
+        "--non-parametric-engine", choices=("pdex", "rsc"), default=None,
+        help="override config non_parametric_engine",
+    )
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 
     with open(args.config) as fh:
         cfg: dict = yaml.safe_load(fh)
+    if args.non_parametric_engine is not None:
+        cfg["non_parametric_engine"] = args.non_parametric_engine
+    cfg.setdefault("non_parametric_engine", "pdex")
+    if cfg["non_parametric_engine"] not in {"pdex", "rsc"}:
+        ap.error(
+            "config non_parametric_engine must be 'pdex' or 'rsc'"
+        )
+    if args.threads is not None:
+        if args.threads < 1:
+            ap.error("--threads must be at least 1")
+        cfg["num_threads"] = args.threads
 
     outdir    = cfg.get("outdir", ".")
     tables_dir = os.path.join(outdir, "tables")
@@ -534,6 +552,7 @@ def main() -> None:
         "pert_col": cfg["pert_col"],
         "control_pert": cfg["control_pert"],
         "counts_layer": cfg.get("counts_layer"),
+        "non_parametric_engine": cfg.get("non_parametric_engine", "pdex"),
     }
 
     # ------------------------------------------------------------------ #

@@ -1,7 +1,6 @@
 ---
 name: evaluating-test2-control-null
-description: Run ONLY Test 2 (control-control split null) from the cell-eval metric-robustness battery and emit a single-test report. Splits control cells into A/B (a true null) and checks the DE null is calibrated: p-values Uniform[0,1], genomic-inflation lambda_GC ~= 1, frac_sig ~= alpha. Output includes a 3-panel diagnostic plot: QQ overlaid across splits | p-value histogram | lambda_GC boxplot. Use when someone wants to check null calibration / lambda_GC / uniformity of a DE metric without running the whole battery.
-type: skill
+description: "Run ONLY Test 2 (control-control split null) from the cell-eval metric-robustness battery and emit a single-test report. Splits control cells into A/B (a true null) and checks the DE null is calibrated: p-values Uniform[0,1], genomic-inflation lambda_GC ~= 1, frac_sig ~= alpha. Output includes a 3-panel diagnostic plot: QQ overlaid across splits | p-value histogram | lambda_GC boxplot. Use when someone wants to check null calibration / lambda_GC / uniformity of a DE metric without running the whole battery."
 ---
 
 # Test 2 — Control-Control Split Null
@@ -30,6 +29,9 @@ python .claude/skills/evaluating-test2-control-null/control_null_diagnostics.py 
 ```
 
 ## Parameters
+
+For exact CPU PyDESeq2 scheduling, use `--threads 1 --resample-workers N` to run independent null
+splits concurrently. This changes scheduling only; each split still uses the same PyDESeq2 model.
 | flag | what it controls | default |
 |---|---|---|
 | `--n-resamples` | number of independent control A/B splits | 10 |
@@ -37,10 +39,13 @@ python .claude/skills/evaluating-test2-control-null/control_null_diagnostics.py 
 | `--fdr` | expected frac_sig under a true null (alpha) | 0.05 |
 | `--seed` | RNG seed for every split | 0 |
 | `--methods` | comma-sep backends (run both for comparison) | pdex,pydeseq2 |
+| `--non-parametric-engine` | `pdex` or numerically matched RAPIDS GPU Wilcoxon (`rsc`) | pdex |
 
 ## Outputs (in `--outdir`)
 - `plots/test_2_pvalue_diagnostics__<dataset>.png` — 3-panel: QQ per method | p-value histogram | λ_GC boxplot
 - `plots/test_2_lfc_agreement__<dataset>.png` — per-gene LFC scatter on the null (pdex vs pydeseq2)
+- `tables/test2_lfc_vectors_<method>__<dataset>.parquet` — split/feature LFC and FDR vectors,
+  tagged with method and execution engine
 
 ## Null-calibration comparison — `control_null_diagnostics.py`
 

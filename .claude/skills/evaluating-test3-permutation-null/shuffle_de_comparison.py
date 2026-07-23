@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import multiprocessing as mp
 import os
 
 import anndata as ad
@@ -51,7 +52,8 @@ from cell_eval._de_backends import build_de_frame
 
 log = logging.getLogger("shuffle_de_cmp")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-LFC_ARCHIVE_VERSION = 3
+LFC_ARCHIVE_VERSION = 5
+_T3_WORKER_STATE = {}
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -136,7 +138,8 @@ def _cpm_eligible_genes(adata: ad.AnnData, groupby: str, pert_label: str,
 
 
 def _run_de(adata: ad.AnnData, method: str, groupby: str, reference: str,
-            n_threads: int, counts_layer, replicate_col) -> pl.DataFrame:
+            n_threads: int, counts_layer, replicate_col,
+            non_parametric_engine: str = "pdex") -> pl.DataFrame:
     """Run DE and preserve every returned LFC for complete-case analyses."""
     return build_de_frame(
         mode="real",
@@ -146,7 +149,7 @@ def _run_de(adata: ad.AnnData, method: str, groupby: str, reference: str,
         num_threads=n_threads,
         allow_discrete=(method == "pydeseq2"),
         de_method=method,
-        de_kwargs=None,
+        de_kwargs=({"engine": non_parametric_engine} if method == "pdex" else None),
         counts_layer=counts_layer,
         replicate_col=replicate_col,
     )
@@ -174,6 +177,87 @@ def _jaccard(a: set, b: set) -> float:
 
 # ── main null computation ──────────────────────────────────────────────────────
 
+def _run_one_fake_comparison(task, *, adata_raw, adata_norm, shuffled,
+                             fdr_thr, lfc_thr, n_threads, counts_layer,
+                             replicate_col, min_cells, gene_names, methods,
+                             non_parametric_engine):
+    """Run one shuffled target/reference comparison."""
+    p, ref_label = task
+    gene_idx = {g: i for i, g in enumerate(gene_names or [])}
+    n_genes = len(gene_names or [])
+    mask_p = shuffled == p
+    mask_ref = shuffled == ref_label
+    n_p, n_ref = int(mask_p.sum()), int(mask_ref.sum())
+    if n_p < min_cells or n_ref < min_cells:
+        return p, None
+
+    combined = mask_p | mask_ref
+    a_norm = adata_norm[combined].copy()
+    a_norm.obs["_group"] = np.where(mask_p[combined], "target", "ref")
+    a_raw = adata_raw[combined].copy()
+    a_raw.obs["_group"] = a_norm.obs["_group"].values
+    cpm_eligible = _cpm_eligible_genes(
+        a_raw, "_group", "target", "ref", counts_layer,
+    )
+    log.info("  %s vs %s  (n_target=%d, n_ref=%d)", p, ref_label, n_p, n_ref)
+
+    n_pdex, genes_pdex = 0, set()
+    n_pydx, genes_pydx = 0, set()
+    lfc_pdex_arr = np.full(n_genes, np.nan)
+    lfc_pydx_arr = np.full(n_genes, np.nan)
+
+    if "pdex" in methods:
+        try:
+            de_pdex = _run_de(a_norm, "pdex", "_group", "ref",
+                              n_threads, counts_layer, replicate_col, non_parametric_engine)
+            n_pdex, genes_pdex = _count_sig_for_target(
+                de_pdex, "target", fdr_thr, lfc_thr, cpm_eligible,
+            )
+            if gene_idx:
+                sub = de_pdex.filter(de_pdex["target"] == "target")
+                for feat, lfc_val in zip(
+                    sub["feature"].to_list(), sub["log2_fold_change"].to_list()
+                ):
+                    idx = gene_idx.get(str(feat))
+                    if idx is not None:
+                        lfc_pdex_arr[idx] = np.nan if lfc_val is None else float(lfc_val)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("pdex shuffled null for %s: %s", p, exc)
+
+    if "pydeseq2" in methods:
+        try:
+            de_pydx = _run_de(a_raw, "pydeseq2", "_group", "ref",
+                              n_threads, counts_layer, replicate_col, non_parametric_engine)
+            n_pydx, genes_pydx = _count_sig_for_target(
+                de_pydx, "target", fdr_thr, lfc_thr, cpm_eligible,
+            )
+            if gene_idx:
+                sub = de_pydx.filter(de_pydx["target"] == "target")
+                for feat, lfc_val in zip(
+                    sub["feature"].to_list(), sub["log2_fold_change"].to_list()
+                ):
+                    idx = gene_idx.get(str(feat))
+                    if idx is not None:
+                        lfc_pydx_arr[idx] = np.nan if lfc_val is None else float(lfc_val)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("pydeseq2 shuffled null for %s: %s", p, exc)
+
+    result = {
+        "n_pdex": n_pdex, "genes_pdex": genes_pdex,
+        "n_pydx": n_pydx, "genes_pydx": genes_pydx,
+        "n_cells": n_p, "reference": ref_label,
+        "n_reference_cells": n_ref,
+        "lfc_pdex": lfc_pdex_arr, "lfc_pydx": lfc_pydx_arr,
+    }
+    log.info("  fake-%s  n=%d  pdex_n_de=%d  pydx_n_de=%d",
+             p, n_p, n_pdex, n_pydx)
+    return p, result
+
+
+def _run_one_fake_comparison_worker(task):
+    return _run_one_fake_comparison(task, **_T3_WORKER_STATE)
+
+
 def _run_shuffled_null(adata_raw: ad.AnnData, adata_norm: ad.AnnData,
                        perts: list[str], pc: str,
                        block_cols: list[str], seed: int,
@@ -183,6 +267,8 @@ def _run_shuffled_null(adata_raw: ad.AnnData, adata_norm: ad.AnnData,
                        min_cells: int = 10,
                        gene_names: list[str] | None = None,
                        methods: list[str] | None = None,
+                       non_parametric_engine: str = "pdex",
+                       comparison_workers: int = 1,
                        ) -> dict[str, dict]:
     """
     Shuffle all non-control labels (globally or within-batch) → N fake groups.
@@ -191,11 +277,6 @@ def _run_shuffled_null(adata_raw: ad.AnnData, adata_norm: ad.AnnData,
                                 lfc_pdex, lfc_pydx}  where lfc_* are full-gene LFC arrays
     aligned to gene_names (NaN for genes with no result). Used for the correlation matrix.
     """
-    gene_idx: dict[str, int] = {}
-    if gene_names is not None:
-        gene_idx = {g: i for i, g in enumerate(gene_names)}
-    n_genes = len(gene_names) if gene_names is not None else 0
-
     labels = adata_norm.obs[pc].astype(str).to_numpy()
     bc = [c for c in block_cols if c in adata_norm.obs.columns]
     if shuffle_mode == "within" and bc:
@@ -222,88 +303,48 @@ def _run_shuffled_null(adata_raw: ad.AnnData, adata_norm: ad.AnnData,
         others = [q for q in fake_labels if q != p]
         pairs[p] = others[int(rng_pair.integers(0, len(others)))]
 
-    for p in fake_labels:
-        ref_label = pairs[p]
-        mask_p   = shuffled == p
-        mask_ref = shuffled == ref_label
-        n_p   = int(mask_p.sum())
-        n_ref = int(mask_ref.sum())
-        if n_p < min_cells or n_ref < min_cells:
-            log.debug("Skipping %s vs %s: n_p=%d n_ref=%d", p, ref_label, n_p, n_ref)
-            continue
-
-        # Build sub-adata: only the two fake groups, labeled "target" and "ref"
-        combined = mask_p | mask_ref
-        a_norm = adata_norm[combined].copy()
-        a_norm.obs["_group"] = np.where(mask_p[combined], "target", "ref")
-
-        a_raw = adata_raw[combined].copy()
-        a_raw.obs["_group"] = a_norm.obs["_group"].values
-
-        # CPM affects only the definition of a DE call. Keep the unfiltered DE
-        # tables below so complete-case LFC matrices include all finite estimates.
-        cpm_eligible = _cpm_eligible_genes(
-            a_raw, "_group", "target", "ref", counts_layer,
+    tasks = [(p, pairs[p]) for p in fake_labels]
+    worker_state = {
+        "adata_raw": adata_raw, "adata_norm": adata_norm,
+        "shuffled": shuffled, "fdr_thr": fdr_thr, "lfc_thr": lfc_thr,
+        "n_threads": n_threads, "counts_layer": counts_layer,
+        "replicate_col": replicate_col, "min_cells": min_cells,
+        "gene_names": gene_names, "methods": methods,
+        "non_parametric_engine": non_parametric_engine,
+    }
+    use_pool = comparison_workers > 1 and not (
+        "pdex" in methods and non_parametric_engine == "rsc"
+    )
+    if use_pool:
+        _T3_WORKER_STATE.clear()
+        _T3_WORKER_STATE.update(worker_state)
+        pool = mp.get_context("fork").Pool(processes=comparison_workers)
+        fitted = pool.imap(_run_one_fake_comparison_worker, tasks, chunksize=1)
+    else:
+        pool = None
+        fitted = (
+            _run_one_fake_comparison(task, **worker_state) for task in tasks
         )
-
-        log.info("  %s vs %s  (n_target=%d, n_ref=%d)", p, ref_label, n_p, n_ref)
-
-        n_pdex, genes_pdex = 0, set()
-        n_pydx,  genes_pydx  = 0, set()
-        lfc_pdex_arr = np.full(n_genes, np.nan)
-        lfc_pydx_arr = np.full(n_genes, np.nan)
-
-        if "pdex" in methods:
-            try:
-                de_pdex = _run_de(a_norm, "pdex", "_group", "ref",
-                                  n_threads, counts_layer, replicate_col)
-                n_pdex, genes_pdex = _count_sig_for_target(
-                    de_pdex, "target", fdr_thr, lfc_thr, cpm_eligible,
-                )
-                if gene_idx:
-                    sub = de_pdex.filter(de_pdex["target"] == "target")
-                    for feat, lfc_val in zip(sub["feature"].to_list(), sub["log2_fold_change"].to_list()):
-                        idx = gene_idx.get(str(feat))
-                        if idx is not None:
-                            lfc_pdex_arr[idx] = np.nan if lfc_val is None else float(lfc_val)
-            except Exception as e:
-                log.warning("pdex shuffled null for %s: %s", p, e)
-
-        if "pydeseq2" in methods:
-            try:
-                de_pydx = _run_de(a_raw, "pydeseq2", "_group", "ref",
-                                  n_threads, counts_layer, replicate_col)
-                n_pydx, genes_pydx = _count_sig_for_target(
-                    de_pydx, "target", fdr_thr, lfc_thr, cpm_eligible,
-                )
-                if gene_idx:
-                    sub = de_pydx.filter(de_pydx["target"] == "target")
-                    for feat, lfc_val in zip(sub["feature"].to_list(), sub["log2_fold_change"].to_list()):
-                        idx = gene_idx.get(str(feat))
-                        if idx is not None:
-                            lfc_pydx_arr[idx] = np.nan if lfc_val is None else float(lfc_val)
-            except Exception as e:
-                log.warning("pydeseq2 shuffled null for %s: %s", p, e)
-
-        results[p] = {
-            "n_pdex": n_pdex, "genes_pdex": genes_pdex,
-            "n_pydx":  n_pydx,  "genes_pydx":  genes_pydx,
-            "n_cells": n_p, "reference": ref_label, "n_reference_cells": n_ref,
-            "lfc_pdex": lfc_pdex_arr,
-            "lfc_pydx":  lfc_pydx_arr,
-        }
-        log.info("  fake-%s  n=%d  pdex_n_de=%d  pydx_n_de=%d", p, n_p, n_pdex, n_pydx)
+    try:
+        for p, result in fitted:
+            if result is not None:
+                results[p] = result
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
 
     return results
 
 
-def _write_lfc_vectors(results, gene_names, mode, method, method_key, out_path):
+def _write_lfc_vectors(results, gene_names, mode, method, engine, method_key, out_path):
     """Stream one long-form Parquet row per shuffled-comparison-feature LFC pair."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     schema = pa.schema([
         ("method", pa.string()),
+        ("engine", pa.string()),
         ("shuffle_mode", pa.string()),
         ("comparison", pa.string()),
         ("reference", pa.string()),
@@ -321,6 +362,7 @@ def _write_lfc_vectors(results, gene_names, mode, method, method_key, out_path):
             n = len(values)
             table = pa.Table.from_pydict({
                 "method": [method] * n,
+                "engine": [engine] * n,
                 "shuffle_mode": [mode] * n,
                 "comparison": [comparison] * n,
                 "reference": [str(d["reference"])] * n,
@@ -541,16 +583,23 @@ def main() -> None:
     ap.add_argument("--fdr",           type=float, default=None)
     ap.add_argument("--lfc",           type=float, default=None)
     ap.add_argument("--n-threads",     type=int,   default=None)
+    ap.add_argument("--comparison-workers", type=int, default=1,
+                    help="parallel shuffled comparisons for CPU PyDESeq2; use --n-threads 1")
     ap.add_argument("--seed",          type=int,   default=None)
     ap.add_argument("--outdir",        default=".")
     ap.add_argument("--methods",        default="pdex,pydeseq2",
                     help="comma-sep DE backends to run (default: pdex,pydeseq2)")
+    ap.add_argument("--non-parametric-engine", choices=("pdex", "rsc"), default=None,
+                    help="non-parametric engine; overrides config (default: pdex)")
     ap.add_argument("--replot",        action="store_true",
                     help="skip DE; regenerate corr-matrix plots from saved test_3_lfc_matrix__<mode>.npz files")
     ap.add_argument("--shuffle-mode",  default="both",
                     choices=["global", "within", "both"],
                     help="global: ignore batch; within: shuffle within each batch; both: produce both plots")
     args = ap.parse_args()
+    if args.comparison_workers < 1:
+        ap.error("--comparison-workers must be at least 1")
+    os.makedirs(args.outdir, exist_ok=True)
 
     cfg: dict = {}
     if os.path.exists(args.config):
@@ -567,6 +616,7 @@ def main() -> None:
     if args.lfc is not None:      cfg["lfc_threshold"] = args.lfc
     if args.n_threads is not None: cfg["num_threads"]  = args.n_threads
     if args.seed is not None:      cfg["seed"]         = args.seed
+    if args.non_parametric_engine is not None: cfg["non_parametric_engine"] = args.non_parametric_engine
 
     cfg.setdefault("fdr_threshold", 0.05)
     cfg.setdefault("lfc_threshold", 0.1)
@@ -575,6 +625,23 @@ def main() -> None:
     cfg.setdefault("block_cols", [])
     cfg.setdefault("counts_layer", None)
     cfg.setdefault("replicate_col", None)
+    cfg.setdefault("non_parametric_engine", "pdex")
+    if cfg["non_parametric_engine"] not in {"pdex", "rsc"}:
+        ap.error(
+            "config non_parametric_engine must be 'pdex' or 'rsc'"
+        )
+
+    available_cpus = (
+        len(os.sched_getaffinity(0))
+        if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    )
+    worker_cap = max(1, available_cpus // max(1, int(cfg["num_threads"])))
+    if args.comparison_workers > worker_cap:
+        log.warning(
+            "Capping --comparison-workers from %d to %d (%d CPUs, %d threads/fit)",
+            args.comparison_workers, worker_cap, available_cpus, cfg["num_threads"],
+        )
+        args.comparison_workers = worker_cap
 
     fdr_thr    = cfg["fdr_threshold"]
     lfc_thr    = cfg["lfc_threshold"]
@@ -625,6 +692,14 @@ def main() -> None:
                     f"format_version={archive_version!r}. Rerun without --replot "
                     "to regenerate unfiltered LFC vectors."
                 )
+            archive_engine = (str(np.asarray(d["non_parametric_engine"]).item())
+                              if "non_parametric_engine" in d else None)
+            if "pdex" in methods and archive_engine != cfg["non_parametric_engine"]:
+                d.close()
+                raise ValueError(
+                    f"Test-3 archive non_parametric_engine={archive_engine!r}, expected "
+                    f"{cfg['non_parametric_engine']!r}; rerun without --replot"
+                )
             pert_names = d["pert_names"].tolist()
             gene_names_r = d["gene_names"].tolist() if "gene_names" in d else []
             results_replot = {p: {"lfc_pdex": d["lfc_pdex"][i] if "lfc_pdex" in d else None,
@@ -664,6 +739,8 @@ def main() -> None:
             min_cells=min_cells,
             gene_names=gene_names,
             methods=methods,
+            non_parametric_engine=cfg["non_parametric_engine"],
+            comparison_workers=args.comparison_workers,
         )
         # save LFC matrices so corr-matrix plots can be regenerated without re-running DE
         perts_with_lfc = [p for p in results if results[p].get("lfc_pdex") is not None]
@@ -671,6 +748,7 @@ def main() -> None:
             "format_version": np.asarray(LFC_ARCHIVE_VERSION, dtype=np.int64),
             "gene_names": np.array(gene_names),
             "pert_names": np.array(perts_with_lfc),
+            "non_parametric_engine": np.asarray(cfg["non_parametric_engine"]),
         }
         if "pdex" in methods:
             lfc_save["lfc_pdex"] = np.stack([results[p]["lfc_pdex"] for p in perts_with_lfc])
@@ -688,7 +766,9 @@ def main() -> None:
                 args.outdir, f"test3_lfc_vectors_{mode}_{method_tag}.parquet"
             )
             n_lfc_rows = _write_lfc_vectors(
-                results, gene_names, mode, method_tag, method_key, lfc_path
+                results, gene_names, mode, method_tag,
+                cfg["non_parametric_engine"] if method_tag == "pdex" else "cpu",
+                method_key, lfc_path
             )
             log.info("Saved LFC vectors → %s (%d rows)", lfc_path, n_lfc_rows)
 

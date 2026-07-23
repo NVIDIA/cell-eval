@@ -18,8 +18,9 @@ on the same cells, apples-to-apples:
 
   Layer 3 — guide × guide correlation matrix (one panel per backend): entry (i,j) = Spearman(guide_i
             LFC, guide_j LFC) over the union DE genes, guides ordered by gene with gene-block
-            separators. **Bright within-gene blocks = guides of a gene agree (on-target, reproducible);
-            bright cross-gene off-diagonal = a shared program / low specificity.**
+            separators. **Dark-red within-gene off-diagonal cells = guides of a gene agree
+            (on-target, reproducible); dark-red cross-gene off-diagonal cells = a shared program /
+            low specificity.**
 
 Guides are compared against the SAME (full) control population, so a uniform positive baseline across
 all pairs is expected — the informative signal is the CONTRAST between within-gene blocks and the
@@ -31,18 +32,22 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import multiprocessing as mp
 import os
 import sys
 from collections import OrderedDict
 
 import anndata as ad
 import numpy as np
+import pandas as pd
 import polars as pl
 from scipy import stats
 
 _RT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "de_helpers.py")
 
 CAP = 2.0  # ±log2FC colour cap
+
+_T5_WORKER_STATE = {}
 
 
 def _load_runner():
@@ -55,36 +60,33 @@ def _load_runner():
 
 def _compute_cpm_elig_t5(adata, pos_P, pos_C, cfg, *, min_cpm=5.0):
     """Return a set of gene names CPM-eligible (shared across DE backends, method-neutral)."""
-    import scipy.sparse as sp_local
-    counts_layer = cfg.get("counts_layer")
-    if counts_layer and counts_layer in adata.layers:
-        X = adata.layers[counts_layer]
-        if not sp_local.issparse(X):
-            X = sp_local.csr_matrix(X)
-        X = X.tocsr()
-    else:
-        X = adata.X
-        if not sp_local.issparse(X):
-            X = sp_local.csr_matrix(X)
-        X = X.tocsr()
-        sample = X.data[:min(5_000, X.data.size)] if X.data.size > 0 else np.array([0.0])
-        if not np.allclose(sample, np.rint(sample)):
-            X = X.copy(); X.data = np.expm1(X.data)
-    def mean_cpm(pos):
-        group = X[pos]
-        library_sizes = np.asarray(group.sum(axis=1)).ravel().astype(float)
-        scales = np.divide(
-            1e6, library_sizes, out=np.zeros_like(library_sizes),
-            where=library_sizes > 0,
-        )
-        return np.asarray(group.multiply(scales[:, None]).mean(axis=0)).ravel()
-
-    m_pert = mean_cpm(pos_P)
-    m_ctrl = mean_cpm(pos_C)
-    return set(adata.var_names[np.where((m_pert >= min_cpm) | (m_ctrl >= min_cpm))[0]])
+    return cfg["_runtime"]._compute_cpm_elig(
+        adata, pos_P, pos_C, cfg, min_cpm=min_cpm,
+    )
 
 
-def guide_signatures(adata, cfg, rt, *, min_guides=2, max_genes=None, max_control=None, seed=0):
+def _fit_guide_signature(task, adata, cfg, rt, pos_C):
+    """Fit one guide against control; CPM eligibility is added in the parent."""
+    gene, k, gu, pos_G = task
+    try:
+        de = rt._de_two(adata, pos_G, pos_C, cfg, "pert", "ctrl")
+    except Exception as exc:  # noqa: BLE001
+        return task, None, str(exc)
+    return task, {
+        "genes": de["feature"].to_numpy().astype(str),
+        "lfc": de["log2_fold_change"].to_numpy().astype(float),
+        "fdr": de["fdr"].to_numpy().astype(float),
+    }, None
+
+
+def _fit_guide_signature_worker(task):
+    return _fit_guide_signature(task, **_T5_WORKER_STATE)
+
+
+def guide_signatures(
+    adata, cfg, rt, *, min_guides=2, max_genes=None, max_control=None,
+    seed=0, guide_workers=1,
+):
     """For each guide of a gene with ≥`min_guides` qualifying guides: DE = guide's cells vs control
     cells (full control), via the shared `_de_two`. Returns (sigs, gene_groups):
       sigs        — OrderedDict `GENE-guide` -> {gene, guide, genes, lfc, fdr, n_cells} (grouped by gene)
@@ -92,6 +94,7 @@ def guide_signatures(adata, cfg, rt, *, min_guides=2, max_genes=None, max_contro
     Only genes with ≥min_guides guides (each ≥min_cells_per_group cells) are kept — the same-gene block
     structure is the whole point."""
     rt.maybe_normalize(adata, cfg)
+    cfg["_runtime"] = rt
     pc, mcg, ctrl = cfg["pert_col"], cfg["min_cells_per_group"], cfg["control_pert"]
     sg = cfg["sgrna_col"]
     tgc = cfg.get("target_gene_col") or pc
@@ -104,13 +107,25 @@ def guide_signatures(adata, cfg, rt, *, min_guides=2, max_genes=None, max_contro
         pos_C = np.random.default_rng(seed).choice(pos_C, size=max_control, replace=False)
     pos_C.sort()
 
+    # Enumerate (gene, guide) groups in one pass. Repeated full-column masks per
+    # guide dominate runtime on large screens even when DE itself is GPU-fast.
+    grouped = pd.DataFrame({
+        "gene": gene_of,
+        "guide": guide_of,
+    }).groupby(["gene", "guide"], sort=True, observed=True).indices
+    positions = {
+        (str(gene), str(guide)): np.asarray(pos, dtype=int)
+        for (gene, guide), pos in grouped.items()
+        if gene != ctrl and guide != ctrl
+    }
+
     # guides per (non-control) gene that clear the cell threshold
     gene_to_guides = {}
-    for g in sorted(set(gene_of)):
-        if g == ctrl:
-            continue
-        gd = [gu for gu in sorted(set(guide_of[gene_of == g]))
-              if gu != ctrl and int(np.sum((guide_of == gu) & (gene_of == g))) >= mcg]
+    for g in sorted({gene for gene, _ in positions}):
+        gd = sorted(
+            guide for gene, guide in positions
+            if gene == g and positions[(gene, guide)].size >= mcg
+        )
         if len(gd) >= min_guides:
             gene_to_guides[g] = gd
     # order genes by (n_guides desc, gene) and optionally cap for readability/runtime
@@ -118,26 +133,52 @@ def guide_signatures(adata, cfg, rt, *, min_guides=2, max_genes=None, max_contro
     if max_genes:
         genes_sorted = genes_sorted[:max_genes]
 
-    sigs, gene_groups = OrderedDict(), []
-    for gene in genes_sorted:
-        kept = []
-        for k, gu in enumerate(gene_to_guides[gene], 1):
-            pos_G = np.where((guide_of == gu) & (gene_of == gene))[0]
-            try:
-                de = rt._de_two(adata, pos_G, pos_C, cfg, "pert", "ctrl")
-            except Exception as e:  # noqa: BLE001
-                print(f"  {gene}.g{k}: DE failed ({e})"); continue
-            lbl = f"{gene}.g{k}"  # compact, readable label; raw sgRNA id kept in 'guide'
-            genes_arr = de["feature"].to_numpy().astype(str)
+    tasks = [
+        (gene, k, gu, positions[(gene, gu)])
+        for gene in genes_sorted
+        for k, gu in enumerate(gene_to_guides[gene], 1)
+    ]
+    if cfg["de_method"] == "pydeseq2" and guide_workers > 1:
+        _T5_WORKER_STATE.clear()
+        _T5_WORKER_STATE.update(
+            adata=adata, cfg=cfg, rt=rt, pos_C=pos_C,
+        )
+        pool = mp.get_context("fork").Pool(processes=guide_workers)
+        results = pool.imap(_fit_guide_signature_worker, tasks, chunksize=1)
+    else:
+        pool = None
+        results = (
+            _fit_guide_signature(task, adata, cfg, rt, pos_C)
+            for task in tasks
+        )
+
+    sigs = OrderedDict()
+    kept_by_gene = {gene: [] for gene in genes_sorted}
+    try:
+        for task, fitted, error in results:
+            gene, k, gu, pos_G = task
+            lbl = f"{gene}.g{k}"
+            if fitted is None:
+                print(f"  {lbl}: DE failed ({error})", flush=True)
+                continue
+            genes_arr = fitted["genes"]
             elig = _compute_cpm_elig_t5(adata, pos_G, pos_C, cfg)
             sigs[lbl] = {"gene": gene, "guide": gu,
                          "genes": genes_arr,
-                         "lfc": de["log2_fold_change"].to_numpy().astype(float),
-                         "fdr": de["fdr"].to_numpy().astype(float),
+                         "lfc": fitted["lfc"],
+                         "fdr": fitted["fdr"],
                          "cpm_elig": np.array([g in elig for g in genes_arr]),
                          "n_cells": int(pos_G.size)}
-            kept.append(lbl)
-            print(f"  {lbl:16s} {gu[:40]:40s} ({pos_G.size} cells)")
+            kept_by_gene[gene].append(lbl)
+            print(f"  {lbl:16s} {gu[:40]:40s} ({pos_G.size} cells)", flush=True)
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
+
+    gene_groups = []
+    for gene in genes_sorted:
+        kept = kept_by_gene[gene]
         if len(kept) >= min_guides:
             gene_groups.append((gene, kept))
         else:
@@ -146,13 +187,14 @@ def guide_signatures(adata, cfg, rt, *, min_guides=2, max_genes=None, max_contro
     return sigs, gene_groups
 
 
-def _write_lfc_vectors(sigs, method, out_path):
+def _write_lfc_vectors(sigs, method, engine, out_path):
     """Stream one long-form Parquet row per guide-feature LFC pair."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     schema = pa.schema([
         ("method", pa.string()),
+        ("engine", pa.string()),
         ("guide_label", pa.string()),
         ("target_gene", pa.string()),
         ("guide", pa.string()),
@@ -168,6 +210,7 @@ def _write_lfc_vectors(sigs, method, out_path):
             n = len(d["genes"])
             table = pa.Table.from_pydict({
                 "method": [method] * n,
+                "engine": [engine] * n,
                 "guide_label": [label] * n,
                 "target_gene": [str(d["gene"])] * n,
                 "guide": [str(d["guide"])] * n,
@@ -431,8 +474,8 @@ def layer2_zoom(sigs_by_method, gene_groups, out_png, cfg, genes, *, methods, pe
 def layer3_corr_matrix(sigs_by_method, gene_groups, out_png, cfg, genes, *, methods,
                        gene_set_label: str = "", min_guides: int = 2):
     """Guide × guide Spearman-LFC correlation per backend (one panel each), guides ordered by gene with
-    gene-block separators. Within-gene blocks bright ⇒ guides of a gene agree; cross-gene off-diagonal
-    bright ⇒ shared program / low specificity."""
+    gene-block separators. Dark-red within-gene off-diagonal cells imply guide agreement; dark-red
+    cross-gene off-diagonal cells imply a shared program / low specificity."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -449,12 +492,22 @@ def layer3_corr_matrix(sigs_by_method, gene_groups, out_png, cfg, genes, *, meth
         sigs = sigs_by_method[m]
         M = _matrix(sigs, labels, genes)
         n = len(labels)
-        C = np.full((n, n), np.nan)
-        for i in range(n):
-            for j in range(n):
-                ok = np.isfinite(M[i]) & np.isfinite(M[j])
-                if ok.sum() >= 5:
-                    C[i, j] = stats.spearmanr(M[i][ok], M[j][ok]).statistic
+        if len(genes) < 5:
+            C = np.full((n, n), np.nan)
+        elif not np.isfinite(M).all():
+            raise ValueError(
+                f"Method {m!r} does not have a fixed finite {len(genes)}-gene "
+                "panel across all guides"
+            )
+        else:
+            ranked = stats.rankdata(M, axis=1)
+            ranked -= ranked.mean(axis=1, keepdims=True)
+            norms = np.sqrt(np.sum(ranked * ranked, axis=1))
+            denom = norms[:, None] * norms[None, :]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                C = (ranked @ ranked.T) / denom
+            C[denom == 0] = np.nan
+            C = np.clip(C, -1.0, 1.0)
         im = ax.imshow(C, cmap="RdBu_r", vmin=-1, vmax=1, interpolation="nearest")
         bounds, centers, names, _ = _gene_boundaries(gene_groups)
         for b in bounds[1:]:
@@ -483,7 +536,10 @@ def layer3_corr_matrix(sigs_by_method, gene_groups, out_png, cfg, genes, *, meth
     cbar_label = (f"Spearman(guide i, guide j) — {gene_set_label}"
                   if gene_set_label else "Spearman(guide i, guide j) over shared gene panel")
     fig.colorbar(im, ax=axes[0].tolist(), fraction=0.025, pad=0.02, label=cbar_label)
-    sup = "Test-5 guide × guide signature correlation — bright WITHIN-gene blocks = same-gene guides agree"
+    sup = (
+        "Test-5 guide × guide signature correlation — dark-red WITHIN-gene "
+        "off-diagonals = higher same-gene agreement"
+    )
     if gene_set_label:
         sup += f"\n{gene_set_label}"
     fig.suptitle(sup, fontsize=11)
@@ -509,6 +565,12 @@ def main():
     ap.add_argument("--min-guides", type=int, default=2, help="only keep genes with ≥ this many qualifying guides")
     ap.add_argument("--max-genes", type=int, default=None, help="cap #genes-with-guides (by #guides desc) for readability")
     ap.add_argument("--max-control", type=int, default=None, help="subsample control cells to this many (speed)")
+    ap.add_argument("--threads", type=int, default=8,
+                    help="worker threads supplied to each DE backend fit")
+    ap.add_argument("--guide-workers", type=int, default=1,
+                    help="parallel guide fits for PyDESeq2; divide available CPUs across workers")
+    ap.add_argument("--non-parametric-engine", choices=("pdex", "rsc"), default="pdex",
+                    help="non-parametric engine; pdex uses Arc pdex and rsc uses RAPIDS GPU Wilcoxon")
     ap.add_argument("--max-de-genes", type=int, default=400, help="cap columns in the heatmaps")
     ap.add_argument("--zoom-per-page", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
@@ -522,6 +584,11 @@ def main():
     adata = ad.read_h5ad(a.adata)
     if counts_layer is None and "counts" in adata.layers:
         counts_layer = "counts"
+    elif (counts_layer is None and "pdex" in methods and a.non_parametric_engine != "rsc"
+          and rt._looks_raw_integer(adata)):
+        counts_layer = "_cell_eval_raw_counts"
+        adata.layers[counts_layer] = adata.X.copy()
+        print(f"preserved raw counts in temporary layer {counts_layer!r} for CPM")
     ds = os.path.splitext(os.path.basename(a.adata))[0]  # dataset tag on every output file
     print(f"loaded {a.adata}: {adata.n_obs} cells × {adata.n_vars} genes  (methods={methods})")
 
@@ -530,8 +597,10 @@ def main():
                 "sgrna_col": a.sgrna_col, "target_gene_col": a.target_gene_col or a.pert_col,
                 "block_cols": [c for c in a.block_cols.split(",") if c], "de_method": m,
                 "allow_discrete": m == "pydeseq2", "normalize_if_raw": m == "pdex",
+                "non_parametric_engine": a.non_parametric_engine,
                 "counts_layer": counts_layer, "min_cells_per_group": a.min_cells,
-                "fdr_threshold": a.fdr, "lfc_threshold": a.lfc, "seed": a.seed, "num_threads": 8}
+                "fdr_threshold": a.fdr, "lfc_threshold": a.lfc, "seed": a.seed,
+                "num_threads": a.threads}
 
     plots_dir = os.path.join(a.outdir, "plots")
     os.makedirs(plots_dir, exist_ok=True)
@@ -539,10 +608,12 @@ def main():
     for m in order:
         print(f"\n=== {m} guide-level DE (min_guides={a.min_guides}) ===")
         sigs, gene_groups = guide_signatures(adata, cfg_for(m), rt, min_guides=a.min_guides,
-                                             max_genes=a.max_genes, max_control=a.max_control, seed=a.seed)
+                                             max_genes=a.max_genes, max_control=a.max_control,
+                                             seed=a.seed, guide_workers=a.guide_workers)
         sigs_by_method[m] = sigs
         lfc_path = os.path.join(a.outdir, f"test5_lfc_vectors_{m}__{ds}.parquet")
-        n_lfc_rows = _write_lfc_vectors(sigs, m, lfc_path)
+        engine = a.non_parametric_engine if m == "pdex" else "cpu"
+        n_lfc_rows = _write_lfc_vectors(sigs, m, engine, lfc_path)
         print(f"LFC vectors: {os.path.abspath(lfc_path)} ({n_lfc_rows} rows)")
         p1 = os.path.join(plots_dir, f"test5_guide_heatmap_{m}__{ds}.png")
         layer1_heatmap(sigs, gene_groups, p1, cfg_for(m), m, max_genes=a.max_de_genes)

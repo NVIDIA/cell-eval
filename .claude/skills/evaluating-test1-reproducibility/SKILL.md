@@ -40,7 +40,10 @@ python .claude/skills/evaluating-test1-reproducibility/reproducibility_heatmap.p
 | `--seed` | RNG seed for every split | 0 |
 | `--n-repeats` | independently seeded A/B splits averaged in each Layer-3 matrix | 5 |
 | `--threads` | worker threads supplied to each DE backend fit; affects speed, not estimates | 8 |
+| `--non-parametric-engine` | `pdex` or numerically matched RAPIDS GPU Wilcoxon (`rsc`) | pdex |
 | `--parallel-repeats` | POSIX fork workers for independent repeats; increase only when RAM/CPU permit | 1 |
+| `--perturbation-workers` | within-repeat CPU PyDESeq2 workers; use with `--threads 1` and `--parallel-repeats 1` | 1 |
+| `--pairwise-workers` | POSIX fork workers used after DE to build pair-specific DE-union correlation rows | 8 |
 | `--signature-cache-dir` | optional directory for atomic partial-repeat checkpoints | none |
 | `--resume-signatures` | load strictly matching local checkpoints and compute only missing repeats/methods | off |
 
@@ -86,8 +89,10 @@ wasting completed work.
 For long runs, set `--signature-cache-dir <dir> --resume-signatures`. Immediately after each repeat
 finishes, the skill atomically rewrites a partial checkpoint containing every completed repeat plus
 method, dataset, repeat-count, seed, perturbation, control, and block metadata. A later run loads
-only an exact metadata match and computes missing repeats or backends. Version-1 complete caches
-remain readable. Checkpoints are trusted local pickle files produced by this skill; never resume
+only an exact metadata match and computes missing repeats or backends. The current cache records
+`non_parametric_engine=pdex|rsc`; stale pdex caches using the former `cpu` label are rejected.
+PyDESeq2-only version-4/5 caches remain readable because this selector does not affect that backend.
+Checkpoints are trusted local pickle files produced by this skill; never resume
 from an untrusted file. If a process pool fails, completed repeats remain checkpointed and missing
 ones fall back to sequential execution. If POSIX fork is unavailable, all repeats run sequentially.
 
@@ -121,7 +126,8 @@ the operating system, plotting, and the interactive session and avoids an OOM-pr
 - **Layer 3 — `test1_corr_matrix__<dataset>.png`** (one panel per backend): split-A × split-B signature
   correlation matrix. Entry (i,j) is computed separately per repeat as Spearman(pert i split-A,
   pert j split-B) over the union DE genes, then averaged cell-by-cell across `--n-repeats`.
-  The **diagonal is within-perturbation A/B reproducibility** (bright = reproducible); off-diagonal =
+  The **diagonal is within-perturbation A/B reproducibility** (dark red = higher positive
+  correlation); off-diagonal =
   cross-perturbation (should be dim if signatures are perturbation-specific). **Each diagonal cell is
   labelled with that perturbation's cell count**, so reproducibility can be read against power. The
   heatmap colors encode Spearman. Every method-panel title reports the finite means of matching and
@@ -132,6 +138,12 @@ the operating system, plotting, and the interactive session and avoids an OOM-pr
   `targets__<method>` labels, the exact `features` used for correlation, and exact
   `spearman__<method>` and `pearson__<method>` averaged matrices. Use these numeric archives—not
   rasterized heatmaps—for downstream boxplots or tests.
+- The primary fixed-panel Layer-3 matrix also emits `test1_corr_matrix_boxplots__<dataset>.png`
+  and a same-stem CSV. Each method gets Spearman and Pearson panels comparing diagonal
+  (within-perturbation) with off-diagonal (cross-perturbation) correlations. Boxes use the IQR,
+  whiskers use the 5th–95th percentiles, and the rasterized scatter layer contains **every finite
+  matrix value**, never a sample. The CSV records n, mean, standard deviation, minimum, 5th/25th/
+  50th/75th/95th percentiles, and maximum for every method × metric × group.
 - A one-method cache-building run writes method-suffixed matrices such as
   `test1_corr_matrix_pydeseq2__<dataset>.png`; it must not overwrite the canonical unsuffixed
   two-method plot because its union-DE gene set is method-specific. Only a run loading both method
@@ -149,10 +161,24 @@ the operating system, plotting, and the interactive session and avoids an OOM-pr
   repeat. Evaluate both methods on that exact panel. Do not emit method-specific all-gene,
   `test1_corr_matrix_all_genes_shared`, or lowest-expression correlation matrices.
 - Treat the shared DE-2,000 and shared all-gene matrices as the two default correlation outputs.
+- `test1_corr_matrix_pair_specific_de_union__<dataset>.png` is a separate feature-selection
+  sensitivity analysis. For each method and repeat, cell `(i,j)` correlates split-A perturbation
+  `i` with split-B perturbation `j` over
+  `DE_A(i) ∪ DE_B(j)`. Calls require that perturbation's CPM eligibility plus the configured
+  FDR/absolute-LFC thresholds, and retained genes must have finite effects in both compared vectors.
+  Compute every repeat independently and average corresponding correlation cells. Keep one common
+  perturbation set/order across all methods and repeats, but do not force the cell-specific gene
+  panels to be identical across methods: each backend's own DE calls define its sensitivity panel.
+  This output complements rather than replaces the canonical fixed-panel matrix.
+- The pair-specific matrix has a same-stem NPZ containing both averaged correlation matrices,
+  mean per-cell panel sizes, finite-repeat counts, thresholds, ordered perturbations, and the exact
+  panel-definition string. It also emits
+  `test1_corr_matrix_pair_specific_de_union_boxplots__<dataset>.png` plus a same-stem all-values
+  summary CSV using the same box/whisker/scatter contract as the fixed-panel matrices.
 - `test1_rho_<method>__<dataset>.csv` — per-repeat, per-perturbation split-half ρ, including repeat,
   seed, and cell count.
 - `test1_lfc_vectors_<method>__<dataset>.parquet` — long-form per-repeat, per-perturbation LFC
-  vectors with one row per feature and separate split-A / split-B values.
+  vectors with one row per feature, separate split-A / split-B values, and execution-engine provenance.
 
 Colour spec: diverging blue–white–red centred at 0, capped ±2 log2FC — genes near 0 in both splits
 appear white, so colour in split B where split A is white (or vice versa) is irreproducibility made

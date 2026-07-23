@@ -44,6 +44,8 @@ uv run python overview.py --config config.yaml --plot-only
 | `replicate_col` | pseudobulk unit column (required for pydeseq2) | batch |
 | `min_cells_per_group` | minimum cells per group | 20 |
 | `num_threads` | DE computation threads | 8 |
+| `--threads` | CLI override for `num_threads` (single shared PyDESeq2 model) | config value |
+| `non_parametric_engine` / `--non-parametric-engine` | `pdex` for Arc pdex or `rsc` for RAPIDS GPU Wilcoxon | pdex |
 | `--plot-only` | skip DE, load cached tables and re-render PNG | — |
 
 ## Outputs

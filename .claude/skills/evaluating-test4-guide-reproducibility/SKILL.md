@@ -38,6 +38,8 @@ python .claude/skills/evaluating-test4-guide-reproducibility/guide_split_reprodu
 | `--min-cells` | min cells per arm; a guide needs ≥2x to be included | 20 |
 | `--max-guides` | cap #guides (most-powered first) for readable heatmap | None |
 | `--max-control` | subsample control cells (speed) | None |
+| `--non-parametric-engine` | `pdex` for Arc pdex or `rsc` for numerically matched RAPIDS GPU Wilcoxon | pdex |
+| `--pairwise-workers` | POSIX fork workers used after DE to build pair-specific DE-union correlation rows | 8 |
 | `--fdr / --lfc` | DEG-calling cutoffs | 0.05 / 0.1 |
 | `--seed` | RNG seed | 0 |
 
@@ -58,7 +60,8 @@ python .claude/skills/evaluating-test4-guide-reproducibility/guide_split_reprodu
   --adata <h5ad> --methods pdex,pydeseq2 \
   --pert-col gene --control non-targeting --sgrna-col <guide_col> --target-gene-col gene \
   --replicate-col <batch/gem_group> --block-cols <batch/gem_group> \
-  --max-guides 24 --max-control 1200 --zoom-per-page 1 --outdir <out>
+  --max-guides 24 --max-control 1200 --threads 1 --guide-workers 8 \
+  --zoom-per-page 1 --outdir <out>
 ```
 
 - **Layer 1 — `test4_guide_heatmap_<method>__<dataset>.png`** (one per backend): rows = guides (`GENE.gN`)
@@ -67,15 +70,43 @@ python .claude/skills/evaluating-test4-guide-reproducibility/guide_split_reprodu
 - **Layer 2 — `test4_zoom__<dataset>_NN.png`** (one PNG per guide, sorted by ρ): **one row per method**
   (pdex row + pydeseq2 row), each = LFC_A-vs-LFC_B scatter + that method's split-A/B heatmap strips.
 - **Layer 3 — `test4_corr_matrix__<dataset>.png`** (one panel per backend): split-A × split-B **guide**
-  correlation matrix — **diagonal = within-guide A/B reproducibility** (bright = reproducible),
+  correlation matrix — **diagonal = within-guide A/B reproducibility** (dark red = higher positive
+  correlation),
   off-diagonal = cross-guide. **Each diagonal cell is labelled with that guide's cell count** (n cells
   before the A/B split), so you can read reproducibility against power at a glance. Every panel title
   reports finite diagonal and off-diagonal means for both Spearman and Pearson.
+- The primary fixed-panel Layer-3 matrix also emits `test4_corr_matrix_boxplots__<dataset>.png`
+  and a same-stem CSV. Each method gets Spearman and Pearson panels comparing diagonal (within-guide)
+  with off-diagonal (cross-guide) correlations. Boxes use the IQR, whiskers use the 5th–95th
+  percentiles, and the rasterized scatter layer contains **every finite matrix value**, never a
+  sample. The CSV records n, mean, standard deviation, minimum, 5th/25th/50th/75th/95th
+  percentiles, and maximum for every method × metric × group.
+- `test4_corr_matrix_pair_specific_de_union__<dataset>.png` is a separate feature-selection
+  sensitivity analysis. For each method, cell `(i,j)` correlates split-A guide `i` with split-B guide
+  `j` over `DE_A(i) ∪ DE_B(j)`. Calls require the guide's CPM eligibility plus the configured
+  FDR/absolute-LFC thresholds, and retained genes must have finite effects in both compared vectors.
+  Keep one common guide set/order across methods, while allowing each backend's own DE calls to
+  define its cell-specific panels. This complements rather than replaces the canonical fixed-panel
+  matrix.
+- The pair-specific matrix has a same-stem NPZ containing Spearman and Pearson matrices, per-cell
+  panel sizes, thresholds, ordered guides, and the exact panel-definition string. It also emits
+  `test4_corr_matrix_pair_specific_de_union_boxplots__<dataset>.png` plus a same-stem all-values
+  summary CSV using the same box/whisker/scatter contract as the fixed-panel matrices.
 - `test4_rho_<method>__<dataset>.csv` — per-guide split-half ρ.
 - `test4_lfc_vectors_<method>__<dataset>.parquet` — long-form per-guide LFC vectors with one row per
   feature and separate split-A / split-B values.
+- `test4_de_masks_<method>__<dataset>.npz` — version-2 compact cache of bit-packed per-guide
+  split-A DE, split-B DE, CPM-eligibility, and feature-presence masks. The archive records its feature
+  universe, guide metadata, `pdex|rsc` execution engine, FDR/LFC thresholds, CPM normalization,
+  minimum CPM, counts layer, and bit order. Use this cache with the LFC Parquet for exact pair-specific DE-union correlations without
+  rerunning DE. Reject a cache when its recorded thresholds or CPM/count-layer semantics do not match
+  the requested analysis.
 
 **This differs from `evaluating-test5-samegene-sgrna`'s `samegene_guide_heatmap.py`:** Test 4 splits ONE
 guide's cells in half (within-guide reproducibility ceiling); Test 5 compares DIFFERENT guides of the
 same gene (does the metric reward shared biology). Levers: `--max-guides` (most-powered first) and
 `--max-control` bound runtime; `--methods pdex` skips the slower backend.
+With a CUDA-capable RAPIDS environment, `--methods pdex --non-parametric-engine rsc` retains every guide while
+moving the Wilcoxon/FDR/LFC calculation to the GPU.
+For CPU PyDESeq2, `--guide-workers N --threads 1` runs independent guide fits concurrently without
+changing the per-guide PyDESeq2 model or numerical results.

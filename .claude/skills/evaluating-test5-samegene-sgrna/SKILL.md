@@ -37,6 +37,7 @@ python .claude/skills/evaluating-test5-samegene-sgrna/samegene_guide_heatmap.py 
 | `--min-guides` | genes need ≥ this many qualifying guides | 2 |
 | `--min-cells` | min cells for a guide's DE to be computed | 20 |
 | `--fdr / --lfc` | DEG cutoff + concordance threshold | 0.05 / 0.1 |
+| `--non-parametric-engine` | `pdex` for Arc pdex or `rsc` for RAPIDS GPU Wilcoxon | pdex |
 | `AUC tiers` | P(same>unrelated) cutoffs -> PASS / WARN, each gated by MWU p < alpha | >= 0.65 / >= 0.55 |
 | `seed` | RNG seed for background-pair sampling | 0 |
 
@@ -69,7 +70,8 @@ python .claude/skills/evaluating-test5-samegene-sgrna/samegene_guide_heatmap.py 
   --adata <h5ad> --methods pdex,pydeseq2 \
   --pert-col gene --control non-targeting --sgrna-col <guide_col> --target-gene-col gene \
   --replicate-col <batch/gem_group> --block-cols <batch/gem_group> \
-  --min-guides 2 --max-genes 12 --max-control 1500 --zoom-per-page 1 --outdir <out>
+  --min-guides 2 --max-genes 12 --max-control 1500 \
+  --threads 1 --guide-workers 8 --zoom-per-page 1 --outdir <out>
 ```
 
 - **Layer 1 — `test5_guide_heatmap_<method>__<dataset>.png`** (one per backend): rows = guides labeled
@@ -82,13 +84,17 @@ python .claude/skills/evaluating-test5-samegene-sgrna/samegene_guide_heatmap.py 
   (for >2 guides) the mean pairwise ρ across the gene's guides. This is "one guide's signature vs another
   guide targeting the same perturbation."
 - **Layer 3 — `test5_corr_matrix__<dataset>.png`** (one panel per backend): **guide × guide** Spearman-LFC
-  correlation over the union DE genes, guides ordered by gene with gene-block separators. **Bright
-  within-gene blocks = same-gene guides agree (on-target, reproducible); bright cross-gene off-diagonal =
-  a shared program / low specificity.** Each panel's title reports overall **diagonal and
+  correlation over the union DE genes, guides ordered by gene with gene-block separators. **Dark-red
+  within-gene off-diagonal cells = same-gene guides agree (on-target, reproducible); dark-red
+  cross-gene off-diagonal cells = a shared program / low specificity.** Each panel's title reports
+  overall **diagonal and
   off-diagonal rho**, followed by **within-gene vs cross-gene off-diagonal rho**. The latter gap is
   the same-gene concordance signal that the `test_5` AUC verdict quantifies.
 - `test5_lfc_vectors_<method>__<dataset>.parquet` — long-form per-guide LFC vectors with one row per
   feature.
 
 Levers: `--max-genes` caps #genes-with-guides (by #guides desc) for readability/runtime, `--max-control`
-subsamples control cells for speed, `--methods pdex` alone skips the (slower) pydeseq2 backend.
+subsamples control cells for speed, `--methods pdex` alone skips the (slower) pydeseq2 backend, and
+`--non-parametric-engine rsc` runs the pdex-equivalent Wilcoxon/FDR/LFC calculation on a CUDA GPU.
+For CPU PyDESeq2, `--guide-workers N --threads 1` runs independent guide fits in a POSIX fork pool;
+this changes scheduling only and preserves the exact per-guide PyDESeq2 model and outputs.

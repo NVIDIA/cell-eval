@@ -21,16 +21,19 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import multiprocessing as mp
 import os
 import sys
 
 import anndata as ad
 import numpy as np
+import polars as pl
 
 _RT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "de_helpers.py")
 
 # colorblind-safe (Okabe-Ito / seaborn "colorblind"): pdex = blue, pydeseq2 = orange
 METHOD_COLOR = {"pdex": "#0173B2", "pydeseq2": "#DE8F05", "wilcoxon": "#0173B2"}
+_T2_WORKER_STATE = {}
 
 
 def _load_runner():
@@ -42,7 +45,31 @@ def _load_runner():
     return rt
 
 
-def control_null_pvalues(adata, cfg, rt, *, n_resamples=10, seed=0):
+def _fit_control_split(r, ctrl_ad, cfg, rt):
+    s = ctrl_ad.copy()
+    s.obs["_arm"] = rt.stratified_split(
+        ctrl_ad.obs, cfg["block_cols"], cfg["seed"] + 100 + r,
+    )
+    try:
+        de = rt.run_de(s, cfg, groupby="_arm", reference="B")
+    except Exception as exc:  # noqa: BLE001
+        return r, None, str(exc)
+    p = de["p_value"].to_numpy().astype(float)
+    p = p[np.isfinite(p)]
+    return r, {
+        "p": p,
+        "lambda": rt.lambda_gc(de["p_value"].to_numpy().astype(float)),
+        "de": de.select(["feature", "log2_fold_change", "fdr"]),
+    }, None
+
+
+def _fit_control_split_worker(r):
+    return _fit_control_split(r, **_T2_WORKER_STATE)
+
+
+def control_null_pvalues(
+    adata, cfg, rt, *, n_resamples=10, seed=0, resample_workers=1,
+):
     """Control-control split null for one backend.
 
     Cells are split 50/50 within each block (plate/batch) so arm A and arm B each receive
@@ -55,23 +82,33 @@ def control_null_pvalues(adata, cfg, rt, *, n_resamples=10, seed=0):
     if ctrl_ad.n_obs < 2 * mcg:
         raise SystemExit(f"too few control cells ({ctrl_ad.n_obs}) for 2×min_cells_per_group={2 * mcg}")
 
+    tasks = range(n_resamples)
+    if cfg["de_method"] == "pydeseq2" and resample_workers > 1:
+        _T2_WORKER_STATE.clear()
+        _T2_WORKER_STATE.update(ctrl_ad=ctrl_ad, cfg=cfg, rt=rt)
+        pool = mp.get_context("fork").Pool(processes=resample_workers)
+        results = pool.imap(_fit_control_split_worker, tasks, chunksize=1)
+    else:
+        pool = None
+        results = (_fit_control_split(r, ctrl_ad, cfg, rt) for r in tasks)
+
     pooled, lambdas, de_frames = [], [], []
-    for r in range(n_resamples):
-        s = ctrl_ad.copy()
-        s.obs["_arm"] = rt.stratified_split(ctrl_ad.obs, cfg["block_cols"],
-                                             cfg["seed"] + 100 + r)
-        try:
-            de = rt.run_de(s, cfg, groupby="_arm", reference="B")
-        except Exception as e:  # noqa: BLE001
-            print(f"  split {r}: DE failed ({e})")
-            continue
-        p = de["p_value"].to_numpy().astype(float)
-        p = p[np.isfinite(p)]
-        pooled.append(p)
-        lam = rt.lambda_gc(de["p_value"].to_numpy().astype(float))
-        lambdas.append(lam)
-        de_frames.append(de.select(["feature", "log2_fold_change", "fdr"]).with_columns(pl.lit(r).alias("split")))
-        print(f"  split {r}: {p.size} genes  λ_GC={lam:.3f}")
+    try:
+        for r, fitted, error in results:
+            if fitted is None:
+                print(f"  split {r}: DE failed ({error})", flush=True)
+                continue
+            pooled.append(fitted["p"])
+            lambdas.append(fitted["lambda"])
+            de_frames.append(
+                fitted["de"].with_columns(pl.lit(r).alias("split"))
+            )
+            print(f"  split {r}: {fitted['p'].size} genes  "
+                  f"λ_GC={fitted['lambda']:.3f}", flush=True)
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
     if not pooled:
         raise SystemExit("no valid control split produced p-values")
     return np.concatenate(pooled), np.array(lambdas, dtype=float), pl.concat(de_frames)
@@ -281,9 +318,26 @@ def main():
     ap.add_argument("--lfc", type=float, default=0.1)
     ap.add_argument("--min-cells", type=int, default=20)
     ap.add_argument("--n-resamples", type=int, default=10)
+    ap.add_argument("--threads", type=int, default=8,
+                    help="CPU threads supplied to each DE fit")
+    ap.add_argument("--resample-workers", type=int, default=1,
+                    help="parallel control splits for CPU PyDESeq2; use --threads 1")
+    ap.add_argument("--non-parametric-engine", choices=("pdex", "rsc"), default="pdex",
+                    help="non-parametric engine; pdex uses Arc pdex and rsc uses RAPIDS GPU Wilcoxon")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--outdir", default=".")
     a = ap.parse_args()
+    if a.threads < 1 or a.resample_workers < 1:
+        ap.error("--threads and --resample-workers must be at least 1")
+    available_cpus = (
+        len(os.sched_getaffinity(0))
+        if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    )
+    worker_cap = max(1, available_cpus // a.threads)
+    if a.resample_workers > worker_cap:
+        print(f"[safety] capping --resample-workers from {a.resample_workers} "
+              f"to {worker_cap} ({available_cpus} CPUs, {a.threads} threads/fit)")
+        a.resample_workers = worker_cap
     rt = _load_runner()
     methods = [m for m in a.methods.split(",") if m]
     # run pydeseq2 (needs raw .X) BEFORE pdex (maybe_normalize log-transforms .X in place)
@@ -299,9 +353,10 @@ def main():
         return {"pert_col": a.pert_col, "control_pert": a.control, "replicate_col": a.replicate_col,
                 "block_cols": [c for c in a.block_cols.split(",") if c], "de_method": m,
                 "allow_discrete": m == "pydeseq2", "normalize_if_raw": m == "pdex",
+                "non_parametric_engine": a.non_parametric_engine,
                 "counts_layer": counts_layer, "min_cells_per_group": a.min_cells,
                 "fdr_threshold": a.fdr, "lfc_threshold": a.lfc, "seed": a.seed,
-                "n_resamples": a.n_resamples, "num_threads": 8}
+                "n_resamples": a.n_resamples, "num_threads": a.threads}
 
     os.makedirs(a.outdir, exist_ok=True)
     os.makedirs(os.path.join(a.outdir, "tables"), exist_ok=True)
@@ -309,9 +364,21 @@ def main():
     for m in order:
         print(f"\n=== {m} control-control null ({a.n_resamples} splits, seed={a.seed}) ===")
         pooled, lambdas, de = control_null_pvalues(adata, cfg_for(m), rt,
-                                                   n_resamples=a.n_resamples, seed=a.seed)
+                                                   n_resamples=a.n_resamples, seed=a.seed,
+                                                   resample_workers=(
+                                                       a.resample_workers if m == "pydeseq2" else 1
+                                                   ))
         res[m] = (pooled, lambdas)
         de_long[m] = de
+        engine = a.non_parametric_engine if m == "pdex" else "cpu"
+        table_path = os.path.join(
+            a.outdir, "tables", f"test2_lfc_vectors_{m}__"
+            f"{os.path.splitext(os.path.basename(a.adata))[0]}.parquet",
+        )
+        de.with_columns(
+            pl.lit(m).alias("method"), pl.lit(engine).alias("engine")
+        ).write_parquet(table_path)
+        print(f"  LFC vectors: {os.path.abspath(table_path)}")
         print(f"  pooled λ_GC = {rt.lambda_gc(pooled):.3f}  ·  per-split λ_GC = "
               f"{np.array2string(lambdas, precision=2)}")
 
