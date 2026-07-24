@@ -13,7 +13,7 @@ import anndata as ad
 import pandas as pd
 from scipy import stats
 
-from cell_eval._de_backends import build_de_frame
+from de_backends import build_de_frame
 
 CHI2_MEDIAN_1DF = 0.4549  # chi2.ppf(0.5, df=1)
 
@@ -51,7 +51,8 @@ def run_de(adata: ad.AnnData, cfg: dict, groupby: str, reference: str) -> pl.Dat
         num_threads=cfg["num_threads"],
         allow_discrete=cfg["allow_discrete"],
         de_method=cfg["de_method"],
-        de_kwargs=None,
+        de_kwargs=({"engine": cfg.get("non_parametric_engine", "pdex")}
+                   if cfg["de_method"] == "pdex" else None),
         counts_layer=cfg.get("counts_layer"),
         replicate_col=cfg.get("replicate_col"),
     )
@@ -139,33 +140,4 @@ def _de_two(adata, pos1, pos2, cfg, lab1="G1", lab2="G2"):
     s.obs["_g"] = pd.Categorical(
         [lab1] * len(pos1) + [lab2] * len(pos2), categories=[lab2, lab1]
     )
-    if cfg.get("de_method") == "pdex" and cfg.get("non_parametric_engine") == "rsc":
-        import rapids_singlecell as rsc
-
-        if _looks_raw_integer(s):
-            sc.pp.normalize_total(s, inplace=True)
-            sc.pp.log1p(s)
-        rsc.get.anndata_to_GPU(s)
-        key = "_rsc_pdex"
-        rsc.tl.rank_genes_groups(
-            s,
-            groupby="_g",
-            groups=[lab1],
-            reference=lab2,
-            method="wilcoxon",
-            n_genes=s.n_vars,
-            tie_correct=True,
-            use_raw=False,
-            key_added=key,
-        )
-        result = s.uns[key]
-        return pl.DataFrame({
-            "target": [lab1] * s.n_vars,
-            "feature": np.asarray(result["names"][lab1], dtype=str),
-            "log2_fold_change": np.asarray(
-                result["logfoldchanges"][lab1], dtype=float
-            ),
-            "p_value": np.asarray(result["pvals"][lab1], dtype=float),
-            "fdr": np.asarray(result["pvals_adj"][lab1], dtype=float),
-        })
     return run_de(s, cfg, groupby="_g", reference=lab2)

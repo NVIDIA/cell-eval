@@ -1,6 +1,6 @@
 # shuffle_de_comparison.py reads this file via --config
 # python shuffle_de_comparison.py --config config.yaml --outdir .
-adata_path: /data2/shared/perturb_seq/k562/Replogle_K562_Essential_2022/cell_eval2.h5ad
+adata_path: /path/to/k562_essential_sub.h5ad
 pert_col: gene
 control_pert: non-targeting
 replicate_col: batch

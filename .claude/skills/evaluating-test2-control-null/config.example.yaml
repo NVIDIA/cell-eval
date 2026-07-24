@@ -1,6 +1,6 @@
 # control_null_diagnostics.py — run both pdex and pydeseq2 in one pass
 # python control_null_diagnostics.py --adata <h5ad> --methods pdex,pydeseq2 #   --pert-col gene --control non-targeting --replicate-col batch --block-cols batch #   --n-resamples 10 --outdir .
-adata: /data2/shared/perturb_seq/k562/Replogle_K562_Essential_2022/cell_eval2.h5ad
+adata: /path/to/k562_essential_sub.h5ad
 methods: pdex,pydeseq2
 pert_col: gene
 control: non-targeting

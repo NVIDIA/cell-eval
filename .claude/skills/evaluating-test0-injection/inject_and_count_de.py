@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Test-0 injection + anchor-recovery (TPR/FPR) check, wired to cell_eval2.h5ad.
+"""Test-0 injection + anchor-recovery (TPR/FPR) check.
 
 Two pieces, as requested:
 
@@ -11,11 +11,11 @@ Two pieces, as requested:
 
 2. ``recover_injected`` — the recovery check, **pooled over N repeats** (default 100): each repeat uses
    a different seed, so both the control/control A/B split AND the anchor set change; at each δ, DE is
-   run on the arms (B vs A) with **wilcoxon** (cell-eval ``pdex``, cell-level rank-sum) and **pydeseq2**
+   run on the arms (B vs A) with **wilcoxon** (upstream ``pdex``, cell-level rank-sum) and **pydeseq2**
    (pseudobulk DESeq2 Wald), and we record how many injected anchors are recovered (TPR) vs how many
    untouched genes are falsely called (FPR). Reported as mean±SD over the repeats.
 
-DE uses the *real* ``cell_eval`` code paths (``build_de_frame``), not a reimplementation. Run
+DE calls the upstream packages through the bundled ``de_backends.py`` adapter. Run
 standalone: ``python inject_and_count_de.py --adata <h5ad>`` (100 repeats by default).
 """
 from __future__ import annotations
@@ -29,7 +29,7 @@ import numpy as np
 import polars as pl
 import scipy.sparse as sp
 
-from cell_eval._de_backends import build_de_frame
+from de_backends import build_de_frame, de_method_label, write_resolved_config
 
 _T0_WORKER_STATE = {}
 
@@ -267,7 +267,10 @@ def recover_injected(adata, *, deltas=(0.0, 0.5, 1.0, 2.0), n_genes=12, n_repeat
     return agg, per
 
 
-def plot_recovery_box(per_repeat_csv, out_png, *, metric="n_anchors_recovered"):
+def plot_recovery_box(
+    per_repeat_csv, out_png, *, metric="n_anchors_recovered",
+    non_parametric_engine="pdex",
+):
     """Box plot of injection recovery across repeats: x = injected log2FC (δ), y = ``metric``, one box
     per method (pdex/Wilcoxon vs pydeseq2) at each δ, with the individual per-repeat points overlaid as a
     jittered scatter. Reads the per-repeat CSV written by ``recover_injected``.
@@ -287,7 +290,12 @@ def plot_recovery_box(per_repeat_csv, out_png, *, metric="n_anchors_recovered"):
     deltas = sorted(per["delta"].unique().to_list())
     methods = ["wilcoxon", "pydeseq2"]
     color = {"wilcoxon": "#4C78A8", "pydeseq2": "#F58518"}   # colourblind-safe blue / orange
-    label = {"wilcoxon": "pdex (cell-level Wilcoxon)", "pydeseq2": "pydeseq2 (pseudobulk DESeq2)"}
+    label = {
+        "wilcoxon": de_method_label(
+            "pdex", non_parametric_engine=non_parametric_engine, verbose=True
+        ),
+        "pydeseq2": de_method_label("pydeseq2", verbose=True),
+    }
     ylab = {"n_anchors_recovered": f"anchors recovered (of {n_anc} injected)",
             "n_false_positives": "DE genes detected NOT among anchors (false positives)",
             "n_false_negatives": f"anchors NOT recovered — false negatives (of {n_anc})",
@@ -324,7 +332,9 @@ def plot_recovery_box(per_repeat_csv, out_png, *, metric="n_anchors_recovered"):
     elif metric in ("TPR", "FPR"):
         ax.set_ylim(-0.03, 1.03)
     ax.grid(axis="y", ls=":", color="0.8", zorder=0)
-    ax.set_title(f"Test-0 injection recovery — pdex vs pydeseq2\n{n_rep} repeats × {n_anc} anchors "
+    ax.set_title(
+                 f"Test-0 injection recovery — {label['wilcoxon']} vs "
+                 f"{label['pydeseq2']}\n{n_rep} repeats × {n_anc} anchors "
                  "(control-vs-control), one point per repeat", fontsize=10)
     ax.legend(handles=[Patch(facecolor=color[m], alpha=0.6, label=label[m]) for m in methods],
               fontsize=8, loc="center left")
@@ -489,7 +499,10 @@ def recover_injected_binned(adata, *, deltas=(0.5, 1.0, 2.0), n_genes_per_bin=5,
     return agg, per
 
 
-def plot_tpr_by_bin(per_csv, out_png, *, deltas=None, fdr=0.05, lfc=0.1):
+def plot_tpr_by_bin(
+    per_csv, out_png, *, deltas=None, fdr=0.05, lfc=0.1,
+    non_parametric_engine="pdex",
+):
     """Line plot of anchors recovered vs expression bin, one panel per method, lines coloured by delta.
 
     X-axis: expression bin (0=lowest mean count … n_bins-1=highest).
@@ -504,7 +517,12 @@ def plot_tpr_by_bin(per_csv, out_png, *, deltas=None, fdr=0.05, lfc=0.1):
         deltas = sorted(per["delta"].unique().to_list())
     methods = [m for m in ["wilcoxon", "pydeseq2"] if m in per["method"].unique().to_list()]
     method_color = {"wilcoxon": "#4C78A8", "pydeseq2": "#F58518"}
-    method_label = {"wilcoxon": "pdex (cell-level Wilcoxon)", "pydeseq2": "pydeseq2 (pseudobulk DESeq2)"}
+    method_label = {
+        "wilcoxon": de_method_label(
+            "pdex", non_parametric_engine=non_parametric_engine, verbose=True
+        ),
+        "pydeseq2": de_method_label("pydeseq2", verbose=True),
+    }
     # fixed colour palette for nonzero deltas — no yellow
     _DELTA_PALETTE = ["#1f77b4", "#d95f02", "#d62728", "#9467bd", "#2ca02c"]
     nonzero = [d for d in deltas if d != 0.0]
@@ -566,7 +584,10 @@ def plot_tpr_by_bin(per_csv, out_png, *, deltas=None, fdr=0.05, lfc=0.1):
     return out_png
 
 
-def plot_fpr_by_bin(per_csv, out_png, *, deltas=None, fdr=0.05, lfc=0.1):
+def plot_fpr_by_bin(
+    per_csv, out_png, *, deltas=None, fdr=0.05, lfc=0.1,
+    non_parametric_engine="pdex",
+):
     """Line plot of false positives vs expression bin, one panel per method.
 
     X-axis: expression bin (0=lowest … n_bins-1=highest, by mean raw count in arm A).
@@ -582,7 +603,12 @@ def plot_fpr_by_bin(per_csv, out_png, *, deltas=None, fdr=0.05, lfc=0.1):
         deltas = sorted(per["delta"].unique().to_list())
     methods = [m for m in ["wilcoxon", "pydeseq2"] if m in per["method"].unique().to_list()]
     method_color = {"wilcoxon": "#4C78A8", "pydeseq2": "#F58518"}
-    method_label = {"wilcoxon": "pdex (cell-level Wilcoxon)", "pydeseq2": "pydeseq2 (pseudobulk DESeq2)"}
+    method_label = {
+        "wilcoxon": de_method_label(
+            "pdex", non_parametric_engine=non_parametric_engine, verbose=True
+        ),
+        "pydeseq2": de_method_label("pydeseq2", verbose=True),
+    }
     _DELTA_PALETTE = ["#808080", "#1f77b4", "#d95f02", "#d62728", "#9467bd", "#2ca02c"]
     all_ds = sorted(per["delta"].unique().to_list())
     delta_color = {d: _DELTA_PALETTE[i % len(_DELTA_PALETTE)] for i, d in enumerate(all_ds)}
@@ -659,6 +685,14 @@ def main():
     ap.add_argument("--pydeseq-workers", type=int, default=1,
                     help="parallel injection tasks for CPU PyDESeq2; use --threads 1")
     ap.add_argument("--out", default="injection_recovery.csv")
+    ap.add_argument(
+        "--expression-state", choices=("raw_counts", "log1p_normalized"), default="",
+        help="user-confirmed state of adata.X; recorded in the resolved YAML",
+    )
+    ap.add_argument(
+        "--run-root", default="",
+        help="confirmed run root for configs/ and logs/ (defaults to the result directory)",
+    )
     a = ap.parse_args()
     deltas = tuple(float(x) for x in a.deltas.split(","))
     methods = tuple(m.strip() for m in a.methods.split(",") if m.strip())
@@ -689,6 +723,19 @@ def main():
     # treat --out as outdir when it has no file extension, otherwise use its parent
     out_abs = os.path.abspath(a.out)
     outdir = out_abs if not os.path.splitext(os.path.basename(a.out))[1] else (os.path.dirname(out_abs) or ".")
+    a.run_root = os.path.abspath(os.path.expanduser(a.run_root or outdir))
+    write_resolved_config(
+        run_root=a.run_root,
+        workflow="de_test0_injection",
+        dataset=dataset,
+        resolved={
+            "arguments": vars(a),
+            "methods": list(methods),
+            "deltas": list(deltas),
+            "effective_counts_layer": counts_layer or "X",
+            "results_outdir": outdir,
+        },
+    )
     plots_dir = os.path.join(outdir, "plots")
     os.makedirs(plots_dir, exist_ok=True)
     base_csv = os.path.join(outdir, f"injection_recovery__{dataset}")
@@ -715,7 +762,10 @@ def main():
     #     recovered = absolute # anchors recovered (of N); false_neg = anchors NOT recovered (N − recovered).
     for metric, tag in (("n_anchors_recovered", "recovered_box"), ("n_false_positives", "false_pos_box")):
         png = base_png + f"__{tag}.png"
-        plot_recovery_box(per_csv, png, metric=metric)
+        plot_recovery_box(
+            per_csv, png, metric=metric,
+            non_parametric_engine=a.non_parametric_engine,
+        )
         print(f"plot:    {os.path.abspath(png)}")
 
     # (3) expression-bin-stratified TPR: same delta injected into anchors from each expression bin
@@ -732,10 +782,16 @@ def main():
         block_cols=block_cols, non_parametric_engine=a.non_parametric_engine, methods=methods,
         workers=a.pydeseq_workers)
     bin_png = base_png + "__tpr_by_bin.png"
-    plot_tpr_by_bin(bin_per_csv, bin_png, fdr=a.fdr, lfc=a.lfc)
+    plot_tpr_by_bin(
+        bin_per_csv, bin_png, fdr=a.fdr, lfc=a.lfc,
+        non_parametric_engine=a.non_parametric_engine,
+    )
     print(f"plot:    {os.path.abspath(bin_png)}")
     fpr_png = base_png + "__fpr_by_bin.png"
-    plot_fpr_by_bin(bin_per_csv, fpr_png, fdr=a.fdr, lfc=a.lfc)
+    plot_fpr_by_bin(
+        bin_per_csv, fpr_png, fdr=a.fdr, lfc=a.lfc,
+        non_parametric_engine=a.non_parametric_engine,
+    )
     print(f"plot:    {os.path.abspath(fpr_png)}")
 
 

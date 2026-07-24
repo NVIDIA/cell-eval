@@ -15,18 +15,23 @@ from __future__ import annotations
 import json
 import importlib.util
 import os
+from datetime import datetime, timezone
+from pathlib import Path
+import re
 import sys
 import warnings
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
 import anndata as ad
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+import yaml
 from scipy import stats
 
 
 METHODS = ("ols", "pdex_mwu")
+MAX_DIAGONAL_COUNT_LABELS = 40
 BIOCONCORD_MODULE_PATH = os.path.join(
     "Src", "bioconcord", "testGeneProgramsConcordance.py"
 )
@@ -48,6 +53,54 @@ class ScoredData:
         self.programs = programs
         self.program_labels = program_labels
         self.score_source = score_source
+
+
+def _yaml_safe(value: Any) -> Any:
+    """Convert resolved runtime values to objects accepted by ``safe_dump``."""
+    if isinstance(value, Mapping):
+        return {str(key): _yaml_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_yaml_safe(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def write_resolved_config(
+    *,
+    run_root: str,
+    workflow: str,
+    dataset: str,
+    resolved: Mapping[str, Any],
+) -> str:
+    """Create run folders and save one immutable, timestamped YAML snapshot."""
+    root = Path(run_root).expanduser().resolve()
+    config_dir = root / "configs"
+    (root / "logs").mkdir(parents=True, exist_ok=True)
+    config_dir.mkdir(parents=True, exist_ok=True)
+    created = datetime.now(timezone.utc)
+    stamp = created.strftime("%Y%m%dT%H%M%S.%fZ")
+
+    def slug(value: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
+        return cleaned or "run"
+
+    path = config_dir / f"{stamp}__{slug(workflow)}__{slug(dataset)}.yaml"
+    payload = {
+        "workflow": workflow,
+        "dataset": dataset,
+        "created_utc": created.isoformat(),
+        "run_root": str(root),
+        "resolved_config": _yaml_safe(resolved),
+    }
+    with path.open("x", encoding="utf-8") as handle:
+        yaml.safe_dump(payload, handle, sort_keys=False, allow_unicode=True)
+    print(f"Resolved configuration: {path}", flush=True)
+    return str(path)
 
 
 def load_programs(csv_path: str, var_names: Sequence[str], min_genes: int = 5) -> dict:
@@ -789,18 +842,19 @@ def plot_target_corr_matrix(
             },
             ax=ax,
         )
-        for i, target in enumerate(ordered_targets):
-            n_cells = int(round(float(np.mean(cell_counts[target]))))
-            ax.text(
-                i + 0.5,
-                i + 0.5,
-                str(n_cells),
-                ha="center",
-                va="center",
-                fontsize=5,
-                color="white",
-                fontweight="bold",
-            )
+        if len(ordered_targets) <= MAX_DIAGONAL_COUNT_LABELS:
+            for i, target in enumerate(ordered_targets):
+                n_cells = int(round(float(np.mean(cell_counts[target]))))
+                ax.text(
+                    i + 0.5,
+                    i + 0.5,
+                    str(n_cells),
+                    ha="center",
+                    va="center",
+                    fontsize=5,
+                    color="white",
+                    fontweight="bold",
+                )
         if group_separator:
             groups = [target.split(group_separator, 1)[0] for target in ordered_targets]
             for boundary in range(1, len(groups)):

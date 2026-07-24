@@ -1,14 +1,31 @@
 ---
 name: evaluating-test2-control-null
-description: "Run ONLY Test 2 (control-control split null) from the cell-eval metric-robustness battery and emit a single-test report. Splits control cells into A/B (a true null) and checks the DE null is calibrated: p-values Uniform[0,1], genomic-inflation lambda_GC ~= 1, frac_sig ~= alpha. Output includes a 3-panel diagnostic plot: QQ overlaid across splits | p-value histogram | lambda_GC boxplot. Use when someone wants to check null calibration / lambda_GC / uniformity of a DE metric without running the whole battery."
+description: "Run ONLY Test 2 (control-control split null) from the DE metric-robustness battery and emit a single-test report. Splits control cells into A/B (a true null) and checks the DE null is calibrated: p-values Uniform[0,1], genomic-inflation lambda_GC ~= 1, frac_sig ~= alpha. Output includes a 3-panel diagnostic plot: QQ overlaid across splits | p-value histogram | lambda_GC boxplot. Use when someone wants to check null calibration / lambda_GC / uniformity of a DE metric without running the whole battery."
 ---
 
 # Test 2 — Control-Control Split Null
 
-**One test from the cell-eval metric-robustness battery, run on its own.** This skill runs **only
+**One test from the DE metric-robustness battery, run on its own.** This skill runs **only
 `test_2`** and produces a self-contained report for it. Role: **validity gate (null calibration)** — Anti-conservative behaviour here means false positives downstream — a hard gate.
 
 Runs **both pdex and pydeseq2** in one pass via `control_null_diagnostics.py`.
+
+`de_backends.py` is bundled with this skill and calls the upstream `pdex` and
+`pydeseq2` packages directly. Do not import project-private DE backend modules.
+
+## Mandatory preflight and run capture
+
+Do not start the executable until the user has explicitly confirmed one fully resolved run configuration.
+
+1. Gather the input `.h5ad`, ask whether `adata.X` contains raw counts or log1p-normalized expression, results output directory, separate run root, methods to compare, non-parametric engine (`pdex` or `rsc`) when `pdex` is selected, required observation columns and control label, replicate/block columns, count or score layers, thresholds, seeds, repeats, and worker/thread settings. Inspect the input read-only to resolve unknown columns, labels, and layers. Pass the confirmed state as `--expression-state`.
+2. Expand paths and resolve every default. Show one concise preflight summary containing the input, results directory, run root, methods/engine, data fields, thresholds, workload/concurrency, exact command, log path, and resolved-config destination.
+3. Ask for explicit confirmation and stop. Do not launch computation or plotting before confirmation.
+4. After confirmation, create `<run-root>/logs` and `<run-root>/configs`, pass `--run-root <run-root>`, and capture the complete terminal stream with `2>&1 | tee <run-root>/logs/<workflow>__<dataset>__<UTC-timestamp>.log`.
+5. Every invocation writes an immutable timestamped YAML snapshot under `<run-root>/configs`. Report the result, log, and YAML paths on completion.
+
+Every box-and-whisker plot must overlay every finite underlying observation as jittered scatter points. Do not sample, aggregate away, or hide values in the scatter layer.
+
+Keep `pdex` as the stable internal/table schema key, but label every plot with the actual selected engine: `pdex` for Arc pdex and `RSC` for RAPIDS GPU Wilcoxon. Never display an RSC result as pdex.
 
 ## What it asks
 When you split **control cells** into a pseudo-perturbation vs a reference (same population, so a true null), does the pipeline correctly find nothing? A calibrated null gives Uniform[0,1] p-values (lambda_GC ~= 1, frac_sig ~= alpha); inflation means false positives, deflation means it is under-powered.
@@ -81,7 +98,7 @@ blue = pdex only · orange = pydeseq2 only · green = both), with `y=x` and, in 
 off-origin colored point is a false positive** — the plot shows whether the two backends' false
 positives coincide (points on the diagonal) or are independent noise (points on the axes). On a
 well-calibrated null both DE counts are ≈ 0 and the two backends' LFC estimates agree tightly (e.g. ρ ≈
-0.92 on cell_eval2, with 0 DE calls from either backend).
+0.92 on the K562 essential subset, with 0 DE calls from either backend).
 
 The reusable `plot_test2_lfc_agreement(de_pdex, de_pydeseq2, output_path, fdr, lfc)` takes the per-gene
 per-split `de_long` frames (the 3rd return value of `control_null_pvalues`).

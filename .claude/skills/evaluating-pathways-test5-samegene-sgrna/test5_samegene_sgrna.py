@@ -286,6 +286,14 @@ def main() -> None:
         help="official ArcInstitute/bioconcord checkout (or set BIOCONCORD_ROOT)",
     )
     parser.add_argument("--outdir", default=".")
+    parser.add_argument(
+        "--expression-state", choices=("raw_counts", "log1p_normalized"), default="",
+        help="user-confirmed state of adata.X; recorded in the resolved YAML",
+    )
+    parser.add_argument(
+        "--run-root", default="",
+        help="confirmed run root for configs/ and logs/ (defaults to --outdir)",
+    )
     parser.add_argument("--pert-col", default="gene", help="target-gene column")
     parser.add_argument("--sgrna-col", required=True)
     parser.add_argument("--control", default="non-targeting")
@@ -296,7 +304,7 @@ def main() -> None:
     parser.add_argument("--n-bins", type=int, default=25)
     parser.add_argument("--min-cells", type=int, default=20)
     parser.add_argument("--min-guides", type=int, default=2)
-    parser.add_argument("--max-genes", type=int, default=12)
+    parser.add_argument("--max-genes", type=int, default=0)
     parser.add_argument("--max-control", type=int, default=1500)
     parser.add_argument("--normalize-raw", action="store_true")
     parser.add_argument("--background-multiplier", type=int, default=10)
@@ -320,6 +328,17 @@ def main() -> None:
     pu.clear_output_prefix(args.outdir, "pathways_test5_")
     plots, tables = pu.prepare_output(args.outdir)
     dataset = pu.dataset_name(args.adata)
+    args.run_root = os.path.abspath(os.path.expanduser(args.run_root or args.outdir))
+    pu.write_resolved_config(
+        run_root=args.run_root,
+        workflow="pathways_test5_samegene_sgrna",
+        dataset=dataset,
+        resolved={
+            "arguments": vars(args),
+            "methods": pu.method_list(args.methods),
+            "results_outdir": os.path.abspath(args.outdir),
+        },
+    )
     subset, selected_genes, selected_guides = load_samegene_subset(args)
     scored = pu.score_anndata(
         subset, args.programs, score_layer=args.score_layer, min_genes=args.min_genes,

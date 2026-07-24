@@ -86,6 +86,8 @@ import numpy as np
 import polars as pl
 from scipy import stats
 
+from de_backends import de_method_label, write_resolved_config
+
 _RT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "de_helpers.py")
 
 CAP = 2.0  # ±log2FC colour cap
@@ -106,6 +108,14 @@ _PAIR_LFC_B = None
 _PAIR_DE_A = None
 _PAIR_DE_B = None
 PAIR_SPECIFIC_MIN_GENES = 5
+
+
+def _display_method(method, cfg, *, verbose=False):
+    return de_method_label(
+        method,
+        non_parametric_engine=cfg.get("non_parametric_engine", "pdex"),
+        verbose=verbose,
+    )
 
 
 def _load_runner():
@@ -200,8 +210,8 @@ def split_half_signatures(adata, cfg, rt, *, seed=0, perturbation_workers=1):
     rt.maybe_normalize(adata, cfg)  # pdex expects log-norm; no-op for pydeseq2
     pc, mcg, ctrl = cfg["pert_col"], cfg["min_cells_per_group"], cfg["control_pert"]
     labels = adata.obs[pc].astype(str).to_numpy()
-    grouped = adata.obs.assign(_cell_eval_label=labels).groupby(
-        "_cell_eval_label", observed=True, sort=True,
+    grouped = adata.obs.assign(_de_label=labels).groupby(
+        "_de_label", observed=True, sort=True,
     ).indices
     pos_C = np.asarray(grouped[ctrl], dtype=int)
     ctrl_obs = adata.obs.iloc[pos_C]
@@ -527,7 +537,8 @@ def layer1_heatmap(sigs, out_png, cfg, *, max_genes=2000, title_prefix="Test-1",
         ax.set_xticks([])
     axes[0].set_yticks(range(len(perts)))
     axes[0].set_yticklabels(ylab, fontsize=6)
-    fig.suptitle(f"{title_prefix} within-condition reproducibility ({cfg['de_method']}) — split A vs split B\n"
+    fig.suptitle(f"{title_prefix} within-condition reproducibility "
+                 f"({_display_method(cfg['de_method'], cfg)}) — split A vs split B\n"
                  f"rows = {unit}s sorted by split-half ρ (low ρ at top = irreproducible)", fontsize=11)
     cbar = fig.colorbar(im, ax=axes, fraction=0.025, pad=0.02)
     cbar.set_label(f"log2FC (capped ±{CAP:g}; white = 0)")
@@ -679,15 +690,24 @@ def layer2_zoom_compare(sigs_by_method, out_png, cfg, genes, *, methods, per_pag
                                  squeeze=False)
         im = None
         for r, (p, m) in enumerate(rows):
-            im = _zoom_row(axes[r][0], axes[r][1], sigs_by_method[m][p], genes, cfg,
-                           f"{p} · {m}", rho_genes=rho_genes)
+            im = _zoom_row(
+                axes[r][0], axes[r][1], sigs_by_method[m][p], genes, cfg,
+                f"{p} · {_display_method(m, cfg)}", rho_genes=rho_genes,
+            )
         fig.colorbar(im, ax=axes[:, 1].tolist(), fraction=0.02, pad=0.02, label=f"log2FC (±{CAP:g})")
         if len(page) == 1:
             p = page[0]
-            rr = " vs ".join(f"{m} ρ={sigs_by_method[m][p]['rho']:.2f}" for m in methods)
+            rr = " vs ".join(
+                f"{_display_method(m, cfg)} ρ={sigs_by_method[m][p]['rho']:.2f}"
+                for m in methods
+            )
             sup = f"{title_prefix} reproducibility zoom — {p}  ({rr})   [{pi}/{len(pages)}]"
         else:
-            sup = f"{title_prefix} reproducibility zoom — {', '.join(methods)}   [{pi}/{len(pages)}]"
+            sup = (
+                f"{title_prefix} reproducibility zoom — "
+                f"{', '.join(_display_method(m, cfg) for m in methods)}   "
+                f"[{pi}/{len(pages)}]"
+            )
         fig.suptitle(sup, fontsize=11)
         png = f"{base}_{pi:02d}.png"
         fig.savefig(png, dpi=140, bbox_inches="tight")
@@ -900,6 +920,7 @@ def _correlation_distribution_summary(method, metric, group, values):
 def correlation_distribution_boxplots(
     matrices_by_method, out_png, *, methods, title_prefix="Test-1",
     unit="perturbation", panel_label="global union-DE", seed=0,
+    method_labels=None,
 ):
     """Plot diagonal/off-diagonal distributions for every method and metric.
 
@@ -980,7 +1001,8 @@ def correlation_distribution_boxplots(
             ax.axhline(0, color="#777777", linestyle="--", linewidth=1)
             ax.set_ylim(-1.02, 1.02)
             ax.grid(axis="y", color="#dddddd", linewidth=0.7)
-            ax.set_title(f"{method} — {metric}")
+            display = (method_labels or {}).get(method, method)
+            ax.set_title(f"{display} — {metric}")
             for x_position, values in enumerate(
                 (diagonal, off_diagonal), start=1
             ):
@@ -1264,7 +1286,7 @@ def pair_specific_de_union_corr_matrix(
             "pearson_off": _finite_mean(mean_pearson[~diagonal]),
         }
         ax.set_title(
-            f"{method}\n"
+            f"{_display_method(method, cfg)}\n"
             f"Spearman: diag={values['spearman_diagonal']:.2f}, "
             f"off={values['spearman_off']:.2f}; "
             f"Pearson: diag={values['pearson_diagonal']:.2f}, "
@@ -1307,6 +1329,7 @@ def pair_specific_de_union_corr_matrix(
         matrices_by_method, boxplot_path, methods=methods,
         title_prefix=title_prefix, unit=unit,
         panel_label="pair-specific DE-union", seed=0,
+        method_labels={method: _display_method(method, cfg) for method in methods},
     )
     return out_png
 
@@ -1423,7 +1446,7 @@ def layer3_corr_matrix(sigs_by_method, out_png, cfg, genes, *, methods,
             f"Pearson diag={pearson_diagonal:.4f}, off={pearson_offdiagonal:.4f}"
         )
         ax.set_title(
-            f"{m}\n"
+            f"{_display_method(m, cfg)}\n"
             f"Spearman: diag={spearman_diagonal:.2f}, off={spearman_offdiagonal:.2f}; "
             f"Pearson: diag={pearson_diagonal:.2f}, off={pearson_offdiagonal:.2f}",
             fontsize=9,
@@ -1447,6 +1470,7 @@ def layer3_corr_matrix(sigs_by_method, out_png, cfg, genes, *, methods,
             matrices_by_method, _variant_output_path(out_png, "boxplots"),
             methods=methods, title_prefix=title_prefix, unit=unit,
             panel_label="global union-DE", seed=0,
+            method_labels={method: _display_method(method, cfg) for method in methods},
         )
     return out_png
 
@@ -1484,6 +1508,14 @@ def main():
     ap.add_argument("--resume-signatures", action="store_true",
                     help="load matching method checkpoints when present; compute missing ones")
     ap.add_argument("--outdir", default=".")
+    ap.add_argument(
+        "--expression-state", choices=("raw_counts", "log1p_normalized"), default="",
+        help="user-confirmed state of adata.X; recorded in the resolved YAML",
+    )
+    ap.add_argument(
+        "--run-root", default="",
+        help="confirmed run root for configs/ and logs/ (defaults to --outdir)",
+    )
     a = ap.parse_args()
     os.makedirs(a.outdir, exist_ok=True)
     run_lock_handle = None
@@ -1627,6 +1659,18 @@ def main():
         counts_layer = "counts"   # robust raw source (survives pdex's in-place normalize)
     print(f"loaded {a.adata}: {adata.n_obs} cells × {adata.n_vars} genes  (methods={methods})")
     ds = os.path.splitext(os.path.basename(a.adata))[0]  # dataset tag appended to every output file
+    a.run_root = os.path.abspath(os.path.expanduser(a.run_root or a.outdir))
+    write_resolved_config(
+        run_root=a.run_root,
+        workflow="de_test1_reproducibility",
+        dataset=ds,
+        resolved={
+            "arguments": vars(a),
+            "methods": methods,
+            "effective_counts_layer": counts_layer or "X",
+            "results_outdir": os.path.abspath(a.outdir),
+        },
+    )
 
     def cfg_for(m):
         return {"pert_col": a.pert_col, "control_pert": a.control, "replicate_col": a.replicate_col,

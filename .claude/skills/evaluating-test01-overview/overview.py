@@ -30,7 +30,11 @@ import yaml
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-from cell_eval._de_backends import build_de_frame  # noqa: E402
+from de_backends import (  # noqa: E402
+    build_de_frame,
+    de_method_label,
+    write_resolved_config,
+)
 
 log = logging.getLogger("overview")
 OVERVIEW_CACHE_VERSION = 4
@@ -252,12 +256,14 @@ def _plot_ma_panels(
     method: str,
     x_label: str,
     out_path: str,
+    non_parametric_engine: str = "pdex",
 ) -> str:
     """1 × 3 figure: mean expression vs LFC for each representative perturbation."""
-    method_label = {
-        "pdex": "pdex (cell-level Wilcoxon)",
-        "pydeseq2": "pydeseq2 (pseudobulk DESeq2)",
-    }[method]
+    method_label = de_method_label(
+        method,
+        non_parametric_engine=non_parametric_engine,
+        verbose=True,
+    )
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     for ax, (rank_label, pert) in zip(axes, picks.items()):
@@ -315,6 +321,15 @@ def _plot_scatter(
     jaccard: dict[str, float] | None = None,
 ) -> None:
     ctrl = cfg["control_pert"]
+    non_parametric_label = de_method_label(
+        "pdex",
+        non_parametric_engine=cfg.get("non_parametric_engine", "pdex"),
+        verbose=True,
+    )
+    non_parametric_short = de_method_label(
+        "pdex",
+        non_parametric_engine=cfg.get("non_parametric_engine", "pdex"),
+    )
     perts = [p for p in n_sig_pyd if p != ctrl and p in n_sig_pdx]
     jaccard = jaccard or {}
 
@@ -335,7 +350,8 @@ def _plot_scatter(
     ax.fill_between([lim_min, lim_max], [lim_min, lim_max], lim_max,
                     color=_PYD_COLOR, alpha=0.04, label="pyDESeq2 calls more")
     ax.fill_between([lim_min, lim_max], lim_min, [lim_min, lim_max],
-                    color=_PDX_COLOR, alpha=0.04, label="pdex calls more")
+                    color=_PDX_COLOR, alpha=0.04,
+                    label=f"{non_parametric_short} calls more")
 
     # label = "NAME  J=<Jaccard(DE_pdex, DE_pydeseq2)>"; leader ARROWS to dots (non-overlapping)
     def _lbl(p):
@@ -358,14 +374,14 @@ def _plot_scatter(
     ax.set_xlim(lim_min, lim_max)
     ax.set_ylim(lim_min, lim_max)
     ax.set_aspect("equal", adjustable="box")
-    ax.set_xlabel("# DE genes — pdex (cell-level Wilcoxon)", fontsize=11)
+    ax.set_xlabel(f"# DE genes — {non_parametric_label}", fontsize=11)
     ax.set_ylabel("# DE genes — pyDESeq2 (pseudobulk)", fontsize=11)
     fdr_t = cfg["fdr_threshold"]
     lfc_t = cfg["lfc_threshold"]
     ax.set_title(
-        f"DE gene count per perturbation: pyDESeq2 vs pdex\n"
+        f"DE gene count per perturbation: PyDESeq2 vs {non_parametric_short}\n"
         f"FDR < {fdr_t},  |LFC| ≥ {lfc_t}  •  dot size ∝ cell count  •  "
-        "J = Jaccard(pdex, pyDESeq2 DE-gene sets)",
+        f"J = Jaccard({non_parametric_short}, PyDESeq2 DE-gene sets)",
         fontsize=11, fontweight="bold",
     )
     ax.legend(fontsize=9, loc="upper left", framealpha=0.85)
@@ -481,7 +497,11 @@ def _plot_corr_matrices(de_by: dict, cfg: dict, out_png: str,
         im = ax.imshow(C, cmap="RdBu_r", vmin=-1, vmax=1, interpolation="nearest")
         ax.set_xticks(range(len(perts))); ax.set_xticklabels(perts, rotation=90, fontsize=5)
         ax.set_yticks(range(len(perts))); ax.set_yticklabels(perts, fontsize=5)
-        label = {"pdex": "pdex (cell-level Wilcoxon)", "pydeseq2": "pydeseq2 (pseudobulk DESeq2)"}[m]
+        label = de_method_label(
+            m,
+            non_parametric_engine=cfg.get("non_parametric_engine", "pdex"),
+            verbose=True,
+        )
         ax.set_title(
             f"{label}\nmean diagonal r = {np.nanmean(diagonal):.2f}; "
             f"off-diagonal r = {np.nanmean(off):.2f}",
@@ -514,6 +534,14 @@ def main() -> None:
         "--non-parametric-engine", choices=("pdex", "rsc"), default=None,
         help="override config non_parametric_engine",
     )
+    ap.add_argument(
+        "--expression-state", choices=("raw_counts", "log1p_normalized"), default="",
+        help="user-confirmed state of adata.X; recorded in the resolved YAML",
+    )
+    ap.add_argument(
+        "--run-root", default="",
+        help="confirmed run root for configs/ and logs/ (defaults to config outdir)",
+    )
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
@@ -539,6 +567,17 @@ def main() -> None:
     os.makedirs(plots_dir,  exist_ok=True)
 
     ds = os.path.splitext(os.path.basename(cfg["adata_path"]))[0]  # dataset tag on every output file
+    args.run_root = os.path.abspath(os.path.expanduser(args.run_root or outdir))
+    write_resolved_config(
+        run_root=args.run_root,
+        workflow="de_overview",
+        dataset=ds,
+        resolved={
+            "arguments": vars(args),
+            "effective_config": cfg,
+            "results_outdir": outdir,
+        },
+    )
     pyd_full_path    = os.path.join(tables_dir, f"overview_pydeseq2_full__{ds}.csv")
     pyd_raw_path     = os.path.join(tables_dir, f"overview_pydeseq2_raw_full__{ds}.csv")
     pdx_full_path    = os.path.join(tables_dir, f"overview_pdex_full__{ds}.csv")
@@ -745,12 +784,14 @@ def main() -> None:
         if ma_pyd is not None:
             p = os.path.join(plots_dir, f"test01_ma_pydeseq2__{ds}.png")
             _plot_ma_panels(ma_pyd, picks, fdr_t, lfc_t, "pydeseq2",
-                            "mean raw count (pert cells)", p)
+                            "mean raw count (pert cells)", p,
+                            cfg.get("non_parametric_engine", "pdex"))
             log.info("Saved → %s", p)
         if ma_pdx is not None:
             p = os.path.join(plots_dir, f"test01_ma_pdex__{ds}.png")
             _plot_ma_panels(ma_pdx, picks, fdr_t, lfc_t, "pdex",
-                            "mean raw count (pert cells)", p)
+                            "mean raw count (pert cells)", p,
+                            cfg.get("non_parametric_engine", "pdex"))
             log.info("Saved → %s", p)
 
 

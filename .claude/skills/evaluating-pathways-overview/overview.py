@@ -19,6 +19,14 @@ def main() -> None:
         help="official ArcInstitute/bioconcord checkout (or set BIOCONCORD_ROOT)",
     )
     parser.add_argument("--outdir", default=".")
+    parser.add_argument(
+        "--expression-state", choices=("raw_counts", "log1p_normalized"), default="",
+        help="user-confirmed state of adata.X; recorded in the resolved YAML",
+    )
+    parser.add_argument(
+        "--run-root", default="",
+        help="confirmed run root for configs/ and logs/ (defaults to --outdir)",
+    )
     parser.add_argument("--pert-col", default="gene")
     parser.add_argument("--control", default="non-targeting")
     parser.add_argument(
@@ -49,6 +57,17 @@ def main() -> None:
     pu.clear_output_prefix(args.outdir, "pathways_run_metadata__")
     plots, tables = pu.prepare_output(args.outdir)
     dataset = pu.dataset_name(args.adata)
+    args.run_root = os.path.abspath(os.path.expanduser(args.run_root or args.outdir))
+    pu.write_resolved_config(
+        run_root=args.run_root,
+        workflow="pathways_overview",
+        dataset=dataset,
+        resolved={
+            "arguments": vars(args),
+            "methods": pu.method_list(args.methods),
+            "results_outdir": os.path.abspath(args.outdir),
+        },
+    )
     scored = pu.load_and_score(
         args.adata,
         args.programs,

@@ -1,14 +1,31 @@
 ---
 name: evaluating-test1-reproducibility
-description: Run ONLY Test 1 (within-condition reproducibility) from the cell-eval metric-robustness battery and emit a single-test report. Splits each perturbation's cells into halves A/B (controls also split) and asks whether independent DE signatures agree using split-half Spearman, Pearson, DEG Jaccard, and direction, including diagonal/off-diagonal correlation summaries, rho-vs-cell-count, and a difference-is-null QQ. Use when someone wants the reproducibility ceiling and cross-perturbation specificity of a DE metric without running the whole battery.
+description: Run ONLY Test 1 (within-condition reproducibility) from the DE metric-robustness battery and emit a single-test report. Splits each perturbation's cells into halves A/B (controls also split) and asks whether independent DE signatures agree using split-half Spearman, Pearson, DEG Jaccard, and direction, including diagonal/off-diagonal correlation summaries, rho-vs-cell-count, and a difference-is-null QQ. Use when someone wants the reproducibility ceiling and cross-perturbation specificity of a DE metric without running the whole battery.
 ---
 
 # Test 1 — Within-Condition Reproducibility
 
-**One test from the cell-eval metric-robustness battery, run on its own.** This skill runs **only
+**One test from the DE metric-robustness battery, run on its own.** This skill runs **only
 `test_1`** and produces a self-contained report for it. Role: **validity gate (reproducibility ceiling)** — Sets the empirical ceiling: no model can score higher on a perturbation than the data agrees with itself.
 
 Runs **both pdex and pydeseq2** on the same splits in one pass via `reproducibility_heatmap.py`.
+
+`de_backends.py` is bundled with this skill and calls the upstream `pdex` and
+`pydeseq2` packages directly. Do not import project-private DE backend modules.
+
+## Mandatory preflight and run capture
+
+Do not start the executable until the user has explicitly confirmed one fully resolved run configuration.
+
+1. Gather the input `.h5ad`, ask whether `adata.X` contains raw counts or log1p-normalized expression, results output directory, separate run root, methods to compare, non-parametric engine (`pdex` or `rsc`) when `pdex` is selected, required observation columns and control label, replicate/block columns, count or score layers, thresholds, seeds, repeats, and worker/thread settings. Inspect the input read-only to resolve unknown columns, labels, and layers. Pass the confirmed state as `--expression-state`.
+2. Expand paths and resolve every default. Show one concise preflight summary containing the input, results directory, run root, methods/engine, data fields, thresholds, workload/concurrency, exact command, log path, cache behavior, and resolved-config destination.
+3. Ask for explicit confirmation and stop. Do not launch computation, plotting, resume mode, or cache reuse before confirmation.
+4. After confirmation, create `<run-root>/logs` and `<run-root>/configs`, pass `--run-root <run-root>`, and capture the complete terminal stream with `2>&1 | tee <run-root>/logs/<workflow>__<dataset>__<UTC-timestamp>.log`.
+5. Every invocation writes an immutable timestamped YAML snapshot under `<run-root>/configs`. Report the result, log, and YAML paths on completion.
+
+Every box-and-whisker plot must overlay every finite underlying observation as jittered scatter points. Do not sample, aggregate away, or hide values in the scatter layer.
+
+Keep `pdex` as the stable internal/table schema key, but label every plot with the actual selected engine: `pdex` for Arc pdex and `RSC` for RAPIDS GPU Wilcoxon. Never display an RSC result as pdex.
 
 ## What it asks
 If a perturbation's cells are split in half and each half is run against control independently, do the two DE signatures agree (DE_A ~= DE_B)? Disagreement caps how well any model can score on that perturbation. Also: does agreement depend on cell count (undersampling vs a genuine method limitation)?

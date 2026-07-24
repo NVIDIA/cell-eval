@@ -12,6 +12,20 @@ Read the bundled `pathway-methods-memory.md` completely before running, reimplem
 - An external official ArcInstitute/bioconcord checkout supplies the scoring and OLS routines; no Bioconcord implementation is copied into this skill.
 - `requirements.txt`: standalone Python dependencies.
 
+## Mandatory preflight and run capture
+
+Do not start the executable until the user has explicitly confirmed one fully resolved run configuration.
+
+1. Gather the input `.h5ad`, ask whether `adata.X` contains raw counts or log1p-normalized expression, pathway-definition CSV, official Bioconcord checkout, results output directory, separate run root, methods to compare (`ols`, `pdex_mwu`, or both), perturbation/control and QC fields, score/count layers, thresholds, scoring settings, seeds, and threads. Inspect the input read-only to resolve unknown columns, labels, layers, and feature identifiers. Pass the confirmed state as `--expression-state`.
+2. Expand paths and resolve every default. Show one concise preflight summary containing inputs, results directory, run root, methods, data fields/layers, thresholds, workload/concurrency, exact command, log path, and resolved-config destination.
+3. Ask for explicit confirmation and stop. Do not launch scoring, inference, plotting, or cache reuse before confirmation.
+4. After confirmation, create `<run-root>/logs` and `<run-root>/configs`, pass `--run-root <run-root>`, and capture the complete terminal stream with `2>&1 | tee <run-root>/logs/<workflow>__<dataset>__<UTC-timestamp>.log`.
+5. Every invocation writes an immutable timestamped YAML snapshot under `<run-root>/configs`. Report the result, log, and YAML paths on completion.
+
+Every box-and-whisker plot must overlay every finite underlying observation as jittered scatter points. Do not sample, aggregate away, or hide values in the scatter layer.
+
+For every pathway correlation matrix, retain every analytically eligible perturbation or guide. Never reduce the unit set merely to make the plot readable. When more than 40 units are shown, omit only the white diagonal cell-count text; keep the full numeric matrix and all units. Any analysis cap must be an explicit, user-confirmed scientific selection, not an automatic display rule.
+
 ## Required inputs
 
 - Supply an `.h5ad` file whose `obs` contains the perturbation column, control label, and per-cell UMI column.

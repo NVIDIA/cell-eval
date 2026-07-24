@@ -81,7 +81,8 @@ Final visualization decisions:
   cell.
 - Emit one combined mean correlation map and explicit separate OLS and pdex Mann–Whitney maps.
 - Fix pdex rank-biserial heatmap colors to `[-1, 1]`. Scale OLS symmetrically to the observed maximum absolute mean effect in that arm.
-- Fix all correlation-map colors to `[-1, 1]` and annotate diagonal cells with total perturbation cell counts.
+- Fix all correlation-map colors to `[-1, 1]`. Retain every analytically eligible perturbation or guide; never subset units merely for display. Annotate diagonal cells with total unit-cell counts only when at most 40 units are shown, and omit that white text—not units or matrix values—above the threshold.
+- Every box-and-whisker plot must overlay every finite underlying observation as jittered scatter points; never sample or hide values in that scatter layer.
 - Save every correlation map's exact ordered Spearman and Pearson matrices in a same-stem NPZ;
   downstream summaries must consume numeric archives rather than infer values from PNG pixels.
 
@@ -117,7 +118,7 @@ Shared OLS pathway-stripe interpretation from `cell_eval2`:
 
 - Test 2 compares genuine control cells against a pseudo-perturbed control half on the fixed score matrix. Its five repeat-level diagnostics are lambda GC, nominal-p fraction, FDR-call fraction, median p-value, and mean absolute descriptive score difference.
 - Test 3 uses exactly five global and five within-block label permutations when both modes are requested. Keep permutation-level calls intact and average counts, Jaccard, and target-correlation matrices only after each permutation has been analyzed independently. Do not restore the removed count/separation boxplot.
-- Test 4 measures the reliability ceiling of one guide against itself using disjoint cell halves and five repeats. Select multi-guide genes, label guides consistently as `GENE | gN`, keep same-gene guides adjacent, and draw gene boundaries. A diagonal cell is split-A versus split-B correlation, not a mathematical self-correlation and therefore need not equal one.
+- Test 4 measures the reliability ceiling of one guide against itself using disjoint cell halves and five repeats. Select each guide independently by its own cell power; do not require multiple guides per target gene. Label guides consistently as `GENE | gN`, keep same-gene guides adjacent, and draw gene boundaries. A diagonal cell is split-A versus split-B correlation, not a mathematical self-correlation and therefore need not equal one.
 - Test 5 compares distinct guides targeting the same gene with guides targeting different genes using each guide's full-cell effect vector. Reuse one unrelated-pair sample across methods and reuse guide-map labels in every plot. Test 4 and Test 5 share scoring and inference, but Test 4 measures sampling reliability whereas Test 5 measures cross-guide agreement. Because Test 5 pairs share guides, its pairwise Mann-Whitney p-value is descriptive rather than a confirmatory gene-level test.
 - Test 7 measures common scoring separately from method inference. Its process RSS value is a process-lifetime high-water delta and may be zero after an earlier stage set the high-water mark; never interpret it as an exact isolated method peak.
 

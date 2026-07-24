@@ -7,6 +7,20 @@ description: Run or reproduce pathway Test 5 comparing whether independent sgRNA
 
 Read the bundled `pathway-methods-memory.md` before running, reimplementing, or changing this skill. Use `test5_samegene_sgrna.py` with the local `pathway_utils.py`, which loads scoring and OLS from an official ArcInstitute/bioconcord checkout. Do not import another skill or copy the Bioconcord implementation into this folder.
 
+## Mandatory preflight and run capture
+
+Do not start the executable until the user has explicitly confirmed one fully resolved run configuration.
+
+1. Gather the input `.h5ad`, ask whether `adata.X` contains raw counts or log1p-normalized expression, pathway-definition CSV, official Bioconcord checkout, results output directory, separate run root, methods to compare (`ols`, `pdex_mwu`, or both), perturbation/guide/control fields, score layer and optional gene-symbol field, thresholds, scoring settings, gene/guide scope, seeds, and threads. Inspect the input read-only to resolve unknown columns, labels, layers, feature identifiers, and powered same-gene groups. Pass the confirmed state as `--expression-state`.
+2. Expand paths and resolve every default. Show one concise preflight summary containing inputs, results directory, run root, methods, data fields/layers, thresholds, selected gene/guide scope, workload/concurrency, exact command, log path, and resolved-config destination.
+3. Ask for explicit confirmation and stop. Do not launch subsetting, scoring, inference, or plotting before confirmation.
+4. After confirmation, create `<run-root>/logs` and `<run-root>/configs`, pass `--run-root <run-root>`, and capture the complete terminal stream with `2>&1 | tee <run-root>/logs/<workflow>__<dataset>__<UTC-timestamp>.log`.
+5. Every invocation writes an immutable timestamped YAML snapshot under `<run-root>/configs`. Report the result, log, and YAML paths on completion.
+
+Every box-and-whisker plot must overlay every finite underlying observation as jittered scatter points. Do not sample, aggregate away, or hide values in the scatter layer.
+
+Retain every analytically eligible same-gene guide group by default: `--max-genes 0` means unlimited. Never reduce the guide set merely to make a correlation plot readable. When more than 40 guides are shown, omit only the white diagonal cell-count text; keep the full numeric matrix and every guide. A nonzero gene cap is allowed only as an explicit, user-confirmed scientific selection.
+
 ## Scientific question
 
 Test whether two independently designed guides assigned to the same target gene produce more similar pathway-effect vectors than guides assigned to different genes.
@@ -21,7 +35,7 @@ python .claude/skills/evaluating-pathways-test5-samegene-sgrna/test5_samegene_sg
   --pert-col gene --sgrna-col <guide_column> --control non-targeting \
   --score-layer X [--gene-symbol-col gene_name] \
   --min-genes 5 --ctrl-size 50 --n-bins 25 \
-  --min-cells 20 --min-guides 2 --max-genes 12 --max-control 1500 \
+  --min-cells 20 --min-guides 2 --max-genes 0 --max-control 1500 \
   [--normalize-raw] --background-multiplier 10 \
   --methods ols,pdex_mwu --threads 8 --fdr 0.05 --seed 42 \
   --outdir experiments_pathways/<dataset>__test5
@@ -39,7 +53,7 @@ required user-supplied CSV because pathway definitions are not committed with th
 
 1. Read observations in backed mode before loading expression. Convert target-gene and sgRNA columns to strings and treat case-insensitive `""`, `nan`, `none`, and `na` as invalid guide labels.
 2. Count valid guides among non-control cells and retain guides with at least `--min-cells` cells. Assign each guide to its modal non-control target-gene value.
-3. Retain genes with at least `--min-guides` powered guides. Rank genes by decreasing guide count, then total selected-guide cells, then gene label; retain at most `--max-genes` (12 by default).
+3. Retain genes with at least `--min-guides` powered guides. Rank genes by decreasing guide count, then total selected-guide cells, then gene label. `--max-genes` defaults to zero (unlimited); use a nonzero cap only when the user explicitly confirms that scientific selection.
 4. Keep every selected guide cell and sample at most `--max-control` control cells without replacement using `--seed`. Load only this subset into memory.
 5. If `var_names` are feature IDs, require `--gene-symbol-col` and replace the in-memory subset's feature index with that column, preserving original IDs in `var['source_var_name']` and making duplicate symbols unique. Never modify the source file.
 6. When `--normalize-raw` is supplied, require `--score-layer X`, total-normalize each selected cell's raw counts to 10,000 and apply log1p. Otherwise use the requested already normalized score layer.

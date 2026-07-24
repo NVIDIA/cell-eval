@@ -1,14 +1,31 @@
 ---
 name: evaluating-test5-samegene-sgrna
-description: Run ONLY Test 5 (same-gene independent-sgRNA reproducibility) from the cell-eval metric-robustness battery and emit a single-test report. Asks whether independent guides targeting the SAME gene produce more concordant signatures than unrelated guide pairs, using the Mann-Whitney probability-of-superiority AUC on DEG-restricted LFC rho, gated by significance. Use when someone wants to check whether a DE metric rewards shared biology or same-gene concordance without running the whole battery. Needs an sgRNA column and genes with at least two guides.
+description: Run ONLY Test 5 (same-gene independent-sgRNA reproducibility) from the DE metric-robustness battery and emit a single-test report. Asks whether independent guides targeting the SAME gene produce more concordant signatures than unrelated guide pairs, using the Mann-Whitney probability-of-superiority AUC on DEG-restricted LFC rho, gated by significance. Use when someone wants to check whether a DE metric rewards shared biology or same-gene concordance without running the whole battery. Needs an sgRNA column and genes with at least two guides.
 ---
 
 # Test 5 — Same-Gene Independent sgRNA Reproducibility
 
-**One test from the cell-eval metric-robustness battery, run on its own.** This skill runs **only
+**One test from the DE metric-robustness battery, run on its own.** This skill runs **only
 `test_5`** and produces a self-contained report for it. Role: **sensitivity diagnostic (biology reward)** — Power-limited with few guides per gene; WARN-only (never FAIL) when under ~5 same-gene pairs.
 
 Runs **both pdex and pydeseq2** in one pass via `samegene_guide_heatmap.py`.
+
+`de_backends.py` is bundled with this skill and calls the upstream `pdex` and
+`pydeseq2` packages directly. Do not import project-private DE backend modules.
+
+## Mandatory preflight and run capture
+
+Do not start the executable until the user has explicitly confirmed one fully resolved run configuration.
+
+1. Gather the input `.h5ad`, ask whether `adata.X` contains raw counts or log1p-normalized expression, results output directory, separate run root, methods to compare, non-parametric engine (`pdex` or `rsc`) when `pdex` is selected, perturbation/guide/target-gene/control fields, replicate/block columns, count layer, thresholds, seeds, gene/guide limits, and worker/thread settings. Inspect the input read-only to resolve unknown columns, labels, layers, and powered guide groups. Pass the confirmed state as `--expression-state`.
+2. Expand paths and resolve every default. Show one concise preflight summary containing the input, results directory, run root, methods/engine, data fields, thresholds, selected guide/gene scope, workload/concurrency, exact command, log path, and resolved-config destination.
+3. Ask for explicit confirmation and stop. Do not launch computation or plotting before confirmation.
+4. After confirmation, create `<run-root>/logs` and `<run-root>/configs`, pass `--run-root <run-root>`, and capture the complete terminal stream with `2>&1 | tee <run-root>/logs/<workflow>__<dataset>__<UTC-timestamp>.log`.
+5. Every invocation writes an immutable timestamped YAML snapshot under `<run-root>/configs`. Report the result, log, and YAML paths on completion.
+
+Every box-and-whisker plot must overlay every finite underlying observation as jittered scatter points. Do not sample, aggregate away, or hide values in the scatter layer.
+
+Keep `pdex` as the stable internal/table schema key, but label every plot with the actual selected engine: `pdex` for Arc pdex and `RSC` for RAPIDS GPU Wilcoxon. Never display an RSC result as pdex.
 
 ## What it asks
 Do two different guides for the **same gene** produce more similar signatures than two **unrelated** guides? The headline statistic is **AUC = P(a random same-gene pair is more concordant than a random unrelated pair)** on DEG-restricted LFC rho, gated by a Mann-Whitney p; a cells-per-guide trend shows whether weak concordance is biology or undersampling.

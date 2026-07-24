@@ -25,7 +25,7 @@ import pandas as pd
 import polars as pl
 import scipy.sparse as sp
 
-from cell_eval._de_backends import build_de_frame
+from de_backends import build_de_frame, de_method_label, write_resolved_config
 
 # ------------------------------------------------------------------ #
 # DE computation
@@ -245,7 +245,8 @@ def _fmt(v):
 
 
 def plot_table(df: pd.DataFrame, out_png: str, dataset: str,
-               methods: list[str], fdr_thr: float) -> None:
+               methods: list[str], fdr_thr: float,
+               non_parametric_engine: str = "pdex") -> None:
     # Build display-friendly column headers (two-line: stat + [method])
     _CPM_LABELS = {"cpm_pert": "cpm\n[pert]", "cpm_ctrl": "cpm\n[ctrl]"}
 
@@ -255,7 +256,10 @@ def plot_table(df: pd.DataFrame, out_png: str, dataset: str,
         for m in methods:
             if col.endswith(f"_{m}"):
                 stat = col[: -(len(m) + 1)]
-                return f"{stat}\n[{m}]"
+                display = de_method_label(
+                    m, non_parametric_engine=non_parametric_engine
+                )
+                return f"{stat}\n[{display}]"
         return col
 
     disp_cols = [col_header(c) for c in df.columns]
@@ -292,7 +296,8 @@ def plot_table(df: pd.DataFrame, out_png: str, dataset: str,
 
     n_perts = len(df)
     ax.set_title(
-        f"Test 6 — target-gene knockdown recovery: {' vs '.join(methods)}"
+        f"Test 6 — target-gene knockdown recovery: "
+        f"{' vs '.join(de_method_label(m, non_parametric_engine=non_parametric_engine) for m in methods)}"
         f"  ({dataset}, {n_perts} perturbations)",
         fontsize=11, pad=14,
     )
@@ -354,6 +359,14 @@ def main() -> None:
     ap.add_argument("--threads", type=int, default=8,
                     help="CPU threads for the shared multi-contrast DE model")
     ap.add_argument("--outdir",          default=".")
+    ap.add_argument(
+        "--expression-state", choices=("raw_counts", "log1p_normalized"), default="",
+        help="user-confirmed state of adata.X; recorded in the resolved YAML",
+    )
+    ap.add_argument(
+        "--run-root", default="",
+        help="confirmed run root for configs/ and logs/ (defaults to --outdir)",
+    )
     a = ap.parse_args()
     if a.threads < 1:
         ap.error("--threads must be at least 1")
@@ -366,6 +379,18 @@ def main() -> None:
     if counts_layer is None and "counts" in adata.layers:
         counts_layer = "counts"
     print(f"loaded {a.adata}: {adata.n_obs} cells × {adata.n_vars} genes  (methods={methods})")
+    a.run_root = os.path.abspath(os.path.expanduser(a.run_root or a.outdir))
+    write_resolved_config(
+        run_root=a.run_root,
+        workflow="de_test6_knockdown_recovery",
+        dataset=dataset,
+        resolved={
+            "arguments": vars(a),
+            "methods": methods,
+            "effective_counts_layer": counts_layer or "X",
+            "results_outdir": os.path.abspath(a.outdir),
+        },
+    )
 
     de: dict[str, pd.DataFrame] = {}
     # run pydeseq2 first (needs raw counts, before pdex normalises in-place)
@@ -390,7 +415,10 @@ def main() -> None:
             disp[c] = disp[c].map(lambda x: f"{x:.4g}" if pd.notna(x) else "NA")
     disp.to_markdown(base + ".md", index=False)
 
-    plot_table(df, base + ".png", dataset=dataset, methods=methods, fdr_thr=a.fdr)
+    plot_table(
+        df, base + ".png", dataset=dataset, methods=methods, fdr_thr=a.fdr,
+        non_parametric_engine=a.non_parametric_engine,
+    )
 
     # Recovery summary
     print(f"\n[t6] target-gene recovery summary (n={len(df)} perts):")

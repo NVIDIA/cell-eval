@@ -7,6 +7,20 @@ description: Run or reproduce pathway Test 0 comparing bioconcord OLS with pdex 
 
 Read the bundled `pathway-methods-memory.md` completely before running, reimplementing, or changing this skill. Use `test0_injection.py` with the local `pathway_utils.py`, which loads scoring and OLS from an official ArcInstitute/bioconcord checkout. Do not import another skill or copy the Bioconcord implementation into this folder.
 
+## Mandatory preflight and run capture
+
+Do not start the executable until the user has explicitly confirmed one fully resolved run configuration.
+
+1. Gather the input `.h5ad`, ask whether `adata.X` contains raw counts or log1p-normalized expression, pathway-definition CSV, official Bioconcord checkout, results output directory, separate run root, methods to compare (`ols`, `pdex_mwu`, or both), perturbation/control/block fields, raw-count layer, thresholds, pathway scope, deltas, repeats, seeds, and threads. Inspect the input read-only to resolve unknown columns, labels, layers, and feature identifiers. Pass the confirmed state as `--expression-state`.
+2. Expand paths and resolve every default. Show one concise preflight summary containing inputs, results directory, run root, methods, data fields/layers, thresholds, pathway scope, workload/concurrency, exact command, log path, and resolved-config destination.
+3. Ask for explicit confirmation and stop. Do not launch scoring, injection, inference, or plotting before confirmation.
+4. After confirmation, create `<run-root>/logs` and `<run-root>/configs`, pass `--run-root <run-root>`, and capture the complete terminal stream with `2>&1 | tee <run-root>/logs/<workflow>__<dataset>__<UTC-timestamp>.log`.
+5. Every invocation writes an immutable timestamped YAML snapshot under `<run-root>/configs`. Report the result, log, and YAML paths on completion.
+
+Every box-and-whisker plot must overlay every finite underlying observation as jittered scatter points. Do not sample, aggregate away, or hide values in the scatter layer.
+
+For every pathway correlation matrix, retain every analytically eligible perturbation or guide. Never reduce the unit set merely to make the plot readable. When more than 40 units are shown, omit only the white diagonal cell-count text; keep the full numeric matrix and all units. Any analysis cap must be an explicit, user-confirmed scientific selection, not an automatic display rule.
+
 ## Scientific question
 
 Measure how often each inference method recovers a known pathway whose member-gene raw UMIs were increased in pseudo-perturbed control cells, and how many untouched pathways it calls at the same time. Inject one pathway per trial so every retained pathway receives its own power and spillover curve.

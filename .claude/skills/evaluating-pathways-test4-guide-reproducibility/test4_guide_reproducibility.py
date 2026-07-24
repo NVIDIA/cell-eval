@@ -11,8 +11,30 @@ import pandas as pd
 import pathway_utils as pu
 
 
+def select_powered_guides(
+    eligible: pd.DataFrame,
+    *,
+    max_guides: int,
+    max_guides_per_gene: int,
+) -> list[str]:
+    """Select independently powered guides, optionally applying explicit caps."""
+    if eligible.empty:
+        return []
+    ranked = eligible.sort_values(
+        ["n_cells", "gene", "guide"],
+        ascending=[False, True, True],
+        kind="stable",
+    ).copy()
+    if max_guides_per_gene:
+        within_gene_rank = ranked.groupby("gene", sort=False).cumcount()
+        ranked = ranked[within_gene_rank < max_guides_per_gene]
+    if max_guides:
+        ranked = ranked.head(max_guides)
+    return ranked.guide.astype(str).tolist()
+
+
 def load_benchmark_subset(args) -> tuple[ad.AnnData, list[str]]:
-    """Load powered multi-guide genes plus a reproducible control sample."""
+    """Load independently powered guides plus a reproducible control sample."""
     backed = ad.read_h5ad(args.adata, backed="r")
     obs = backed.obs
     perturbations = obs[args.pert_col].astype(str).to_numpy()
@@ -36,31 +58,17 @@ def load_benchmark_subset(args) -> tuple[ad.AnnData, list[str]]:
             "gene": guide_gene.loc[counts.index].to_numpy(str),
         }
     )
-    gene_summary = (
-        eligible.groupby("gene", as_index=False)
-        .agg(n_guides=("guide", "size"), n_cells=("n_cells", "sum"))
-        .query("n_guides >= 2")
-        .sort_values(["n_guides", "n_cells", "gene"], ascending=[False, False, True])
+    selected_guides = select_powered_guides(
+        eligible,
+        max_guides=args.max_guides,
+        max_guides_per_gene=args.max_guides_per_gene,
     )
-    selected_guides: list[str] = []
-    for gene in gene_summary.gene:
-        candidates = (
-            eligible[eligible.gene == gene]
-            .sort_values(["n_cells", "guide"], ascending=[False, True])
-            .guide.astype(str).tolist()
-        )
-        if args.max_guides_per_gene:
-            candidates = candidates[: args.max_guides_per_gene]
-        remaining = args.max_guides - len(selected_guides) if args.max_guides else len(candidates)
-        take = min(len(candidates), remaining)
-        if take < 2:
-            continue
-        selected_guides.extend(candidates[:take])
-        if args.max_guides and len(selected_guides) >= args.max_guides:
-            break
     if not selected_guides:
         backed.file.close()
-        raise ValueError("No guide has enough cells for both split arms")
+        raise ValueError(
+            "No non-control guide has at least "
+            f"{2 * args.min_cells_per_arm} cells required for both split arms"
+        )
 
     rng = np.random.default_rng(args.seed)
     control_idx = np.flatnonzero(perturbations == args.control)
@@ -112,6 +120,14 @@ def main() -> None:
         help="official ArcInstitute/bioconcord checkout (or set BIOCONCORD_ROOT)",
     )
     parser.add_argument("--outdir", default=".")
+    parser.add_argument(
+        "--expression-state", choices=("raw_counts", "log1p_normalized"), default="",
+        help="user-confirmed state of adata.X; recorded in the resolved YAML",
+    )
+    parser.add_argument(
+        "--run-root", default="",
+        help="confirmed run root for configs/ and logs/ (defaults to --outdir)",
+    )
     parser.add_argument("--pert-col", default="gene")
     parser.add_argument("--sgrna-col", required=True)
     parser.add_argument("--control", default="non-targeting")
@@ -123,8 +139,8 @@ def main() -> None:
     parser.add_argument("--n-bins", type=int, default=25)
     parser.add_argument("--min-cells-per-arm", type=int, default=20)
     parser.add_argument("--n-repeats", type=int, default=5)
-    parser.add_argument("--max-guides", type=int, default=24)
-    parser.add_argument("--max-guides-per-gene", type=int, default=3)
+    parser.add_argument("--max-guides", type=int, default=0)
+    parser.add_argument("--max-guides-per-gene", type=int, default=0)
     parser.add_argument("--max-control", type=int, default=1200)
     parser.add_argument("--normalize-raw", action="store_true")
     parser.add_argument("--methods", default="ols,pdex_mwu")
@@ -136,16 +152,27 @@ def main() -> None:
     pu.validate_probability(args.fdr, "--fdr")
     pu.validate_positive_int(args.min_cells_per_arm, "--min-cells-per-arm")
     pu.validate_positive_int(args.n_repeats, "--n-repeats")
-    if args.max_guides < 0 or args.max_guides == 1:
-        raise ValueError("--max-guides must be 0 (unlimited) or at least 2")
-    if args.max_guides_per_gene < 0 or args.max_guides_per_gene == 1:
-        raise ValueError("--max-guides-per-gene must be 0 (unlimited) or at least 2")
+    if args.max_guides < 0:
+        raise ValueError("--max-guides cannot be negative")
+    if args.max_guides_per_gene < 0:
+        raise ValueError("--max-guides-per-gene cannot be negative")
     if args.max_control < 0:
         raise ValueError("--max-control cannot be negative")
 
     pu.clear_output_prefix(args.outdir, "pathways_test4_")
     plots, tables = pu.prepare_output(args.outdir)
     dataset = pu.dataset_name(args.adata)
+    args.run_root = os.path.abspath(os.path.expanduser(args.run_root or args.outdir))
+    pu.write_resolved_config(
+        run_root=args.run_root,
+        workflow="pathways_test4_guide_reproducibility",
+        dataset=dataset,
+        resolved={
+            "arguments": vars(args),
+            "methods": pu.method_list(args.methods),
+            "results_outdir": os.path.abspath(args.outdir),
+        },
+    )
     subset, selected_guides = load_benchmark_subset(args)
     scored = pu.score_anndata(
         subset, args.programs, score_layer=args.score_layer, min_genes=args.min_genes,

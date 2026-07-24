@@ -43,11 +43,21 @@ import pandas as pd
 import polars as pl
 from scipy import stats
 
+from de_backends import de_method_label, write_resolved_config
+
 _RT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "de_helpers.py")
 
 CAP = 2.0  # ±log2FC colour cap
 
 _T5_WORKER_STATE = {}
+
+
+def _display_method(method, cfg, *, verbose=False):
+    return de_method_label(
+        method,
+        non_parametric_engine=cfg.get("non_parametric_engine", "pdex"),
+        verbose=verbose,
+    )
 
 
 def _load_runner():
@@ -365,7 +375,9 @@ def layer1_heatmap(sigs, gene_groups, out_png, cfg, method, *, max_genes=400):
     ax.set_yticklabels(labels, fontsize=6)
     ax.set_xticks([])
     ax.set_xlabel(f"union DE genes (n={len(genes)}, sorted by mean LFC)")
-    ax.set_title(f"Test-5 guide-level signatures ({method}) — rows grouped by gene\n"
+    ax.set_title(
+                 f"Test-5 guide-level signatures ({_display_method(method, cfg)}) "
+                 "— rows grouped by gene\n"
                  "same-gene guides adjacent; matching rows within a block = reproducible on-target effect",
                  fontsize=10)
     cbar = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
@@ -458,11 +470,16 @@ def layer2_zoom(sigs_by_method, gene_groups, out_png, cfg, genes, *, methods, pe
                                  squeeze=False)
         im = None
         for r, (gene, gs, m) in enumerate(rows):
-            im = _zoom_row(axes[r][0], axes[r][1], sigs_by_method[m], gs[m], genes, cfg, m)
+            im = _zoom_row(
+                axes[r][0], axes[r][1], sigs_by_method[m], gs[m], genes,
+                cfg, _display_method(m, cfg),
+            )
         fig.colorbar(im, ax=axes[:, 1].tolist(), fraction=0.02, pad=0.02, label=f"log2FC (±{CAP:g})")
         sup = (f"Test-5 same-gene guide reproducibility — {page[0][0]}   [{pi}/{len(pages)}]"
                if len(page) == 1 else
-               f"Test-5 same-gene guide reproducibility — {', '.join(methods)}   [{pi}/{len(pages)}]")
+               f"Test-5 same-gene guide reproducibility — "
+               f"{', '.join(_display_method(m, cfg) for m in methods)}   "
+               f"[{pi}/{len(pages)}]")
         fig.suptitle(sup, fontsize=11)
         png = f"{base}_{pi:02d}.png"
         fig.savefig(png, dpi=140, bbox_inches="tight")
@@ -529,7 +546,8 @@ def layer3_corr_matrix(sigs_by_method, gene_groups, out_png, cfg, genes, *, meth
         dm = float(np.nanmean(C[diagonal_mask]))
         om = float(np.nanmean(C[~diagonal_mask]))
         ax.set_title(
-            f"{m}: diagonal ρ̄={dm:.2f}; off-diagonal ρ̄={om:.2f}\n"
+            f"{_display_method(m, cfg)}: diagonal ρ̄={dm:.2f}; "
+            f"off-diagonal ρ̄={om:.2f}\n"
             f"within-gene off-diagonal ρ̄={wm:.2f}; cross-gene off-diagonal ρ̄={cm:.2f}",
             fontsize=9,
         )
@@ -575,6 +593,14 @@ def main():
     ap.add_argument("--zoom-per-page", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--outdir", default=".")
+    ap.add_argument(
+        "--expression-state", choices=("raw_counts", "log1p_normalized"), default="",
+        help="user-confirmed state of adata.X; recorded in the resolved YAML",
+    )
+    ap.add_argument(
+        "--run-root", default="",
+        help="confirmed run root for configs/ and logs/ (defaults to --outdir)",
+    )
     a = ap.parse_args()
     rt = _load_runner()
     methods = [m for m in a.methods.split(",") if m]
@@ -586,11 +612,24 @@ def main():
         counts_layer = "counts"
     elif (counts_layer is None and "pdex" in methods and a.non_parametric_engine != "rsc"
           and rt._looks_raw_integer(adata)):
-        counts_layer = "_cell_eval_raw_counts"
+        counts_layer = "_raw_counts_for_de"
         adata.layers[counts_layer] = adata.X.copy()
         print(f"preserved raw counts in temporary layer {counts_layer!r} for CPM")
     ds = os.path.splitext(os.path.basename(a.adata))[0]  # dataset tag on every output file
     print(f"loaded {a.adata}: {adata.n_obs} cells × {adata.n_vars} genes  (methods={methods})")
+    a.run_root = os.path.abspath(os.path.expanduser(a.run_root or a.outdir))
+    write_resolved_config(
+        run_root=a.run_root,
+        workflow="de_test5_samegene_sgrna",
+        dataset=ds,
+        resolved={
+            "arguments": vars(a),
+            "methods": methods,
+            "effective_counts_layer": counts_layer or "X",
+            "target_gene_col": a.target_gene_col or a.pert_col,
+            "results_outdir": os.path.abspath(a.outdir),
+        },
+    )
 
     def cfg_for(m):
         return {"pert_col": a.pert_col, "control_pert": a.control, "replicate_col": a.replicate_col,

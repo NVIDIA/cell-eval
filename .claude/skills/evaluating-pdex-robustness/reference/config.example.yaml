@@ -1,0 +1,54 @@
+# RobustnessConfig for the cell-eval pdex-backend robustness battery.
+# Run: uv run python .claude/skills/evaluating-pdex-robustness/scripts/run_robustness.py --config this.yaml
+# (JSON is also accepted; inspect_dataset.py emits a JSON skeleton you can paste here.)
+#
+# pdex is a CELL-LEVEL Wilcoxon DE test (cell-eval run --de-methods pdex). It is NOT
+# pseudobulk: there is no replicate/sample requirement and no "counts layer". pdex expects
+# LOG-NORMALIZED .X.
+
+# --- required -------------------------------------------------------------- #
+adata_path: /path/to/perturbation.h5ad
+pert_col: target_gene          # obs column with the perturbation label per cell
+control_pert: non-targeting    # value in pert_col marking control cells
+
+# --- expression scale ------------------------------------------------------ #
+# pdex expects log-normalized .X. allow_discrete=False => pdex treats .X as log1p
+# (is_log1p=True) AND the run pipeline auto-normalizes raw .X for the AnnData-level metrics.
+# If .X is RAW integer counts, normalize_if_raw (default true) applies
+# normalize_total(1e4)+log1p ONCE at load so pdex receives lognorm input.
+allow_discrete: false
+normalize_if_raw: true         # normalize+log1p raw .X at load (set false if .X already lognorm)
+
+# --- optional annotations (gate which tests can run) ----------------------- #
+replicate_col: gem_group       # OPTIONAL: used only to stratify A/B splits / subsampling.
+                               # pdex is cell-level, so this is informational; null is fine.
+target_gene_col: target_gene   # perturbation -> target gene symbol (tests 5, 6, 7); must match var_names
+sgrna_col: sgrna               # per-guide identity (tests 4, 5); controls carry control_pert here too
+block_cols: [donor, cell_type] # covariates to stratify splits / permutations within (tests 1-4)
+
+# --- knobs ----------------------------------------------------------------- #
+fdr_threshold: 0.05
+seed: 0
+num_threads: 8
+max_conditions: null           # null = ALL perturbations (default & recommended). Set an int only
+                               # to cap perts per test for a quick/cheap smoke run.
+outdir: ./pdrobust-out
+
+# stress tests 9/10
+downsample_grid: [25, 50, 100, 200, 500, 1000]          # perturbed-cell grid (test 9)
+control_downsample_grid: [500, 1000, 2000, 5000]        # control-cell grid (test 10).
+                                                        # null => use downsample_grid
+n_repeats: 3
+stable_lfc_corr: 0.9        # corr-to-full at/above which a downsample level counts as "stable"
+min_cells_per_group: 10     # warn when a downsample level keeps fewer cells per condition than this
+
+# pdex backend options (forwarded as de_kwargs["pdex"], then to pdex()).
+# Leave empty for defaults (Wilcoxon).
+pdex_kwargs: {}
+
+# which tests: list of test_1..test_10, or ["all"]
+tests: ["all"]
+
+# --- optional curated resources (tests 7 & 8) ------------------------------ #
+# curated_targets_csv: /path/to/curated.csv      # see curated_targets_schema.md
+# gene_sets_json: /path/to/gene_sets.json         # {"<pert_gene>": ["geneA", "geneB", ...]}

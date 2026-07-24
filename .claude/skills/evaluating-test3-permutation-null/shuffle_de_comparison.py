@@ -24,7 +24,7 @@ Output
 
 Usage
 -----
-  uv run --project /path/to/cell-eval \
+  uv run \
     python /path/to/shuffle_de_comparison.py \
     --config config.yaml --outdir .
 """
@@ -48,7 +48,7 @@ import matplotlib.pyplot as plt
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 
-from cell_eval._de_backends import build_de_frame
+from de_backends import build_de_frame, de_method_label, write_resolved_config
 
 log = logging.getLogger("shuffle_de_cmp")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -384,7 +384,8 @@ def _write_lfc_vectors(results, gene_names, mode, method, engine, method_key, ou
 # ── plotting ───────────────────────────────────────────────────────────────────
 
 def _plot(results: dict[str, dict], out_png: str, title: str,
-          fdr_thr: float, lfc_thr: float) -> None:
+          fdr_thr: float, lfc_thr: float,
+          non_parametric_engine: str = "pdex") -> None:
     perts = [p for p in results]
     if not perts:
         log.warning("No perturbations to plot; skipping %s", out_png)
@@ -403,6 +404,13 @@ def _plot(results: dict[str, dict], out_png: str, title: str,
     cnorm = Normalize(vmin=n_cells.min(), vmax=n_cells.max())
 
     fig, ax = plt.subplots(figsize=(8, 7))
+    non_parametric_label = de_method_label(
+        "pdex", non_parametric_engine=non_parametric_engine
+    )
+    non_parametric_verbose = de_method_label(
+        "pdex", non_parametric_engine=non_parametric_engine, verbose=True
+    )
+    pydeseq2_label = de_method_label("pydeseq2")
 
     lim_max = max(int(x.max()), int(y.max()), 5) * 1.3 + 1
     ax.fill_between([0, lim_max], [0, 0],       [0, lim_max],      color="#dce8f5", alpha=0.35, zorder=0)
@@ -442,16 +450,18 @@ def _plot(results: dict[str, dict], out_png: str, title: str,
 
     ax.legend(handles=[
         plt.Line2D([0], [0], ls="--", color="#777777", lw=1.2, label="equal calling"),
-        plt.Rectangle((0, 0), 1, 1, fc="#f5ece0", alpha=0.6, label="pyDESeq2 calls more"),
-        plt.Rectangle((0, 0), 1, 1, fc="#dce8f5", alpha=0.6, label="pdex calls more"),
+        plt.Rectangle((0, 0), 1, 1, fc="#f5ece0", alpha=0.6,
+                      label=f"{pydeseq2_label} calls more"),
+        plt.Rectangle((0, 0), 1, 1, fc="#dce8f5", alpha=0.6,
+                      label=f"{non_parametric_label} calls more"),
     ], fontsize=7.5, loc="upper left")
 
-    ax.set_xlabel("# DE genes — pdex (cell-level Wilcoxon)", fontsize=10)
-    ax.set_ylabel("# DE genes — pyDESeq2 (pseudobulk)", fontsize=10)
+    ax.set_xlabel(f"# DE genes — {non_parametric_verbose}", fontsize=10)
+    ax.set_ylabel("# DE genes — PyDESeq2 (pseudobulk)", fontsize=10)
     ax.set_title(
         f"{title}\n"
         f"FDR < {fdr_thr}, |LFC| ≥ {lfc_thr}  ·  dot size ∝ cell count  ·  "
-        f"J = Jaccard(pdex DE ∩ pyDESeq2 DE)\n"
+        f"J = Jaccard({non_parametric_label} DE ∩ {pydeseq2_label} DE)\n"
         f"null: shuffled group X vs random shuffled group Y — calibrated → cloud at origin",
         fontsize=8.5,
     )
@@ -498,7 +508,8 @@ def _cc_mask_and_ranked(results: dict, gene_names: list[str],
 def _plot_corr_matrix(results: dict[str, dict], method_key: str,
                       out_png: str, title: str,
                       genes_mask: np.ndarray | None = None,
-                      gene_set_label: str = "") -> None:
+                      gene_set_label: str = "",
+                      non_parametric_engine: str = "pdex") -> None:
     """Pairwise Spearman correlation matrix between fake-pert LFC vectors.
 
     Each cell [i, j] = Spearman r between the LFC vector of fake pert i and fake pert j
@@ -557,7 +568,11 @@ def _plot_corr_matrix(results: dict[str, dict], method_key: str,
     cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     glabel = gene_set_label or f"{n_features} genes"
     cb.set_label(f"Spearman r (LFC)  [{glabel}]", fontsize=8)
-    method_label = "pdex (cell-level Wilcoxon)" if method_key == "lfc_pdex" else "pydeseq2 (pseudobulk DESeq2)"
+    method_label = de_method_label(
+        "pdex" if method_key == "lfc_pdex" else "pydeseq2",
+        non_parametric_engine=non_parametric_engine,
+        verbose=True,
+    )
     ax.set_title(f"{title}\n{method_label}  (mean diagonal ρ = {mean_diagonal:.3f}; "
                  f"off-diagonal ρ = {mean_off:.3f})\n"
                  f"calibrated null — clean diagonal, zero elsewhere",
@@ -587,6 +602,14 @@ def main() -> None:
                     help="parallel shuffled comparisons for CPU PyDESeq2; use --n-threads 1")
     ap.add_argument("--seed",          type=int,   default=None)
     ap.add_argument("--outdir",        default=".")
+    ap.add_argument(
+        "--expression-state", choices=("raw_counts", "log1p_normalized"), default="",
+        help="user-confirmed state of adata.X; recorded in the resolved YAML",
+    )
+    ap.add_argument(
+        "--run-root", default="",
+        help="confirmed run root for configs/ and logs/ (defaults to --outdir)",
+    )
     ap.add_argument("--methods",        default="pdex,pydeseq2",
                     help="comma-sep DE backends to run (default: pdex,pydeseq2)")
     ap.add_argument("--non-parametric-engine", choices=("pdex", "rsc"), default=None,
@@ -668,6 +691,18 @@ def main() -> None:
 
     dataset_name = os.path.splitext(os.path.basename(cfg["adata_path"]))[0]
     methods = [m.strip() for m in args.methods.split(",") if m.strip()]
+    args.run_root = os.path.abspath(os.path.expanduser(args.run_root or args.outdir))
+    write_resolved_config(
+        run_root=args.run_root,
+        workflow="de_test3_permutation_null",
+        dataset=dataset_name,
+        resolved={
+            "arguments": vars(args),
+            "effective_config": cfg,
+            "methods": methods,
+            "results_outdir": os.path.abspath(args.outdir),
+        },
+    )
 
     modes = []
     if args.shuffle_mode in ("global", "both"):
@@ -719,6 +754,7 @@ def main() -> None:
                                          f"test_3_corr_matrix__{mode}__{method_tag}.png"),
                     title=corr_title,
                     genes_mask=cc_mask_r, gene_set_label=cc_label_r,
+                    non_parametric_engine=cfg["non_parametric_engine"],
                 )
             log.info("Replotted corr matrices for mode=%s", mode)
         log.info("Done (--replot).")
@@ -777,9 +813,13 @@ def main() -> None:
             _plot(
                 results,
                 out_png=os.path.join(args.outdir, "plots", f"test_3_shuffle_de_comparison__{mode}.png"),
-                title=(f"DE gene count: pyDESeq2 vs pdex — {dataset_name}\n"
+                title=(
+                       f"DE gene count: PyDESeq2 vs "
+                       f"{de_method_label('pdex', non_parametric_engine=cfg['non_parametric_engine'])} "
+                       f"— {dataset_name}\n"
                        f"Null: shuffled fake-pert X vs random shuffled fake-pert Y  ({mode_label})"),
                 fdr_thr=fdr_thr, lfc_thr=lfc_thr,
+                non_parametric_engine=cfg["non_parametric_engine"],
             )
         cc_mask, ranked_cc_idx = _cc_mask_and_ranked(results, gene_names, methods)
         n_cc = int(cc_mask.sum())
@@ -799,6 +839,7 @@ def main() -> None:
                                      f"test_3_corr_matrix__{mode}__{method_tag}.png"),
                 title=corr_title,
                 genes_mask=cc_mask, gene_set_label=cc_label,
+                non_parametric_engine=cfg["non_parametric_engine"],
             )
 
         # Sensitivity caps: top 400 / 2000 / 4000 by cross-method LFC variance
@@ -816,6 +857,7 @@ def main() -> None:
                                          f"test_3_corr_matrix__{mode}_top{cap}__{method_tag}.png"),
                     title=corr_title,
                     genes_mask=cap_mask, gene_set_label=cap_label,
+                    non_parametric_engine=cfg["non_parametric_engine"],
                 )
     log.info("Done.")
 

@@ -1,16 +1,33 @@
 ---
 name: evaluating-test3-permutation-null
-description: Run ONLY Test 3 (label permutation null) from the cell-eval metric-robustness battery and emit a single-test report. Shuffles perturbation labels within block strata, recomputes DE, and scores the separation (z) of the real signal from the permuted null, plus a cell-count-stratified real-vs-shuffled p-value diagnostic (ECDF/QQ). Use when someone wants a permutation/label-shuffle null or signal-vs-noise separation check without running the whole battery.
+description: Run ONLY Test 3 (label permutation null) from the DE metric-robustness battery and emit a single-test report. Shuffles perturbation labels within block strata, recomputes DE, and scores the separation (z) of the real signal from the permuted null, plus a cell-count-stratified real-vs-shuffled p-value diagnostic (ECDF/QQ). Use when someone wants a permutation/label-shuffle null or signal-vs-noise separation check without running the whole battery.
 ---
 
 # Test 3 — Label Permutation Null
 
-**One test from the cell-eval metric-robustness battery, run on its own.** This skill runs **only
+**One test from the DE metric-robustness battery, run on its own.** This skill runs **only
 `test_3`** and produces a self-contained report for it. Role: **validity gate (signal vs noise)** — If real signal is not clearly outside the permuted null, the metric cannot tell signal from noise.
 
 Runs **both pdex and pydeseq2** in one pass via `shuffle_de_comparison.py`, which compares
 per-perturbation DE gene counts on a perturbed-vs-perturbed null. Uses `--config config.yaml`
 (see `config.example.yaml`).
+
+`de_backends.py` is bundled with this skill and calls the upstream `pdex` and
+`pydeseq2` packages directly. Do not import project-private DE backend modules.
+
+## Mandatory preflight and run capture
+
+Do not start the executable until the user has explicitly confirmed one fully resolved run configuration.
+
+1. Gather the input `.h5ad`, ask whether `adata.X` contains raw counts or log1p-normalized expression, results output directory, separate run root, methods to compare, non-parametric engine (`pdex` or `rsc`) when `pdex` is selected, required observation columns and control label, replicate/block columns, count or score layers, thresholds, seeds, shuffle modes, repeats, and worker/thread settings. Inspect the input read-only to resolve unknown columns, labels, and layers. Pass the confirmed state as `--expression-state`.
+2. Expand paths and resolve every CLI and YAML default. Show one concise preflight summary containing the input, results directory, run root, methods/engine, data fields, thresholds, workload/concurrency, exact command, log path, cache/replot behavior, and resolved-config destination.
+3. Ask for explicit confirmation and stop. Do not launch computation, replotting, or archive reuse before confirmation.
+4. After confirmation, create `<run-root>/logs` and `<run-root>/configs`, pass `--run-root <run-root>`, and capture the complete terminal stream with `2>&1 | tee <run-root>/logs/<workflow>__<dataset>__<UTC-timestamp>.log`.
+5. Every invocation writes an immutable timestamped YAML snapshot under `<run-root>/configs`, including replot runs. Report the result, log, and YAML paths on completion.
+
+Every box-and-whisker plot must overlay every finite underlying observation as jittered scatter points. Do not sample, aggregate away, or hide values in the scatter layer.
+
+Keep `pdex` as the stable internal/table schema key, but label every plot with the actual selected engine: `pdex` for Arc pdex and `RSC` for RAPIDS GPU Wilcoxon. Never display an RSC result as pdex.
 
 ## What it asks
 If the perturbation labels are randomly **shuffled** (within batch) and DE is run on fake-pert X vs

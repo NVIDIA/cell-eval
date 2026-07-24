@@ -33,6 +33,8 @@ import pandas as pd
 import polars as pl
 from scipy import stats
 
+from de_backends import write_resolved_config
+
 _T1 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                    "evaluating-test1-reproducibility", "reproducibility_heatmap.py")
 _DH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "de_helpers.py")
@@ -344,6 +346,14 @@ def main():
     ap.add_argument("--zoom-per-page", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--outdir", default=".")
+    ap.add_argument(
+        "--expression-state", choices=("raw_counts", "log1p_normalized"), default="",
+        help="user-confirmed state of adata.X; recorded in the resolved YAML",
+    )
+    ap.add_argument(
+        "--run-root", default="",
+        help="confirmed run root for configs/ and logs/ (defaults to --outdir)",
+    )
     a = ap.parse_args()
     if a.pairwise_workers < 1:
         ap.error("--pairwise-workers must be at least 1")
@@ -367,11 +377,24 @@ def main():
         counts_layer = "counts"
     elif (counts_layer is None and "pdex" in methods and a.non_parametric_engine != "rsc"
           and rt._looks_raw_integer(adata)):
-        counts_layer = "_cell_eval_raw_counts"
+        counts_layer = "_raw_counts_for_de"
         adata.layers[counts_layer] = adata.X.copy()
         print(f"preserved raw counts in temporary layer {counts_layer!r} for CPM")
     ds = os.path.splitext(os.path.basename(a.adata))[0]  # dataset tag on every output file
     print(f"loaded {a.adata}: {adata.n_obs} cells × {adata.n_vars} genes  (methods={methods})")
+    a.run_root = os.path.abspath(os.path.expanduser(a.run_root or a.outdir))
+    write_resolved_config(
+        run_root=a.run_root,
+        workflow="de_test4_guide_reproducibility",
+        dataset=ds,
+        resolved={
+            "arguments": vars(a),
+            "methods": methods,
+            "effective_counts_layer": counts_layer or "X",
+            "target_gene_col": a.target_gene_col or a.pert_col,
+            "results_outdir": os.path.abspath(a.outdir),
+        },
+    )
 
     def cfg_for(m):
         return {"pert_col": a.pert_col, "control_pert": a.control, "replicate_col": a.replicate_col,

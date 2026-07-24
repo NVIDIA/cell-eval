@@ -12,7 +12,7 @@ import scipy.sparse as sp
 import anndata as ad
 from scipy import stats
 
-from cell_eval._de_backends import build_de_frame
+from de_backends import build_de_frame
 
 CHI2_MEDIAN_1DF = 0.4549  # chi2.ppf(0.5, df=1)
 

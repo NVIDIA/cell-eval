@@ -7,6 +7,20 @@ description: Run or reproduce pathway Test 1 comparing perturbation split-half r
 
 Read the bundled `pathway-methods-memory.md` before running, reimplementing, or changing this skill. Use `test1_reproducibility.py` with the local `pathway_utils.py`, which loads scoring and OLS from an official ArcInstitute/bioconcord checkout. Do not import another skill or copy the Bioconcord implementation into this folder.
 
+## Mandatory preflight and run capture
+
+Do not start the executable until the user has explicitly confirmed one fully resolved run configuration.
+
+1. Gather the input `.h5ad`, ask whether `adata.X` contains raw counts or log1p-normalized expression, pathway-definition CSV, official Bioconcord checkout, results output directory, separate run root, methods to compare (`ols`, `pdex_mwu`, or both), perturbation/control/block fields, score layer, thresholds, scoring settings, repeats, seeds, and threads. Inspect the input read-only to resolve unknown columns, labels, layers, and eligible perturbations. Pass the confirmed state as `--expression-state`.
+2. Expand paths and resolve every default. Show one concise preflight summary containing inputs, results directory, run root, methods, data fields/layers, thresholds, unit scope, workload/concurrency, exact command, log path, and resolved-config destination.
+3. Ask for explicit confirmation and stop. Do not launch scoring, inference, plotting, or reuse before confirmation.
+4. After confirmation, create `<run-root>/logs` and `<run-root>/configs`, pass `--run-root <run-root>`, and capture the complete terminal stream with `2>&1 | tee <run-root>/logs/<workflow>__<dataset>__<UTC-timestamp>.log`.
+5. Every invocation writes an immutable timestamped YAML snapshot under `<run-root>/configs`. Report the result, log, and YAML paths on completion.
+
+Every box-and-whisker plot must overlay every finite underlying observation as jittered scatter points. Do not sample, aggregate away, or hide values in the scatter layer.
+
+For every pathway correlation matrix, retain every analytically eligible perturbation or guide. Never reduce the unit set merely to make the plot readable. When more than 40 units are shown, omit only the white diagonal cell-count text; keep the full numeric matrix and all units. Any analysis cap must be an explicit, user-confirmed scientific selection, not an automatic display rule.
+
 ## Scientific question
 
 Estimate each method's reproducibility ceiling by comparing pathway-effect vectors from two independent halves of the same perturbation and control cells. Score the full dataset once so this test isolates cell sampling and inference, not score recomputation.
@@ -69,7 +83,7 @@ For all requested methods together:
 5. Interpret the diagonal as within-perturbation reproducibility and off-diagonals as cross-perturbation similarity. Compute the finite mean of all diagonal cells and all off-diagonal cells separately for both correlation metrics.
 6. Render the Spearman matrix. In every method-panel title, report `Spearman: diag=<mean>, off=<mean>; Pearson: diag=<mean>, off=<mean>`.
 7. Derive one target order from the across-method mean Spearman diagonal and use it for every method panel in that family.
-8. Annotate each diagonal cell with the perturbation's mean total cell count across repeats.
+8. Annotate each diagonal cell with the perturbation's mean total cell count across repeats only when at most 40 perturbations are shown. Above that threshold suppress only the white diagonal count text and retain the full perturbation matrix.
 9. Use `RdBu_r` centered at zero with fixed limits `[-1, 1]`.
 10. Save the exact averaged Spearman and Pearson matrices beside every PNG as an NPZ archive. The archive contains the plotted and basis methods, shared targets/pathways, dropped targets/pathways, mean and repeat-level per-cell feature counts, selection family, FDR threshold, plus `targets__<method>`, `programs__<method>`, `spearman__<method>`, and `pearson__<method>` arrays. This makes the common comparison basis auditable without recovering values from raster heatmaps.
 

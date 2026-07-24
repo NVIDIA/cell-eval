@@ -11,7 +11,7 @@
 #   tables/overview_pdex_full.csv
 #   tables/overview_seed_counts.csv
 
-adata_path: /workspace/cell-eval/adata_Validation.h5ad
+adata_path: /path/to/adata_Validation.h5ad
 pert_col: target_gene
 control_pert: non-targeting
 replicate_col: batch          # REQUIRED for pydeseq2 pseudobulk (batch = pseudobulk unit)

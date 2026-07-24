@@ -29,6 +29,8 @@ import anndata as ad
 import numpy as np
 import polars as pl
 
+from de_backends import de_method_label, write_resolved_config
+
 _RT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "de_helpers.py")
 
 # colorblind-safe (Okabe-Ito / seaborn "colorblind"): pdex = blue, pydeseq2 = orange
@@ -138,6 +140,7 @@ def plot_test2_diagnostics(
     alpha=0.05,
     n_resamples=10,
     output_path="test_2_pvalue_diagnostics.png",
+    non_parametric_engine="pdex",
 ):
     """Single 3-panel figure comparing pdex vs pydeseq2 on the control-control null.
 
@@ -152,10 +155,18 @@ def plot_test2_diagnostics(
     import matplotlib.pyplot as plt
     from scipy import stats
 
+    pdex_label = de_method_label(
+        "pdex", non_parametric_engine=non_parametric_engine
+    )
+    pydeseq2_label = de_method_label("pydeseq2")
     methods = [
-        ("pdex", np.asarray(pvalues_pdex, float), np.asarray(lambda_gc_per_split_pdex, float)),
-        ("pydeseq2", np.asarray(pvalues_pydeseq2, float), np.asarray(lambda_gc_per_split_pydeseq2, float)),
+        (pdex_label, np.asarray(pvalues_pdex, float), np.asarray(lambda_gc_per_split_pdex, float)),
+        (pydeseq2_label, np.asarray(pvalues_pydeseq2, float), np.asarray(lambda_gc_per_split_pydeseq2, float)),
     ]
+    method_color = {
+        pdex_label: METHOD_COLOR["pdex"],
+        pydeseq2_label: METHOD_COLOR["pydeseq2"],
+    }
 
     fig, axes = plt.subplots(1, 3, figsize=(14, 5),
                              gridspec_kw={"width_ratios": [1.25, 1.15, 0.9], "wspace": 0.32})
@@ -177,7 +188,7 @@ def plot_test2_diagnostics(
             continue
         m_val = max(m_val, float(obs.max()))
         lam_mean = float(np.nanmean(lam)) if lam.size else float("nan")
-        ax.plot(exp, obs, lw=1.4, alpha=0.9, color=METHOD_COLOR.get(name, "0.3"),
+        ax.plot(exp, obs, lw=1.4, alpha=0.9, color=method_color[name],
                 label=f"{name}  (λ_GC={lam_mean:.2f})")
     ax.plot([0, m_val], [0, m_val], "--", color="0.4", lw=1, zorder=1, label="y = x (calibrated)")
     ax.set_xlabel("expected −log₁₀(p)  (Uniform)")
@@ -191,7 +202,7 @@ def plot_test2_diagnostics(
     bins = np.linspace(0, 1, 21)
     for name, pv, _ in methods:
         p = pv[np.isfinite(pv)]
-        ax.hist(p, bins=bins, density=True, alpha=0.5, color=METHOD_COLOR.get(name, "0.3"),
+        ax.hist(p, bins=bins, density=True, alpha=0.5, color=method_color[name],
                 label=name, edgecolor="white", linewidth=0.3)
     ax.axhline(1.0, color="black", ls="--", lw=1.2, label="Uniform[0,1] (density = 1)")
     ax.set_xlabel("p-value")
@@ -208,7 +219,7 @@ def plot_test2_diagnostics(
     for name, _, lam in methods:
         lam = lam[np.isfinite(lam)]
         box_data.append(lam)
-        box_colors.append(METHOD_COLOR.get(name, "0.3"))
+        box_colors.append(method_color[name])
         labels.append(name)
     bp = ax.boxplot(box_data, positions=list(positions), widths=0.5, patch_artist=True,
                     medianprops=dict(color="black", lw=1.6),
@@ -229,7 +240,9 @@ def plot_test2_diagnostics(
     ax.set_title(f"(3) λ_GC: should be near 1.0\n(one point per split, n={n_resamples} splits)", fontsize=9)
     ax.legend(fontsize=7.5, loc="best")
 
-    fig.suptitle("Test 2 — control-control null (stratified split): pdex vs pydeseq2",
+    fig.suptitle(
+                 f"Test 2 — control-control null (stratified split): "
+                 f"{pdex_label} vs {pydeseq2_label}",
                  fontsize=12, fontweight="bold", y=1.02)
     fig.tight_layout()
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
@@ -237,7 +250,10 @@ def plot_test2_diagnostics(
     return output_path
 
 
-def plot_test2_lfc_agreement(de_pdex, de_pydeseq2, output_path, *, fdr=0.05, lfc=0.1):
+def plot_test2_lfc_agreement(
+    de_pdex, de_pydeseq2, output_path, *, fdr=0.05, lfc=0.1,
+    non_parametric_engine="pdex",
+):
     """Per-gene LFC agreement on the control-control null: pdex log2FC (x) vs pydeseq2 log2FC (y).
 
     `de_pdex` / `de_pydeseq2` are the per-gene, per-split `de_long` frames from `control_null_pvalues`
@@ -252,6 +268,10 @@ def plot_test2_lfc_agreement(de_pdex, de_pydeseq2, output_path, *, fdr=0.05, lfc
     import matplotlib.pyplot as plt
     import polars as pl
     from scipy import stats
+    pdex_label = de_method_label(
+        "pdex", non_parametric_engine=non_parametric_engine
+    )
+    pydeseq2_label = de_method_label("pydeseq2")
 
     j = (de_pdex.rename({"log2_fold_change": "lfc_pdex", "fdr": "fdr_pdex"})
          .join(de_pydeseq2.rename({"log2_fold_change": "lfc_pyd", "fdr": "fdr_pyd"}),
@@ -278,9 +298,9 @@ def plot_test2_lfc_agreement(de_pdex, de_pydeseq2, output_path, *, fdr=0.05, lfc
     ax.scatter(xp[neither], yp[neither], s=5, color="0.75", alpha=0.35, linewidths=0,
                label=f"DE in neither (n={int(neither.sum())})", zorder=2)
     ax.scatter(xp[only_pdex], yp[only_pdex], s=22, color="#0173B2", alpha=0.85, edgecolor="white",
-               linewidth=0.3, label=f"DE in pdex only (n={int(only_pdex.sum())})", zorder=4)
+               linewidth=0.3, label=f"DE in {pdex_label} only (n={int(only_pdex.sum())})", zorder=4)
     ax.scatter(xp[only_pyd], yp[only_pyd], s=22, color="#DE8F05", alpha=0.85, edgecolor="white",
-               linewidth=0.3, label=f"DE in pydeseq2 only (n={int(only_pyd.sum())})", zorder=4)
+               linewidth=0.3, label=f"DE in {pydeseq2_label} only (n={int(only_pyd.sum())})", zorder=4)
     ax.scatter(xp[both], yp[both], s=34, color="#029E73", alpha=0.9, edgecolor="black",
                linewidth=0.4, label=f"DE in both (n={int(both.sum())})", zorder=5)
 
@@ -289,8 +309,8 @@ def plot_test2_lfc_agreement(de_pdex, de_pydeseq2, output_path, *, fdr=0.05, lfc
     rho_de = float(stats.spearmanr(xp[de_any], yp[de_any]).statistic) if de_any.sum() >= 5 else float("nan")
     ax.set_xlim(-lim, lim)
     ax.set_ylim(-lim, lim)
-    ax.set_xlabel("pdex log2FC (control-control null)")
-    ax.set_ylabel("pydeseq2 log2FC (control-control null)")
+    ax.set_xlabel(f"{pdex_label} log2FC (control-control null)")
+    ax.set_ylabel(f"{pydeseq2_label} log2FC (control-control null)")
     ax.set_title("Test 2 — per-gene LFC agreement on the control-control null\n"
                  f"pooled over splits · Spearman ρ (all genes)={rho_all:.2f}"
                  + (f", ρ (DE in either)={rho_de:.2f}" if np.isfinite(rho_de) else "")
@@ -326,6 +346,14 @@ def main():
                     help="non-parametric engine; pdex uses Arc pdex and rsc uses RAPIDS GPU Wilcoxon")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--outdir", default=".")
+    ap.add_argument(
+        "--expression-state", choices=("raw_counts", "log1p_normalized"), default="",
+        help="user-confirmed state of adata.X; recorded in the resolved YAML",
+    )
+    ap.add_argument(
+        "--run-root", default="",
+        help="confirmed run root for configs/ and logs/ (defaults to --outdir)",
+    )
     a = ap.parse_args()
     if a.threads < 1 or a.resample_workers < 1:
         ap.error("--threads and --resample-workers must be at least 1")
@@ -348,6 +376,19 @@ def main():
     if counts_layer is None and "counts" in adata.layers:
         counts_layer = "counts"
     print(f"loaded {a.adata}: {adata.n_obs} cells × {adata.n_vars} genes  (methods={methods})")
+    dataset = os.path.splitext(os.path.basename(a.adata))[0]
+    a.run_root = os.path.abspath(os.path.expanduser(a.run_root or a.outdir))
+    write_resolved_config(
+        run_root=a.run_root,
+        workflow="de_test2_control_null",
+        dataset=dataset,
+        resolved={
+            "arguments": vars(a),
+            "methods": methods,
+            "effective_counts_layer": counts_layer or "X",
+            "results_outdir": os.path.abspath(a.outdir),
+        },
+    )
 
     def cfg_for(m):
         return {"pert_col": a.pert_col, "control_pert": a.control, "replicate_col": a.replicate_col,
@@ -382,21 +423,23 @@ def main():
         print(f"  pooled λ_GC = {rt.lambda_gc(pooled):.3f}  ·  per-split λ_GC = "
               f"{np.array2string(lambdas, precision=2)}")
 
-    dataset = os.path.splitext(os.path.basename(a.adata))[0]
     plots_dir = os.path.join(a.outdir, "plots")
     os.makedirs(plots_dir, exist_ok=True)
     out_png = os.path.join(plots_dir, f"test_2_pvalue_diagnostics__{dataset}.png")
     p_pdex, l_pdex = res.get("pdex", (np.array([]), np.array([])))
     p_pyd, l_pyd = res.get("pydeseq2", (np.array([]), np.array([])))
     plot_test2_diagnostics(p_pdex, p_pyd, l_pdex, l_pyd,
-                           alpha=a.fdr, n_resamples=a.n_resamples, output_path=out_png)
+                           alpha=a.fdr, n_resamples=a.n_resamples,
+                           output_path=out_png,
+                           non_parametric_engine=a.non_parametric_engine)
     print("\nTest-2 diagnostics:", os.path.abspath(out_png))
 
     # per-gene LFC agreement on the null: pdex log2FC (x) vs pydeseq2 log2FC (y)
     if "pdex" in de_long and "pydeseq2" in de_long:
         lfc_png = os.path.join(plots_dir, f"test_2_lfc_agreement__{dataset}.png")
         plot_test2_lfc_agreement(de_long["pdex"], de_long["pydeseq2"], lfc_png,
-                                 fdr=a.fdr, lfc=a.lfc)
+                                 fdr=a.fdr, lfc=a.lfc,
+                                 non_parametric_engine=a.non_parametric_engine)
         print("Test-2 LFC agreement:", os.path.abspath(lfc_png))
 
 
