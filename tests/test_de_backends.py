@@ -12,6 +12,7 @@ from cell_eval._de_backends import (
     normalize_pydeseq2_results,
 )
 from cell_eval._pydeseq2_backend import _parse_pydeseq2_kwargs
+from cell_eval import _pdex_backend
 
 
 def _adata_for_de() -> AnnData:
@@ -65,6 +66,58 @@ def test_normalize_de_methods_accepts_comma_separated_values() -> None:
 def test_normalize_de_methods_rejects_unknown_backend() -> None:
     with pytest.raises(ValueError, match="Unknown DE method"):
         normalize_de_methods("pdex,unknown")
+
+
+def test_pdex_rsc_engine_dispatches_without_mutating_options(monkeypatch) -> None:
+    expected = _de_frame().head(3)
+    seen = {}
+
+    def fake_rsc(*, adata, reference, groupby):
+        seen.update(adata=adata, reference=reference, groupby=groupby)
+        return expected
+
+    monkeypatch.setattr(_pdex_backend, "_compute_rsc_pdex_de", fake_rsc)
+    options = {"engine": "rsc"}
+    adata = _adata_for_de()
+    actual = _pdex_backend.compute_pdex_de(
+        adata=adata, reference="control", groupby="target", threads=2,
+        allow_discrete=False, pdex_kwargs=options,
+    )
+    assert actual.equals(expected)
+    assert options == {"engine": "rsc"}
+    assert seen == {"adata": adata, "reference": "control", "groupby": "target"}
+
+
+def test_pdex_engine_name_dispatches_to_arc_pdex(monkeypatch) -> None:
+    expected = _de_frame()
+    seen = {}
+
+    def fake_pdex(*, adata, mode, **kwargs):
+        seen.update(adata=adata, mode=mode, kwargs=kwargs)
+        return expected
+
+    monkeypatch.setattr(_pdex_backend, "pdex", fake_pdex)
+    options = {"engine": "pdex"}
+    adata = _adata_for_de()
+    actual = _pdex_backend.compute_pdex_de(
+        adata=adata, reference="control", groupby="target", threads=2,
+        allow_discrete=False, pdex_kwargs=options,
+    )
+    assert actual.equals(expected)
+    assert options == {"engine": "pdex"}
+    assert seen["adata"] is adata
+    assert seen["mode"] == "ref"
+    assert seen["kwargs"]["reference"] == "control"
+    assert seen["kwargs"]["groupby"] == "target"
+
+
+@pytest.mark.parametrize("engine", ["cpu", "warp"])
+def test_pdex_rejects_unknown_non_parametric_engine(engine: str) -> None:
+    with pytest.raises(ValueError, match="Unknown non-parametric engine"):
+        _pdex_backend.compute_pdex_de(
+            adata=_adata_for_de(), reference="control", groupby="target",
+            threads=1, allow_discrete=False, pdex_kwargs={"engine": engine},
+        )
 
 
 def test_build_pydeseq2_inputs_pseudobulks_by_replicate() -> None:
