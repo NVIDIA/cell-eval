@@ -13,12 +13,17 @@ Runs **both pdex and pydeseq2** on the same splits in one pass via `guide_split_
 `de_backends.py` is bundled with this skill and calls the upstream `pdex` and
 `pydeseq2` packages directly. Do not import project-private DE backend modules.
 
+Before executing, read and follow
+[`hardware-execution-contract.md`](hardware-execution-contract.md). Use the bundled
+`run_with_watchdog.py` for every inference attempt; worker value `0` means
+hardware-adaptive selection.
+
 ## Mandatory preflight and run capture
 
 Do not start the executable until the user has explicitly confirmed one fully resolved run configuration.
 
 1. Gather the input `.h5ad`, ask whether `adata.X` contains raw counts or log1p-normalized expression, results output directory, separate run root, methods to compare, non-parametric engine (`pdex` or `rsc`) when `pdex` is selected, perturbation/guide/target-gene/control fields, replicate/block columns, count layer, thresholds, seeds, guide limits, repeats, and worker/thread settings. Inspect the input read-only to resolve unknown columns, labels, layers, and guide counts. Pass the confirmed state as `--expression-state`.
-2. Expand paths and resolve every default. Show one concise preflight summary containing the input, results directory, run root, methods/engine, data fields, thresholds, selected guide scope, workload/concurrency, exact command, log path, cache behavior, and resolved-config destination.
+2. Expand paths and resolve every default. Show one concise preflight summary containing the input, results directory, run root, methods/engine, data fields, thresholds, selected guide scope, workload/concurrency, exact command, log path, cache behavior, and resolved-config destination. Before asking for confirmation, estimate wall time separately for every selected method, shared preparation/rendering, and the complete run; state the hardware/tier, cache assumptions, evidence or throughput basis, uncertainty range, and how watchdog de-escalation could extend it.
 3. Ask for explicit confirmation and stop. Do not launch computation, plotting, or cache reuse before confirmation.
 4. After confirmation, create `<run-root>/logs` and `<run-root>/configs`, pass `--run-root <run-root>`, and capture the complete terminal stream with `2>&1 | tee <run-root>/logs/<workflow>__<dataset>__<UTC-timestamp>.log`.
 5. Every invocation writes an immutable timestamped YAML snapshot under `<run-root>/configs`. Report the result, log, and YAML paths on completion.
@@ -98,6 +103,15 @@ python .claude/skills/evaluating-test4-guide-reproducibility/guide_split_reprodu
   percentiles, and the rasterized scatter layer contains **every finite matrix value**, never a
   sample. The CSV records n, mean, standard deviation, minimum, 5th/25th/50th/75th/95th
   percentiles, and maximum for every method × metric × group.
+- Whenever those primary correlation boxplots are rendered, also emit
+  `test4_corr_matrix_de_jaccard_diagonal_boxplot__<dataset>.png` and
+  `test4_corr_matrix_de_jaccard_off_diagonal_boxplot__<dataset>.png`, each with a same-stem
+  summary CSV. Define matrix cell `(i,j)` as `J(DE_A(guide i), DE_B(guide j))`; both DE sets
+  require the configured FDR/absolute-LFC thresholds and guide-specific CPM eligibility. The
+  diagonal plot shows same-guide split reproducibility and the off-diagonal plot shows
+  cross-guide DE-set similarity. Treat an empty union as undefined—not Jaccard 1. Use IQR
+  boxes, 5th–95th percentile whiskers, and jittered scatter containing **every finite matrix
+  cell**, never a sample. Test 4 has one split repeat, so no cross-repeat averaging is needed.
 - `test4_corr_matrix_pair_specific_de_union__<dataset>.png` is a separate feature-selection
   sensitivity analysis. For each method, cell `(i,j)` correlates split-A guide `i` with split-B guide
   `j` over `DE_A(i) ∪ DE_B(j)`. Calls require the guide's CPM eligibility plus the configured
@@ -126,4 +140,5 @@ same gene (does the metric reward shared biology). Levers: `--max-guides` (most-
 With a CUDA-capable RAPIDS environment, `--methods pdex --non-parametric-engine rsc` retains every guide while
 moving the Wilcoxon/FDR/LFC calculation to the GPU.
 For CPU PyDESeq2, `--guide-workers N --threads 1` runs independent guide fits concurrently without
-changing the per-guide PyDESeq2 model or numerical results.
+changing the per-guide PyDESeq2 model or numerical results. The default `0`
+selects a CPU/RAM-safe worker count from the measured machine.

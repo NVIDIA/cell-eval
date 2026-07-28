@@ -29,7 +29,12 @@ import numpy as np
 import polars as pl
 import scipy.sparse as sp
 
-from de_backends import build_de_frame, de_method_label, write_resolved_config
+from de_backends import (
+    build_de_frame,
+    de_method_label,
+    hardware_worker_limit,
+    write_resolved_config,
+)
 
 _T0_WORKER_STATE = {}
 
@@ -682,8 +687,8 @@ def main():
                     help="comma-separated backends to run")
     ap.add_argument("--threads", type=int, default=8,
                     help="CPU threads supplied to each DE fit")
-    ap.add_argument("--pydeseq-workers", type=int, default=1,
-                    help="parallel injection tasks for CPU PyDESeq2; use --threads 1")
+    ap.add_argument("--pydeseq-workers", type=int, default=0,
+                    help="parallel injection tasks; 0 = hardware-adaptive")
     ap.add_argument("--out", default="injection_recovery.csv")
     ap.add_argument(
         "--expression-state", choices=("raw_counts", "log1p_normalized"), default="",
@@ -699,19 +704,22 @@ def main():
     unknown = sorted(set(methods) - {"pdex", "pydeseq2"})
     if not methods or unknown:
         ap.error(f"--methods must contain pdex and/or pydeseq2; unknown={unknown}")
-    if a.threads < 1 or a.pydeseq_workers < 1:
-        ap.error("--threads and --pydeseq-workers must be at least 1")
-    available_cpus = (
-        len(os.sched_getaffinity(0))
-        if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
-    )
-    worker_cap = max(1, available_cpus // a.threads)
-    if a.pydeseq_workers > worker_cap:
-        print(f"[safety] capping --pydeseq-workers from {a.pydeseq_workers} "
-              f"to {worker_cap} ({available_cpus} CPUs, {a.threads} threads/fit)")
-        a.pydeseq_workers = worker_cap
+    if a.threads < 1 or a.pydeseq_workers < 0:
+        ap.error("--threads must be at least 1 and --pydeseq-workers at least 0")
 
     adata = ad.read_h5ad(a.adata)
+    requested_workers = a.pydeseq_workers
+    a.pydeseq_workers = hardware_worker_limit(
+        requested=requested_workers,
+        threads_per_worker=a.threads,
+        worker_memory_bytes=max(os.path.getsize(a.adata) // 3, 768 * 1024**2),
+        max_auto_workers=16,
+        memory_fraction=0.55,
+    )
+    print(
+        f"[resources] injection workers={a.pydeseq_workers} "
+        f"(requested={requested_workers}; threads/worker={a.threads})"
+    )
     print(f"loaded {a.adata}: {adata.n_obs} cells × {adata.n_vars} genes")
     # fall back to .X if the requested counts layer doesn't exist
     counts_layer = a.counts_layer if (a.counts_layer and a.counts_layer in adata.layers) else None

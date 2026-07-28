@@ -78,15 +78,21 @@ if (
     guarded_env.update(_THREAD_ENV_LIMITS)
     guarded_env["CELL_EVAL_THREAD_GUARD"] = "1"
     os.execve(sys.executable, [sys.executable, *sys.argv], guarded_env)
-for _thread_env, _thread_limit in _THREAD_ENV_LIMITS.items():
-    os.environ[_thread_env] = _thread_limit
+# Do not rewrite Numba/OpenMP environment variables when this module is
+# imported into an already-running Python process. Numba rejects changing its
+# startup thread ceiling after the pool has initialized. Standalone CLI runs
+# already received these values through the one-time exec above.
 
 import anndata as ad
 import numpy as np
 import polars as pl
 from scipy import stats
 
-from de_backends import de_method_label, write_resolved_config
+from de_backends import (
+    de_method_label,
+    hardware_worker_limit,
+    write_resolved_config,
+)
 
 _RT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "de_helpers.py")
 
@@ -1035,6 +1041,205 @@ def correlation_distribution_boxplots(
     return out_png
 
 
+def _de_jaccard_matrix(sigs, units, cfg):
+    """Split-A × split-B Jaccard matrix over CPM-qualified DE-gene sets.
+
+    Cell ``(i, j)`` is ``J(DE_A(unit i), DE_B(unit j))``.  An empty union is
+    undefined (NaN), rather than perfect agreement, so units with no DE calls
+    cannot inflate the reproducibility distribution.
+    """
+    from scipy import sparse
+
+    fdr_threshold = float(cfg["fdr_threshold"])
+    lfc_threshold = float(cfg["lfc_threshold"])
+    de_a_sets = []
+    de_b_sets = []
+    feature_union = set()
+    for unit_name in units:
+        signature = sigs[unit_name]
+        genes = np.asarray(signature["genes"], dtype=str)
+        lfc_a = np.asarray(signature["lfc_a"], dtype=float)
+        lfc_b = np.asarray(signature["lfc_b"], dtype=float)
+        fdr_a = np.asarray(signature["fdr_a"], dtype=float)
+        fdr_b = np.asarray(signature["fdr_b"], dtype=float)
+        cpm_eligible = _cpm_elig_mask(signature)
+        if not all(
+            len(values) == len(genes)
+            for values in (lfc_a, lfc_b, fdr_a, fdr_b, cpm_eligible)
+        ):
+            raise ValueError(
+                f"{unit_name}: DE-Jaccard signature arrays have inconsistent lengths"
+            )
+        de_a = (
+            cpm_eligible & np.isfinite(lfc_a) & np.isfinite(fdr_a)
+            & (fdr_a <= fdr_threshold)
+            & (np.abs(lfc_a) >= lfc_threshold)
+        )
+        de_b = (
+            cpm_eligible & np.isfinite(lfc_b) & np.isfinite(fdr_b)
+            & (fdr_b <= fdr_threshold)
+            & (np.abs(lfc_b) >= lfc_threshold)
+        )
+        set_a = set(genes[de_a])
+        set_b = set(genes[de_b])
+        de_a_sets.append(set_a)
+        de_b_sets.append(set_b)
+        feature_union.update(set_a)
+        feature_union.update(set_b)
+
+    n_units = len(units)
+    if not feature_union:
+        return np.full((n_units, n_units), np.nan, dtype=np.float32)
+
+    feature_index = {
+        feature: index for index, feature in enumerate(sorted(feature_union))
+    }
+
+    def sparse_calls(gene_sets):
+        rows = []
+        columns = []
+        for row, genes in enumerate(gene_sets):
+            rows.extend([row] * len(genes))
+            columns.extend(feature_index[gene] for gene in genes)
+        data = np.ones(len(rows), dtype=np.int32)
+        return sparse.csr_matrix(
+            (data, (rows, columns)),
+            shape=(n_units, len(feature_index)),
+            dtype=np.int32,
+        )
+
+    calls_a = sparse_calls(de_a_sets)
+    calls_b = sparse_calls(de_b_sets)
+    intersection = (calls_a @ calls_b.T).toarray().astype(np.float64)
+    count_a = np.asarray(calls_a.sum(axis=1)).ravel().astype(np.float64)
+    count_b = np.asarray(calls_b.sum(axis=1)).ravel().astype(np.float64)
+    union = count_a[:, None] + count_b[None, :] - intersection
+    jaccard = np.full(union.shape, np.nan, dtype=np.float32)
+    np.divide(intersection, union, out=jaccard, where=union > 0)
+    return jaccard
+
+
+def de_jaccard_distribution_boxplots(
+    matrices_by_method, matrix_png, *, methods, title_prefix="Test-1",
+    unit="perturbation", seed=0, method_labels=None, cfg=None,
+):
+    """Emit separate diagonal and off-diagonal DE-Jaccard box/scatter plots.
+
+    Every finite cell of each repeat-averaged Jaccard matrix is rendered.  The
+    accompanying CSV contains distribution summaries; no scatter values are
+    sampled.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    rng = np.random.default_rng(seed)
+    colors = plt.get_cmap("tab10").colors
+    outputs = {}
+    groups = (
+        ("diagonal", "diagonal", f"within-{unit} split reproducibility"),
+        ("off_diagonal", "off_diagonal", f"cross-{unit} specificity"),
+    )
+    for group_key, filename_group, group_label in groups:
+        out_png = _variant_output_path(
+            matrix_png, f"de_jaccard_{filename_group}_boxplot"
+        )
+        fig, ax = plt.subplots(
+            figsize=(max(6.8, 2.0 + 1.8 * len(methods)), 6.2)
+        )
+        box_values = []
+        finite_by_method = {}
+        summaries = []
+        for method in methods:
+            matrix = np.asarray(matrices_by_method[method], dtype=float)
+            if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+                raise ValueError(
+                    f"{method} DE-Jaccard matrix must be square, got {matrix.shape}"
+                )
+            diagonal = np.eye(matrix.shape[0], dtype=bool)
+            values = matrix[diagonal if group_key == "diagonal" else ~diagonal]
+            values = values[np.isfinite(values)]
+            finite_by_method[method] = values
+            box_values.append(
+                values if values.size else np.asarray([np.nan])
+            )
+            summaries.append(
+                _correlation_distribution_summary(
+                    method, "DE Jaccard", group_key, values
+                )
+            )
+
+        boxes = ax.boxplot(
+            box_values,
+            tick_labels=[
+                (method_labels or {}).get(method, method) for method in methods
+            ],
+            patch_artist=True, showfliers=False, whis=(5, 95), widths=0.58,
+            medianprops={"color": "black", "linewidth": 1.8},
+            whiskerprops={"linewidth": 1.1},
+            capprops={"linewidth": 1.1},
+        )
+        for index, (patch, method) in enumerate(
+            zip(boxes["boxes"], methods)
+        ):
+            color = colors[index % len(colors)]
+            patch.set_facecolor(color)
+            patch.set_alpha(0.78)
+            values = finite_by_method[method]
+            if values.size:
+                jitter = rng.uniform(
+                    index + 1 - 0.18, index + 1 + 0.18,
+                    size=values.size,
+                )
+                ax.scatter(
+                    jitter, values,
+                    s=5 if group_key == "diagonal" else 1,
+                    color=color,
+                    alpha=(
+                        0.35 if group_key == "diagonal"
+                        else max(0.002, min(0.06, 1_000 / values.size))
+                    ),
+                    edgecolors="none", rasterized=True, zorder=3,
+                )
+            median = float(np.median(values)) if values.size else np.nan
+            mean = float(np.mean(values)) if values.size else np.nan
+            ax.text(
+                index + 1, 0.02,
+                f"n={values.size:,}\nmedian={median:.2f}\nmean={mean:.2f}",
+                ha="center", va="bottom", fontsize=9,
+                bbox={
+                    "facecolor": "white", "edgecolor": "none", "alpha": 0.82
+                },
+            )
+        ax.set_ylim(-0.02, 1.02)
+        ax.set_ylabel("DE-gene Jaccard similarity")
+        ax.grid(axis="y", color="#dddddd", linewidth=0.7)
+        threshold_label = ""
+        if cfg is not None:
+            threshold_label = (
+                f"; FDR ≤ {cfg['fdr_threshold']:g}, "
+                f"|LFC| ≥ {cfg['lfc_threshold']:g}, CPM eligible"
+            )
+        ax.set_title(
+            f"{title_prefix} DE-gene Jaccard — {group_label}\n"
+            "J(DE_A(i), DE_B(j)); corresponding cells averaged across repeats"
+            f"{threshold_label}\n"
+            "boxes = IQR; whiskers = 5th–95th percentiles; "
+            "points = every finite averaged matrix cell; empty unions excluded",
+            fontsize=11,
+        )
+        fig.tight_layout()
+        os.makedirs(os.path.dirname(os.path.abspath(out_png)), exist_ok=True)
+        fig.savefig(out_png, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+        csv_path = os.path.splitext(out_png)[0] + ".csv"
+        pl.DataFrame(summaries).write_csv(csv_path)
+        print(f"  saved DE-Jaccard {group_key} boxplot: {out_png}")
+        print(f"  saved DE-Jaccard {group_key} summary: {csv_path}")
+        outputs[group_key] = out_png
+    return outputs
+
+
 def _pair_specific_signature_matrices(sigs, units, cfg):
     """Dense LFC and DE masks for exact pair-specific DE-union panels."""
     feature_set = set()
@@ -1364,6 +1569,14 @@ def layer3_corr_matrix(sigs_by_method, out_png, cfg, genes, *, methods,
         "targets": np.asarray(perts, dtype=str),
     }
     matrices_by_method = {}
+    jaccard_by_method = {}
+    if emit_boxplots:
+        matrix_archive["jaccard_definition"] = np.asarray(
+            "cell(i,j)=J(DE_A(unit i),DE_B(unit j)); calls require configured "
+            "FDR, absolute-LFC, and unit-specific CPM eligibility; empty unions "
+            "are undefined; repeat matrices are averaged cellwise",
+            dtype=str,
+        )
     if not isinstance(genes, dict):
         matrix_archive["features"] = np.asarray(genes, dtype=str)
     for ax, m in zip(axes[0], methods):
@@ -1373,6 +1586,7 @@ def layer3_corr_matrix(sigs_by_method, out_png, cfg, genes, *, methods,
         repeat_counts.append(len(repeat_sigs))
         repeat_spearman = []
         repeat_pearson = []
+        repeat_jaccard = []
         for sigs in repeat_sigs:
             A = _matrix(sigs, perts, method_genes, "lfc_a")
             B = _matrix(sigs, perts, method_genes, "lfc_b")
@@ -1409,9 +1623,20 @@ def layer3_corr_matrix(sigs_by_method, out_png, cfg, genes, *, methods,
                 P_r = cross_corr(A, B)
             repeat_spearman.append(C_r)
             repeat_pearson.append(P_r)
+            if emit_boxplots:
+                repeat_jaccard.append(
+                    _de_jaccard_matrix(sigs, perts, cfg)
+                )
         with np.errstate(invalid="ignore"):
             C = np.nanmean(np.stack(repeat_spearman), axis=0)
             P = np.nanmean(np.stack(repeat_pearson), axis=0)
+        if emit_boxplots:
+            J, finite_jaccard_repeats = _nanmean_stacks(repeat_jaccard)
+            jaccard_by_method[m] = J
+            matrix_archive[f"jaccard__{m}"] = J
+            matrix_archive[f"finite_jaccard_repeats__{m}"] = (
+                finite_jaccard_repeats
+            )
         im = ax.imshow(C, cmap="RdBu_r", vmin=-1, vmax=1, interpolation="nearest")
         # Counts are useful for small panels, but overlapping text obscures the
         # diagonal on large matrices. Axis labels remain complete at every size.
@@ -1472,6 +1697,13 @@ def layer3_corr_matrix(sigs_by_method, out_png, cfg, genes, *, methods,
             panel_label="global union-DE", seed=0,
             method_labels={method: _display_method(method, cfg) for method in methods},
         )
+        de_jaccard_distribution_boxplots(
+            jaccard_by_method, out_png, methods=methods,
+            title_prefix=title_prefix, unit=unit, seed=0, cfg=cfg,
+            method_labels={
+                method: _display_method(method, cfg) for method in methods
+            },
+        )
     return out_png
 
 
@@ -1499,8 +1731,8 @@ def main():
                     help="non-parametric engine; pdex uses Arc pdex and rsc uses RAPIDS GPU Wilcoxon")
     ap.add_argument("--parallel-repeats", type=int, default=1,
                     help="repeat-level fork workers; use up to n-repeats on large multicore hosts")
-    ap.add_argument("--perturbation-workers", type=int, default=1,
-                    help="within-repeat PyDESeq2 perturbation workers; use --threads 1")
+    ap.add_argument("--perturbation-workers", type=int, default=0,
+                    help="within-repeat PyDESeq2 workers; 0 = hardware-adaptive")
     ap.add_argument("--pairwise-workers", type=int, default=8,
                     help="fork workers for pair-specific DE-union correlation rows")
     ap.add_argument("--signature-cache-dir", default=None,
@@ -1542,10 +1774,24 @@ def main():
         ap.error("--threads must be at least 1")
     if a.parallel_repeats < 1:
         ap.error("--parallel-repeats must be at least 1")
-    if a.perturbation_workers < 1:
-        ap.error("--perturbation-workers must be at least 1")
+    if a.perturbation_workers < 0:
+        ap.error("--perturbation-workers must be at least 0")
     if a.pairwise_workers < 1:
         ap.error("--pairwise-workers must be at least 1")
+    input_bytes = os.path.getsize(a.adata)
+    requested_perturbation_workers = a.perturbation_workers
+    a.perturbation_workers = hardware_worker_limit(
+        requested=requested_perturbation_workers,
+        threads_per_worker=a.threads,
+        worker_memory_bytes=max(input_bytes // 3, 768 * 1024**2),
+        max_auto_workers=16,
+        memory_fraction=0.55,
+    )
+    print(
+        f"[resources] perturbation workers={a.perturbation_workers} "
+        f"(requested={requested_perturbation_workers}; "
+        f"threads/worker={a.threads})"
+    )
     if a.perturbation_workers > 1 and a.parallel_repeats > 1:
         print("[safety] nested fork pools are unsupported; forcing --parallel-repeats=1")
         a.parallel_repeats = 1
@@ -1556,14 +1802,6 @@ def main():
         len(os.sched_getaffinity(0))
         if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
     )
-    max_perturbation_workers = max(1, available_cpus // a.threads)
-    if a.perturbation_workers > max_perturbation_workers:
-        print(
-            f"[safety] capping --perturbation-workers from "
-            f"{a.perturbation_workers} to {max_perturbation_workers} "
-            f"({available_cpus} CPUs, {a.threads} threads/backend)"
-        )
-        a.perturbation_workers = max_perturbation_workers
     if a.pairwise_workers > available_cpus:
         print(
             f"[safety] capping --pairwise-workers from {a.pairwise_workers} "
@@ -1575,7 +1813,6 @@ def main():
     # work; otherwise workers × threads can make the machine unreachable.
     cpu_safe_workers = max(1, int(available_cpus * 0.75) // a.threads)
     available_memory = _available_memory_bytes()
-    input_bytes = os.path.getsize(a.adata)
     # A worker can dirty normalized/count arrays inherited by fork. A 1.5x
     # on-disk estimate and a 50% available-memory budget are deliberately
     # conservative; underestimation reduces concurrency rather than risking OOM.

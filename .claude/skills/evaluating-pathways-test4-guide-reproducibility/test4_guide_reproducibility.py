@@ -110,6 +110,14 @@ def compact_guide_labels(
     }
 
 
+def fdr_filename_label(threshold: float) -> str:
+    """Return a stable filename label such as ``fdr05`` for 0.05."""
+    percent = f"{100 * threshold:g}".replace(".", "p")
+    if "p" not in percent:
+        percent = percent.zfill(2)
+    return f"fdr{percent}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--adata", required=True)
@@ -281,6 +289,37 @@ def main() -> None:
             sort_by_diagonal=False,
             group_separator=" | g",
             methods_to_plot=(method,),
+        )
+    fdr_label = fdr_filename_label(args.fdr)
+    pu.plot_target_corr_matrix(
+        plot_repeat_results,
+        os.path.join(
+            plots,
+            f"pathways_test4_corr_matrix_mean_{fdr_label}__{dataset}.png",
+        ),
+        f"Pathway Test 4 mean across {args.n_repeats} repeats — "
+        f"{dataset} — shared FDR <= {args.fdr:g} union",
+        unit="guide",
+        sort_by_diagonal=False,
+        group_separator=" | g",
+        fdr_threshold=args.fdr,
+        emit_distribution_boxplots=True,
+    )
+    for method in methods:
+        pu.plot_target_corr_matrix(
+            plot_repeat_results,
+            os.path.join(
+                plots,
+                f"pathways_test4_corr_matrix_mean_{method}_{fdr_label}"
+                f"__{dataset}.png",
+            ),
+            f"Pathway Test 4 mean across {args.n_repeats} repeats — "
+            f"{dataset} — {method} — shared FDR <= {args.fdr:g} union",
+            unit="guide",
+            sort_by_diagonal=False,
+            group_separator=" | g",
+            methods_to_plot=(method,),
+            fdr_threshold=args.fdr,
         )
     for arm in ("A", "B"):
         pu.plot_effect_heatmaps(

@@ -56,6 +56,7 @@ def _cpm_filter_multi(de_frame: pl.DataFrame, adata: ad.AnnData,
             X = X.copy()
             X.data = np.expm1(X.data)
     var_names = list(adata.var_names)
+    var_names_array = np.asarray(var_names, dtype=str)
 
     def mean_cpm(idx: np.ndarray) -> np.ndarray:
         group = X[idx, :]
@@ -74,38 +75,55 @@ def _cpm_filter_multi(de_frame: pl.DataFrame, adata: ad.AnnData,
         ctrl_pass = {g for g, mc in zip(var_names, m_ctrl) if mc >= min_cpm}
         return de_frame.filter(pl.col("feature").is_in(ctrl_pass))
 
-    pass_pairs: set[tuple[str, str]] = set()
+    eligible_frames: list[pl.DataFrame] = []
     for tgt in targets:
         tidx = np.where(obs_g == str(tgt))[0]
         if len(tidx) == 0:
             continue
         m_pert = mean_cpm(tidx)
-        for g, mc, mp in zip(var_names, m_ctrl, m_pert):
-            if mc >= min_cpm or mp >= min_cpm:
-                pass_pairs.add((str(tgt), g))
-
-    keep_mask = pl.Series([
-        (str(t), str(f)) in pass_pairs
-        for t, f in zip(de_frame["target"].to_list(), de_frame["feature"].to_list())
-    ])
-    return de_frame.filter(keep_mask)
+        eligible = (m_ctrl >= min_cpm) | (m_pert >= min_cpm)
+        eligible_frames.append(
+            pl.DataFrame(
+                {
+                    "target": np.repeat(str(tgt), int(eligible.sum())),
+                    "feature": var_names_array[eligible],
+                }
+            )
+        )
+    if not eligible_frames:
+        return de_frame.head(0)
+    eligibility = pl.concat(eligible_frames, how="vertical")
+    return de_frame.join(eligibility, on=["target", "feature"], how="semi")
 
 
 def _run_de(adata: ad.AnnData, method: str, pert_col: str, control: str,
             replicate_col: str | None, counts_layer: str | None,
-            non_parametric_engine: str = "pdex", num_threads: int = 8) -> pd.DataFrame:
+            non_parametric_engine: str = "pdex", num_threads: int = 8,
+            pydeseq_workers: int = 0, pydeseq_threads: int = 1,
+            pydeseq_checkpoint_dir: str | None = None) -> pd.DataFrame:
     if method == "pdex":
-        a = adata.copy()
-        if counts_layer and counts_layer in a.layers:
-            a.X = a.layers[counts_layer]
-        import scanpy as sc
-        if _looks_raw(a.X):
-            sc.pp.normalize_total(a, inplace=True)
-            sc.pp.log1p(a)
+        if non_parametric_engine == "rsc":
+            # RSC performs raw-count normalization inside its own working copy.
+            # Avoid creating an additional full-size CPU copy first.
+            a = adata
+            allow_discrete = True
+        else:
+            a = adata.copy()
+            if counts_layer and counts_layer in a.layers:
+                a.X = a.layers[counts_layer]
+            import scanpy as sc
+            if _looks_raw(a.X):
+                sc.pp.normalize_total(a, inplace=True)
+                sc.pp.log1p(a)
+            allow_discrete = False
         result = build_de_frame(
             mode="real", adata=a, control_pert=control, pert_col=pert_col,
-            num_threads=num_threads, allow_discrete=False, de_method="pdex",
-            de_kwargs={"engine": non_parametric_engine}, counts_layer=None,
+            num_threads=num_threads, allow_discrete=allow_discrete, de_method="pdex",
+            de_kwargs={
+                "engine": non_parametric_engine,
+                "result_mode": "target_only",
+            },
+            counts_layer=None,
         )
         # Apply shared CPM filter using raw counts from counts_layer (or adata directly).
         result = _cpm_filter_multi(result, adata, pert_col, control, counts_layer)
@@ -113,8 +131,16 @@ def _run_de(adata: ad.AnnData, method: str, pert_col: str, control: str,
     else:
         result = build_de_frame(
             mode="real", adata=adata, control_pert=control, pert_col=pert_col,
-            num_threads=num_threads, allow_discrete=True, de_method="pydeseq2",
-            de_kwargs=None, counts_layer=counts_layer, replicate_col=replicate_col,
+            num_threads=pydeseq_threads, allow_discrete=True, de_method="pydeseq2",
+            de_kwargs={
+                "fit_strategy": "auto",
+                "workers": pydeseq_workers,
+                "checkpoint_dir": pydeseq_checkpoint_dir,
+                "resume": True,
+                "continue_on_error": True,
+                "result_mode": "target_only",
+            },
+            counts_layer=counts_layer, replicate_col=replicate_col,
         )
         # Apply shared CPM filter identically to pydeseq2.
         result = _cpm_filter_multi(result, adata, pert_col, control, counts_layer)
@@ -357,7 +383,19 @@ def main() -> None:
     ap.add_argument("--non-parametric-engine", choices=("pdex", "rsc"), default="pdex",
                     help="non-parametric engine; pdex uses Arc pdex and rsc uses RAPIDS GPU Wilcoxon")
     ap.add_argument("--threads", type=int, default=8,
-                    help="CPU threads for the shared multi-contrast DE model")
+                    help="CPU threads for Arc pdex")
+    ap.add_argument(
+        "--pydeseq-workers",
+        type=int,
+        default=0,
+        help="parallel target-vs-control PyDESeq2 fits; 0 = hardware-adaptive",
+    )
+    ap.add_argument(
+        "--pydeseq-threads",
+        type=int,
+        default=1,
+        help="threads per PyDESeq2 fit; keep 1 when using multiple workers",
+    )
     ap.add_argument("--outdir",          default=".")
     ap.add_argument(
         "--expression-state", choices=("raw_counts", "log1p_normalized"), default="",
@@ -368,8 +406,11 @@ def main() -> None:
         help="confirmed run root for configs/ and logs/ (defaults to --outdir)",
     )
     a = ap.parse_args()
-    if a.threads < 1:
-        ap.error("--threads must be at least 1")
+    if a.threads < 1 or a.pydeseq_threads < 1 or a.pydeseq_workers < 0:
+        ap.error(
+            "--threads and --pydeseq-threads must be at least 1; "
+            "--pydeseq-workers must be at least 0"
+        )
 
     methods = [m.strip() for m in a.methods.split(",") if m.strip()]
     dataset = os.path.splitext(os.path.basename(a.adata))[0]
@@ -393,12 +434,19 @@ def main() -> None:
     )
 
     de: dict[str, pd.DataFrame] = {}
+    pydeseq_checkpoint_dir = os.path.join(
+        a.outdir,
+        "pydeseq2_target_checkpoints",
+    )
     # run pydeseq2 first (needs raw counts, before pdex normalises in-place)
     for m in [x for x in methods if x != "pdex"] + (["pdex"] if "pdex" in methods else []):
         print(f"[t6] {m} DE …")
         de[m] = _run_de(
             adata, m, a.pert_col, a.control, a.replicate_col, counts_layer,
             non_parametric_engine=a.non_parametric_engine, num_threads=a.threads,
+            pydeseq_workers=a.pydeseq_workers,
+            pydeseq_threads=a.pydeseq_threads,
+            pydeseq_checkpoint_dir=pydeseq_checkpoint_dir,
         )
 
     df = build_table(adata, de, a.pert_col, a.control, a.fdr, lfc_thr=a.lfc, counts_layer=counts_layer)

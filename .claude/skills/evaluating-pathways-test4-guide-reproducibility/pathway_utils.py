@@ -13,6 +13,7 @@ Keep those flat copies byte-identical when changing the statistical contract.
 from __future__ import annotations
 
 import json
+import hashlib
 import importlib.util
 import os
 from datetime import datetime, timezone
@@ -281,7 +282,80 @@ def load_and_score(
     score_jobs: int = 1,
 ) -> ScoredData:
     adata = ad.read_h5ad(adata_path)
-    return score_anndata(
+    cache_dir = os.environ.get("PATHWAY_SCORE_CACHE_DIR", "").strip()
+    if not cache_dir:
+        return score_anndata(
+            adata,
+            programs_path,
+            score_layer=score_layer,
+            min_genes=min_genes,
+            ctrl_size=ctrl_size,
+            n_bins=n_bins,
+            seed=seed,
+            score_jobs=score_jobs,
+        )
+
+    # Overview and Tests 1–3 intentionally reuse the same full-dataset
+    # cell-by-program score matrix.  Persist that immutable feature-engineering
+    # result within a confirmed run root so separate skill processes do not
+    # spend tens of minutes recomputing it.  File identity and every scoring
+    # parameter participate in the key; injected/subset workflows call
+    # score_anndata directly and therefore cannot consume this cache.
+    _, score_source = expression_matrix(adata, score_layer)
+    programs = load_programs(programs_path, adata.var_names, min_genes=min_genes)
+    module_path = (
+        Path(_BIOCONCORD_ROOT or "") / BIOCONCORD_MODULE_PATH
+        if _BIOCONCORD_ROOT
+        else Path(BIOCONCORD_MODULE_PATH)
+    )
+
+    def file_identity(path: str | Path) -> dict[str, Any]:
+        resolved = Path(path).expanduser().resolve()
+        stat = resolved.stat()
+        return {
+            "path": str(resolved),
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
+
+    cache_key_payload = {
+        "format_version": 1,
+        "adata": file_identity(adata_path),
+        "programs": file_identity(programs_path),
+        "bioconcord_module": file_identity(module_path),
+        "shape": [int(adata.n_obs), int(adata.n_vars)],
+        "score_layer": score_layer or "X",
+        "score_source": score_source,
+        "min_genes": int(min_genes),
+        "ctrl_size": int(ctrl_size),
+        "n_bins": int(n_bins),
+        "seed": int(seed),
+        "program_labels": list(programs),
+    }
+    digest = hashlib.sha256(
+        json.dumps(cache_key_payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    cache_root = Path(cache_dir).expanduser().resolve()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    scores_path = cache_root / f"pathway_scores__{digest}.npy"
+    metadata_path = cache_root / f"pathway_scores__{digest}.json"
+    if scores_path.is_file() and metadata_path.is_file():
+        with metadata_path.open(encoding="utf-8") as handle:
+            cached_metadata = json.load(handle)
+        if cached_metadata == cache_key_payload:
+            scores = np.load(scores_path, allow_pickle=False)
+            expected_shape = (adata.n_obs, len(programs))
+            if scores.shape == expected_shape and np.isfinite(scores).all():
+                print(f"Reusing pathway score cache: {scores_path}", flush=True)
+                return ScoredData(
+                    adata,
+                    np.asarray(scores, dtype=np.float64),
+                    programs,
+                    list(programs),
+                    score_source,
+                )
+
+    scored = score_anndata(
         adata,
         programs_path,
         score_layer=score_layer,
@@ -291,6 +365,16 @@ def load_and_score(
         seed=seed,
         score_jobs=score_jobs,
     )
+    temporary_scores = scores_path.with_suffix(".npy.tmp")
+    temporary_metadata = metadata_path.with_suffix(".json.tmp")
+    with temporary_scores.open("wb") as handle:
+        np.save(handle, scored.scores, allow_pickle=False)
+    with temporary_metadata.open("w", encoding="utf-8") as handle:
+        json.dump(cache_key_payload, handle, sort_keys=True, indent=2)
+    os.replace(temporary_scores, scores_path)
+    os.replace(temporary_metadata, metadata_path)
+    print(f"Saved pathway score cache: {scores_path}", flush=True)
+    return scored
 
 
 def score_anndata(
@@ -349,64 +433,90 @@ def run_ols(
     reference: str,
     program_labels: Sequence[str],
 ) -> pd.DataFrame:
-    """Call bioconcord's reference-coded program regression unchanged.
+    """Fit Bioconcord's reference-coded one-way OLS model exactly.
 
-    Current bioconcord adds a constant: ``const`` is the reference mean and
-    every non-reference coefficient is the perturbation-minus-reference
-    contrast. The intercept is not emitted as a pathway test row.
+    Bioconcord constructs an intercept plus one dummy column per non-reference
+    perturbation, then calls statsmodels independently for every program.  For
+    this one-way design the same coefficients, residual variance, t statistics,
+    and p-values have a closed form.  Computing those shared sufficient
+    statistics once avoids repeatedly materializing and factorizing a very
+    large dummy matrix while preserving the fitted model:
+
+    * ``const`` is the reference mean;
+    * each coefficient is ``target mean - reference mean``;
+    * all contrasts use the common OLS residual variance with ``N - G``
+      residual degrees of freedom.
+
+    The intercept is not emitted as a pathway test row.
     """
     labels = validate_groups(labels, reference)
     y = np.asarray(scores, dtype=np.float64)
     if y.ndim != 2 or y.shape[0] != labels.size:
         raise ValueError("scores must be cells x programs and align with labels")
-    obs = pd.DataFrame({"pathway_group": labels})
-    for i, program in enumerate(program_labels):
-        obs[str(program)] = y[:, i]
-    score_adata = ad.AnnData(
-        X=np.zeros((len(labels), 1), dtype=np.float32),
-        obs=obs,
-        var=pd.DataFrame(index=["placeholder"]),
+    if y.shape[1] != len(program_labels):
+        raise ValueError("program_labels must align with score columns")
+    if not np.isfinite(y).all():
+        raise ValueError("OLS pathway scores contain NaN or infinite values")
+
+    groups, group_index = np.unique(labels, return_inverse=True)
+    counts = np.bincount(group_index).astype(np.int64)
+    n_groups = len(groups)
+    df_resid = len(labels) - n_groups
+    if df_resid <= 0:
+        raise ValueError(
+            f"OLS requires positive residual degrees of freedom; got {df_resid}"
+        )
+
+    sums = np.zeros((n_groups, y.shape[1]), dtype=np.float64)
+    sum_squares = np.zeros_like(sums)
+    np.add.at(sums, group_index, y)
+    np.add.at(sum_squares, group_index, y * y)
+    means = sums / counts[:, None]
+
+    # Algebraically sum (y - group_mean)^2 without constructing the full
+    # cell-by-program residual matrix.  Clamp tiny negative round-off to zero.
+    within_sse = np.maximum(
+        sum_squares - (sums * sums) / counts[:, None],
+        0.0,
+    ).sum(axis=0)
+    residual_variance = within_sse / float(df_resid)
+
+    ref_idx = int(np.flatnonzero(groups == reference)[0])
+    target_idx = np.flatnonzero(groups != reference)
+    targets = groups[target_idx].astype(str)
+    effects = means[target_idx] - means[ref_idx]
+    standard_errors = np.sqrt(
+        residual_variance[None, :]
+        * (
+            1.0 / counts[target_idx, None]
+            + 1.0 / float(counts[ref_idx])
+        )
     )
-    bc = _bioconcord_module()
-    wide = bc.run_program_regression(
-        score_adata,
-        perturbationsColumn="pathway_group",
-        referenceLevel=reference,
-        pathways=list(program_labels),
+    with np.errstate(divide="ignore", invalid="ignore"):
+        statistics = effects / standard_errors
+    zero_se = standard_errors == 0
+    statistics[zero_se & (effects > 0)] = np.inf
+    statistics[zero_se & (effects < 0)] = -np.inf
+    statistics[zero_se & (effects == 0)] = np.nan
+    p_values = 2.0 * stats.t.sf(np.abs(statistics), df=df_resid)
+
+    n_targets = len(targets)
+    n_programs = len(program_labels)
+    frame = pd.DataFrame(
+        {
+            "method": "ols",
+            "target": np.repeat(targets, n_programs),
+            "program": np.tile(np.asarray(program_labels, dtype=str), n_targets),
+            "effect": effects.ravel(),
+            "mean_difference": effects.ravel(),
+            "statistic": statistics.ravel(),
+            "standard_error": standard_errors.ravel(),
+            "p_value": p_values.ravel(),
+            "n_target": np.repeat(counts[target_idx], n_programs),
+            "n_reference": int(counts[ref_idx]),
+        }
     )
-    ref_mean = y[labels == reference].mean(axis=0)
-    df_resid = len(labels) - len(set(labels))
-    rows: list[dict] = []
-    targets = [str(value) for value in wide.index if str(value) != "const"]
-    for target in targets:
-        target_mask = labels == target
-        for i, program in enumerate(program_labels):
-            coefficient = float(wide.loc[target, f"{program}_coef"])
-            p_value = float(wide.loc[target, f"{program}_pval"])
-            statistic = float(
-                np.sign(coefficient)
-                * stats.t.isf(max(p_value, np.finfo(float).tiny) / 2, df=df_resid)
-            )
-            standard_error = (
-                abs(coefficient / statistic)
-                if np.isfinite(statistic) and statistic != 0
-                else np.nan
-            )
-            rows.append(
-                {
-                    "method": "ols",
-                    "target": target,
-                    "program": program,
-                    "effect": coefficient,
-                    "mean_difference": float(y[target_mask, i].mean() - ref_mean[i]),
-                    "statistic": statistic,
-                    "standard_error": standard_error,
-                    "p_value": p_value,
-                    "n_target": int(target_mask.sum()),
-                    "n_reference": int(np.sum(labels == reference)),
-                }
-            )
-    return _bh_by_target(pd.DataFrame(rows))
+    return _bh_by_target(frame)
 
 
 def run_pdex_mwu(
@@ -597,6 +707,285 @@ def average_split_effects(
     return averaged
 
 
+def _variant_output_path(path: str, variant: str, extension: str = ".png") -> str:
+    """Insert an output variant before the terminal ``__dataset`` tag."""
+    stem = os.path.splitext(path)[0]
+    prefix, separator, dataset = stem.rpartition("__")
+    if separator:
+        return f"{prefix}_{variant}__{dataset}{extension}"
+    return f"{stem}_{variant}{extension}"
+
+
+def _finite_matrix_groups(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return every finite diagonal and ordered off-diagonal matrix cell."""
+    matrix = np.asarray(matrix, dtype=float)
+    diagonal_mask = np.eye(matrix.shape[0], dtype=bool)
+    diagonal = matrix[diagonal_mask]
+    off_diagonal = matrix[~diagonal_mask]
+    return (
+        diagonal[np.isfinite(diagonal)],
+        off_diagonal[np.isfinite(off_diagonal)],
+    )
+
+
+def _distribution_summary(
+    method: str, metric: str, group: str, values: np.ndarray
+) -> dict[str, object]:
+    """Return one CSV-ready distribution summary."""
+    values = np.asarray(values, dtype=float)
+    if values.size == 0:
+        return {
+            "method": method, "metric": metric, "group": group, "n": 0,
+            "mean": np.nan, "std": np.nan, "min": np.nan, "q05": np.nan,
+            "q25": np.nan, "median": np.nan, "q75": np.nan,
+            "q95": np.nan, "max": np.nan,
+        }
+    q05, q25, median, q75, q95 = np.quantile(
+        values, [0.05, 0.25, 0.50, 0.75, 0.95]
+    )
+    return {
+        "method": method, "metric": metric, "group": group,
+        "n": int(values.size), "mean": float(np.mean(values)),
+        "std": float(np.std(values)), "min": float(np.min(values)),
+        "q05": float(q05), "q25": float(q25), "median": float(median),
+        "q75": float(q75), "q95": float(q95), "max": float(np.max(values)),
+    }
+
+
+def plot_correlation_distribution_boxplots(
+    matrices: dict[str, tuple[np.ndarray, np.ndarray]],
+    path: str,
+    *,
+    methods: Sequence[str],
+    title: str,
+    unit: str,
+    seed: int = 0,
+) -> str:
+    """Plot every finite diagonal/off-diagonal Spearman and Pearson cell."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(
+        len(methods), 2,
+        figsize=(11.0, 5.5 * len(methods)),
+        sharey=True,
+        squeeze=False,
+    )
+    colors = ("#D95F59", "#4C78A8")
+    rng = np.random.default_rng(seed)
+    summaries = []
+    for row, method in enumerate(methods):
+        for column, (metric, matrix) in enumerate(
+            zip(("Spearman", "Pearson"), matrices[method])
+        ):
+            ax = axes[row, column]
+            diagonal, off_diagonal = _finite_matrix_groups(matrix)
+            summaries.extend(
+                (
+                    _distribution_summary(
+                        method, metric, "diagonal", diagonal
+                    ),
+                    _distribution_summary(
+                        method, metric, "off_diagonal", off_diagonal
+                    ),
+                )
+            )
+            values_for_box = [
+                values if values.size else np.asarray([np.nan])
+                for values in (diagonal, off_diagonal)
+            ]
+            boxes = ax.boxplot(
+                values_for_box,
+                tick_labels=[
+                    f"Diagonal\n(within {unit})",
+                    f"Off-diagonal\n(cross {unit})",
+                ],
+                patch_artist=True,
+                showfliers=False,
+                whis=(5, 95),
+                widths=0.58,
+                medianprops={"color": "black", "linewidth": 1.8},
+                whiskerprops={"linewidth": 1.1},
+                capprops={"linewidth": 1.1},
+            )
+            for patch, color in zip(boxes["boxes"], colors):
+                patch.set_facecolor(color)
+                patch.set_alpha(0.8)
+            for position, values, color in zip(
+                (1, 2), (diagonal, off_diagonal), colors
+            ):
+                if values.size:
+                    jitter = rng.uniform(
+                        position - 0.17, position + 0.17, size=values.size
+                    )
+                    ax.scatter(
+                        jitter,
+                        values,
+                        s=5 if position == 1 else 1,
+                        color=color,
+                        alpha=(
+                            0.28 if position == 1
+                            else max(0.002, min(0.055, 1_000 / values.size))
+                        ),
+                        edgecolors="none",
+                        rasterized=True,
+                        zorder=3,
+                    )
+                median = float(np.median(values)) if values.size else np.nan
+                mean = float(np.mean(values)) if values.size else np.nan
+                ax.text(
+                    position,
+                    -0.96,
+                    f"n={values.size:,}\nmedian={median:.2f}\nmean={mean:.2f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=9,
+                    bbox={
+                        "facecolor": "white",
+                        "edgecolor": "none",
+                        "alpha": 0.82,
+                    },
+                )
+            ax.axhline(0, color="#777777", linestyle="--", linewidth=1)
+            ax.set_ylim(-1.02, 1.02)
+            ax.grid(axis="y", color="#dddddd", linewidth=0.7)
+            ax.set_title(f"{method} — {metric}")
+        axes[row, 0].set_ylabel("Correlation")
+    fig.suptitle(
+        f"{title}\n"
+        "boxes = IQR; whiskers = 5th–95th percentiles; "
+        "points = every finite repeat-averaged matrix cell",
+        fontsize=12,
+    )
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    csv_path = os.path.splitext(path)[0] + ".csv"
+    pd.DataFrame(summaries).to_csv(csv_path, index=False)
+    print(f"Saved correlation distribution boxplots: {path}")
+    print(f"Saved correlation distribution summaries: {csv_path}")
+    return path
+
+
+def plot_jaccard_distribution_boxplots(
+    matrices: dict[str, np.ndarray],
+    matrix_path: str,
+    *,
+    methods: Sequence[str],
+    title: str,
+    unit: str,
+    seed: int = 0,
+) -> dict[str, str]:
+    """Emit separate diagonal/off-diagonal Jaccard boxplots with all points."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    outputs = {}
+    colors = plt.get_cmap("tab10").colors
+    rng = np.random.default_rng(seed)
+    for group, group_title in (
+        ("diagonal", f"within-{unit} split reproducibility"),
+        ("off_diagonal", f"cross-{unit} similarity"),
+    ):
+        path = _variant_output_path(
+            matrix_path, f"jaccard_{group}_boxplot"
+        )
+        values_by_method = {}
+        summaries = []
+        for method in methods:
+            diagonal, off_diagonal = _finite_matrix_groups(matrices[method])
+            values = diagonal if group == "diagonal" else off_diagonal
+            values_by_method[method] = values
+            summaries.append(
+                _distribution_summary(method, "FDR-set Jaccard", group, values)
+            )
+        fig, ax = plt.subplots(
+            figsize=(max(6.8, 2.0 + 1.8 * len(methods)), 6.2)
+        )
+        box_values = [
+            values_by_method[method]
+            if values_by_method[method].size
+            else np.asarray([np.nan])
+            for method in methods
+        ]
+        boxes = ax.boxplot(
+            box_values,
+            tick_labels=list(methods),
+            patch_artist=True,
+            showfliers=False,
+            whis=(5, 95),
+            widths=0.58,
+            medianprops={"color": "black", "linewidth": 1.8},
+            whiskerprops={"linewidth": 1.1},
+            capprops={"linewidth": 1.1},
+        )
+        for index, (patch, method) in enumerate(
+            zip(boxes["boxes"], methods)
+        ):
+            color = colors[index % len(colors)]
+            patch.set_facecolor(color)
+            patch.set_alpha(0.78)
+            values = values_by_method[method]
+            if values.size:
+                jitter = rng.uniform(
+                    index + 1 - 0.18,
+                    index + 1 + 0.18,
+                    size=values.size,
+                )
+                ax.scatter(
+                    jitter,
+                    values,
+                    s=5 if group == "diagonal" else 1,
+                    color=color,
+                    alpha=(
+                        0.35 if group == "diagonal"
+                        else max(0.002, min(0.06, 1_000 / values.size))
+                    ),
+                    edgecolors="none",
+                    rasterized=True,
+                    zorder=3,
+                )
+            median = float(np.median(values)) if values.size else np.nan
+            mean = float(np.mean(values)) if values.size else np.nan
+            ax.text(
+                index + 1,
+                0.02,
+                f"n={values.size:,}\nmedian={median:.2f}\nmean={mean:.2f}",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+                bbox={
+                    "facecolor": "white",
+                    "edgecolor": "none",
+                    "alpha": 0.82,
+                },
+            )
+        ax.set_ylim(-0.02, 1.02)
+        ax.set_ylabel("Significant-pathway Jaccard similarity")
+        ax.grid(axis="y", color="#dddddd", linewidth=0.7)
+        ax.set_title(
+            f"{title}\nFDR-set Jaccard — {group_title}\n"
+            "boxes = IQR; whiskers = 5th–95th percentiles; "
+            "points = every finite repeat-averaged matrix cell",
+            fontsize=11,
+        )
+        fig.tight_layout()
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        fig.savefig(path, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+        csv_path = os.path.splitext(path)[0] + ".csv"
+        pd.DataFrame(summaries).to_csv(csv_path, index=False)
+        print(f"Saved Jaccard {group} boxplot: {path}")
+        print(f"Saved Jaccard {group} summary: {csv_path}")
+        outputs[group] = path
+    return outputs
+
+
 def plot_target_corr_matrix(
     repeat_results: list[dict[str, dict[str, pd.DataFrame]]],
     path: str,
@@ -606,6 +995,7 @@ def plot_target_corr_matrix(
     group_separator: str | None = None,
     methods_to_plot: Sequence[str] | None = None,
     fdr_threshold: float | None = None,
+    emit_distribution_boxplots: bool = False,
 ) -> None:
     """Plot repeat-mean A-by-B correlations on one cross-method basis.
 
@@ -724,6 +1114,8 @@ def plot_target_corr_matrix(
                     ).loc[targets, programs]
 
     matrices: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    jaccard_matrices: dict[str, np.ndarray] = {}
+    jaccard_counts: dict[str, np.ndarray] = {}
     feature_counts = np.full(
         (len(repeat_results), len(targets), len(targets)), len(programs), dtype=int
     )
@@ -753,6 +1145,7 @@ def plot_target_corr_matrix(
     for method in methods:
         repeat_spearman = []
         repeat_pearson = []
+        repeat_jaccard = []
         for repeat_index in range(len(repeat_results)):
             left = effects[(repeat_index, "A", method)]
             right = effects[(repeat_index, "B", method)]
@@ -768,11 +1161,45 @@ def plot_target_corr_matrix(
                     pearson_matrix[i, j] = safe_pearson(effects_a, effects_b)
             repeat_spearman.append(spearman_matrix)
             repeat_pearson.append(pearson_matrix)
+            if fdr_threshold is not None:
+                significant_a = (
+                    fdrs[(repeat_index, "A", method)].to_numpy(float)
+                    <= fdr_threshold
+                )
+                significant_b = (
+                    fdrs[(repeat_index, "B", method)].to_numpy(float)
+                    <= fdr_threshold
+                )
+                intersection = (
+                    significant_a.astype(np.float32)
+                    @ significant_b.astype(np.float32).T
+                )
+                count_a = significant_a.sum(axis=1, dtype=np.int32)
+                count_b = significant_b.sum(axis=1, dtype=np.int32)
+                union = (
+                    count_a[:, None] + count_b[None, :] - intersection
+                )
+                jaccard_matrix = np.ones(
+                    intersection.shape, dtype=np.float32
+                )
+                np.divide(
+                    intersection,
+                    union,
+                    out=jaccard_matrix,
+                    where=union > 0,
+                )
+                repeat_jaccard.append(jaccard_matrix)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
             matrices[method] = (
                 np.nanmean(np.stack(repeat_spearman), axis=0),
                 np.nanmean(np.stack(repeat_pearson), axis=0),
+            )
+        if repeat_jaccard:
+            stack = np.stack(repeat_jaccard)
+            jaccard_matrices[method] = np.mean(stack, axis=0)
+            jaccard_counts[method] = np.isfinite(stack).sum(
+                axis=0, dtype=np.uint16
             )
 
     if sort_by_diagonal:
@@ -810,10 +1237,26 @@ def plot_target_corr_matrix(
             np.nan if fdr_threshold is None else fdr_threshold, dtype=float
         ),
     }
+    if fdr_threshold is not None:
+        matrix_archive["jaccard_definition"] = np.asarray(
+            "cell(i,j)=J(significant pathways in split A unit i, significant "
+            "pathways in split B unit j), calculated within method and repeat; "
+            "both-empty sets have Jaccard 1; repeat matrices are averaged "
+            "cellwise",
+            dtype=str,
+        )
+        matrix_archive["fdr_union_definition"] = np.asarray(
+            "correlation cell(i,j) uses the union of pathways with FDR at or "
+            "below the threshold in either compared profile by any basis method",
+            dtype=str,
+        )
+    ordered_matrices: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    ordered_jaccard: dict[str, np.ndarray] = {}
     for ax, method in zip(axes[0], plotted_methods):
         spearman, pearson = matrices[method]
         spearman = spearman[np.ix_(order, order)]
         pearson = pearson[np.ix_(order, order)]
+        ordered_matrices[method] = (spearman, pearson)
         cell_counts = {target: [] for target in targets}
         for result in repeat_results:
             left_frame = result["A"][method]
@@ -871,6 +1314,13 @@ def plot_target_corr_matrix(
         matrix_archive[f"programs__{method}"] = np.asarray(programs, dtype=str)
         matrix_archive[f"spearman__{method}"] = spearman
         matrix_archive[f"pearson__{method}"] = pearson
+        if fdr_threshold is not None:
+            jaccard_matrix = jaccard_matrices[method][np.ix_(order, order)]
+            ordered_jaccard[method] = jaccard_matrix
+            matrix_archive[f"jaccard__{method}"] = jaccard_matrix
+            matrix_archive[f"finite_jaccard_repeats__{method}"] = (
+                jaccard_counts[method][np.ix_(order, order)]
+            )
         ax.set_title(
             f"{method}\n"
             f"Spearman: diag={spearman_diagonal:.2f}, off={spearman_offdiagonal:.2f}; "
@@ -892,6 +1342,25 @@ def plot_target_corr_matrix(
     matrix_path = os.path.splitext(path)[0] + ".npz"
     np.savez_compressed(matrix_path, **matrix_archive)
     print(f"Saved correlation values: {matrix_path}")
+    if emit_distribution_boxplots:
+        if fdr_threshold is None:
+            raise ValueError(
+                "Pair-specific distribution boxplots require fdr_threshold"
+            )
+        plot_correlation_distribution_boxplots(
+            ordered_matrices,
+            _variant_output_path(path, "correlation_boxplots"),
+            methods=plotted_methods,
+            title=f"{title} — shared FDR <= {fdr_threshold:g} union",
+            unit=unit,
+        )
+        plot_jaccard_distribution_boxplots(
+            ordered_jaccard,
+            path,
+            methods=plotted_methods,
+            title=f"{title} — FDR <= {fdr_threshold:g}",
+            unit=unit,
+        )
 
 
 def compare_methods(

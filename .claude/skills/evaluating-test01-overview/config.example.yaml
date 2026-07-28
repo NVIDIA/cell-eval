@@ -20,6 +20,8 @@ lfc_threshold: 0.1            # gene is significant if |LFC| >= this (log2)
 min_cells_per_group: 20       # skip groups with fewer cells during subsampling
 counts_layer: null            # layer with raw integer counts; null = use .X
 num_threads: 8
+pydeseq2_workers: 0         # 0 = bounded automatic target-vs-control process count
+pydeseq2_threads: 1         # threads per PyDESeq2 fit; keep 1 when workers > 1
 non_parametric_engine: pdex  # pdex = Arc pdex; rsc = RAPIDS GPU Wilcoxon
 seed: 0
 outdir: .

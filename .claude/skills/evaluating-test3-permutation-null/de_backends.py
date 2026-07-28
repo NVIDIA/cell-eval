@@ -8,7 +8,11 @@ skills.
 
 from __future__ import annotations
 
+import gc
+import hashlib
 import logging
+import multiprocessing
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import import_module
@@ -35,6 +39,13 @@ _PYDESEQ2_KWARG_KEYS = frozenset(
         "fill_filtered",
         "dds_kwargs",
         "stats_kwargs",
+        "fit_strategy",
+        "max_joint_samples",
+        "workers",
+        "checkpoint_dir",
+        "resume",
+        "continue_on_error",
+        "result_mode",
     }
 )
 
@@ -45,6 +56,19 @@ class PyDESeq2Options:
     fill_filtered: bool
     dds_kwargs: dict[str, Any]
     stats_kwargs: dict[str, Any]
+    fit_strategy: str
+    max_joint_samples: int
+    workers: int
+    checkpoint_dir: str | None
+    resume: bool
+    continue_on_error: bool
+    result_mode: str
+
+
+_PAIRWISE_ADATA: ad.AnnData | None = None
+_PAIRWISE_SETTINGS: dict[str, Any] | None = None
+_PAIRWISE_CONTROL_COUNTS: pd.DataFrame | None = None
+_PAIRWISE_CONTROL_METADATA: pd.DataFrame | None = None
 
 
 def _yaml_safe(value: Any) -> Any:
@@ -198,26 +222,36 @@ def compute_pdex_de(
     """Run Arc pdex directly, or its optional RAPIDS Wilcoxon counterpart."""
     options = dict(pdex_kwargs or {})
     engine = str(options.pop("engine", "pdex"))
+    result_mode = str(options.pop("result_mode", "all"))
+    copy_input = bool(options.pop("copy", True))
+    if result_mode not in {"all", "target_only"}:
+        raise ValueError("pdex result_mode must be 'all' or 'target_only'")
     if engine == "rsc":
-        return _compute_rsc_de(
+        result = _compute_rsc_de(
             adata=adata,
             reference=reference,
             groupby=groupby,
+            copy_input=copy_input,
         )
-    if engine != "pdex":
+    elif engine != "pdex":
         raise ValueError(
             f"Unknown non-parametric engine {engine!r}; expected 'pdex' or 'rsc'"
         )
-
-    options = _build_pdex_kwargs(
-        reference=reference,
-        groupby=groupby,
-        threads=threads,
-        allow_discrete=allow_discrete,
-        pdex_kwargs=options,
-    )
-    logger.info("Using Arc pdex with options: %s", options)
-    return cast(pl.DataFrame, pdex(adata=adata, mode="ref", **options))
+    else:
+        options = _build_pdex_kwargs(
+            reference=reference,
+            groupby=groupby,
+            threads=threads,
+            allow_discrete=allow_discrete,
+            pdex_kwargs=options,
+        )
+        logger.info("Using Arc pdex with options: %s", options)
+        result = cast(pl.DataFrame, pdex(adata=adata, mode="ref", **options))
+    if result_mode == "target_only":
+        result = result.filter(
+            pl.col("feature").cast(pl.Utf8) == pl.col("target").cast(pl.Utf8)
+        )
+    return result
 
 
 def _looks_raw_integer(matrix: Any) -> bool:
@@ -237,6 +271,7 @@ def _compute_rsc_de(
     adata: ad.AnnData,
     reference: str,
     groupby: str,
+    copy_input: bool = True,
 ) -> pl.DataFrame:
     try:
         import rapids_singlecell as rsc
@@ -253,11 +288,37 @@ def _compute_rsc_de(
     levels = sorted(set(labels.tolist()))
     if reference not in levels:
         raise ValueError(f"Reference {reference!r} not found in adata.obs[{groupby!r}]")
-    groups = [level for level in levels if level != reference]
+    group_sizes = pd.Series(labels, copy=False).value_counts()
+    if int(group_sizes.get(reference, 0)) < 2:
+        raise ValueError(
+            f"Reference {reference!r} has fewer than two cells and cannot support "
+            "RSC Wilcoxon differential expression"
+        )
+    dropped_groups = [
+        level
+        for level in levels
+        if level != reference and int(group_sizes.get(level, 0)) < 2
+    ]
+    if dropped_groups:
+        logger.warning(
+            "RSC omitted %d target group(s) with fewer than two cells: %s",
+            len(dropped_groups),
+            ", ".join(dropped_groups),
+        )
+    groups = [
+        level
+        for level in levels
+        if level != reference and int(group_sizes.get(level, 0)) >= 2
+    ]
     if not groups:
         raise ValueError("RSC did not find a non-reference group")
 
-    work = adata.copy()
+    if dropped_groups:
+        supported = np.isin(labels, [reference, *groups])
+        work = adata[supported].copy()
+        labels = labels[supported]
+    else:
+        work = adata.copy() if copy_input else adata
     work.obs[groupby] = pd.Categorical(
         labels,
         categories=[reference, *groups],
@@ -310,7 +371,13 @@ def compute_pydeseq2_de(
     replicate_col: str | None = None,
     pydeseq2_kwargs: Mapping[str, Any] | None = None,
 ) -> pl.DataFrame:
-    """Pseudobulk cells by replicate, then run scverse PyDESeq2 directly."""
+    """Pseudobulk cells by replicate, then run scverse PyDESeq2 directly.
+
+    Large multi-condition inputs automatically use independent target-versus-
+    reference fits.  This avoids materialising one enormous samples × genes
+    DESeq2 object, reuses the reference pseudobulks, bounds worker memory, and
+    optionally checkpoints every completed contrast.
+    """
     try:
         DeseqDataSet = getattr(import_module("pydeseq2.dds"), "DeseqDataSet")
         DeseqStats = getattr(import_module("pydeseq2.ds"), "DeseqStats")
@@ -338,6 +405,51 @@ def compute_pydeseq2_de(
     stats_kwargs.setdefault("quiet", True)
     stats_kwargs.setdefault("n_cpus", threads)
 
+    perturbations = sorted(
+        value
+        for value in set(_obs_str_values(adata, groupby).tolist())
+        if value != reference
+    )
+    if not perturbations:
+        raise ValueError("PyDESeq2 did not find any non-reference perturbations")
+    sample_count = (
+        pd.DataFrame(
+            {
+                groupby: _obs_str_values(adata, groupby),
+                replicate_col: _obs_str_values(adata, replicate_col),
+            }
+        )
+        .drop_duplicates()
+        .shape[0]
+    )
+    strategy = options.fit_strategy
+    if strategy == "auto":
+        strategy = (
+            "pairwise"
+            if sample_count > options.max_joint_samples
+            else "joint"
+        )
+    if strategy == "pairwise":
+        logger.info(
+            "Using pairwise PyDESeq2 fits for %d contrasts (%d joint "
+            "pseudobulk samples would exceed max_joint_samples=%d)",
+            len(perturbations),
+            sample_count,
+            options.max_joint_samples,
+        )
+        return _compute_pydeseq2_pairwise(
+            adata=adata,
+            reference=reference,
+            groupby=groupby,
+            threads=threads,
+            counts_layer=counts_layer,
+            replicate_col=replicate_col,
+            perturbations=perturbations,
+            options=options,
+            dds_kwargs=dds_kwargs,
+            stats_kwargs=stats_kwargs,
+        )
+
     counts, metadata = build_pydeseq2_inputs(
         adata=adata,
         groupby=groupby,
@@ -351,37 +463,589 @@ def compute_pydeseq2_de(
         counts.shape[0],
         counts.shape[1],
     )
-    dds = DeseqDataSet(counts=counts, metadata=metadata, **dds_kwargs)
-    dds.deseq2()
-
-    frames: list[pl.DataFrame] = []
-    perturbations = sorted(
-        value
-        for value in metadata[groupby].astype(str).unique()
-        if value != reference
+    frames = _fit_pydeseq2_counts(
+        counts=counts,
+        metadata=metadata,
+        groupby=groupby,
+        reference=reference,
+        perturbations=perturbations,
+        fill_filtered=options.fill_filtered,
+        dds_kwargs=dds_kwargs,
+        stats_kwargs=stats_kwargs,
+        DeseqDataSet=DeseqDataSet,
+        DeseqStats=DeseqStats,
     )
-    for perturbation in perturbations:
-        logger.info(
-            "Running PyDESeq2 contrast %s vs %s",
-            perturbation,
-            reference,
+    if not frames:
+        raise ValueError("PyDESeq2 did not produce any perturbation contrasts")
+    result = pl.concat(frames)
+    if options.result_mode == "target_only":
+        result = result.filter(
+            pl.col("feature").cast(pl.Utf8) == pl.col("target").cast(pl.Utf8)
         )
+    return result
+
+
+def _fit_pydeseq2_counts(
+    *,
+    counts: pd.DataFrame,
+    metadata: pd.DataFrame,
+    groupby: str,
+    reference: str,
+    perturbations: list[str],
+    fill_filtered: bool,
+    dds_kwargs: Mapping[str, Any],
+    stats_kwargs: Mapping[str, Any],
+    DeseqDataSet: Any,
+    DeseqStats: Any,
+) -> list[pl.DataFrame]:
+    dds = DeseqDataSet(
+        counts=counts,
+        metadata=metadata,
+        **dict(dds_kwargs),
+    )
+    dds.deseq2()
+    frames: list[pl.DataFrame] = []
+    for perturbation in perturbations:
+        logger.info("Running PyDESeq2 contrast %s vs %s", perturbation, reference)
         stats = DeseqStats(
             dds,
             contrast=[groupby, perturbation, reference],
-            **stats_kwargs,
+            **dict(stats_kwargs),
         )
         stats.summary()
         frames.append(
             normalize_pydeseq2_results(
                 stats.results_df,
                 target=perturbation,
-                fill_filtered=options.fill_filtered,
+                fill_filtered=fill_filtered,
             )
         )
-    if not frames:
-        raise ValueError("PyDESeq2 did not produce any perturbation contrasts")
-    return pl.concat(frames)
+        del stats
+    del dds
+    gc.collect()
+    return frames
+
+
+def _condition_pseudobulks(
+    *,
+    adata: ad.AnnData,
+    condition: str,
+    groupby: str,
+    replicate_col: str,
+    counts_layer: str | None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    labels = _obs_str_values(adata, groupby)
+    replicates = _obs_str_values(adata, replicate_col)
+    matrix = _get_count_matrix(adata, counts_layer=counts_layer)
+    condition_rows = np.flatnonzero(labels == condition)
+    if condition_rows.size == 0:
+        raise ValueError(f"Condition {condition!r} has no cells")
+
+    rows: list[np.ndarray] = []
+    metadata_rows: list[dict[str, str]] = []
+    for replicate in sorted(set(replicates[condition_rows].tolist())):
+        indices = condition_rows[replicates[condition_rows] == replicate]
+        context = f"{replicate}/{condition}"
+        counts = _sum_count_rows(matrix, indices, context=context)
+        rows.append(_validate_counts(counts, context=context))
+        metadata_rows.append(
+            {
+                "sample": f"{replicate}__{condition}",
+                replicate_col: str(replicate),
+                groupby: str(condition),
+            }
+        )
+    frame = pd.DataFrame(
+        np.vstack(rows),
+        index=pd.Index([item["sample"] for item in metadata_rows], dtype=str),
+        columns=np.asarray(adata.var_names, dtype=str),
+    )
+    metadata = pd.DataFrame(metadata_rows).set_index("sample")
+    return frame, metadata
+
+
+def _pairwise_counts_for_target(target: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if (
+        _PAIRWISE_ADATA is None
+        or _PAIRWISE_SETTINGS is None
+        or _PAIRWISE_CONTROL_COUNTS is None
+        or _PAIRWISE_CONTROL_METADATA is None
+    ):
+        raise RuntimeError("Pairwise PyDESeq2 worker state is not initialized")
+    settings = _PAIRWISE_SETTINGS
+    target_counts, target_metadata = _condition_pseudobulks(
+        adata=_PAIRWISE_ADATA,
+        condition=target,
+        groupby=settings["groupby"],
+        replicate_col=settings["replicate_col"],
+        counts_layer=settings["counts_layer"],
+    )
+    counts = pd.concat([_PAIRWISE_CONTROL_COUNTS, target_counts], axis=0)
+    metadata = pd.concat(
+        [_PAIRWISE_CONTROL_METADATA, target_metadata],
+        axis=0,
+    )
+    min_total_count = int(settings["min_total_count"])
+    if min_total_count > 0:
+        keep = counts.sum(axis=0).to_numpy() >= min_total_count
+        counts = counts.loc[:, keep]
+        if counts.shape[1] == 0:
+            raise ValueError(
+                f"{target}: no genes remain after "
+                f"min_total_count={min_total_count}"
+            )
+    _validate_pydeseq2_design(
+        metadata,
+        groupby=settings["groupby"],
+        reference=settings["reference"],
+    )
+    return counts, metadata
+
+
+def _pairwise_pydeseq2_worker(target: str) -> tuple[str, pl.DataFrame]:
+    if _PAIRWISE_SETTINGS is None:
+        raise RuntimeError("Pairwise PyDESeq2 worker state is not initialized")
+    DeseqDataSet = getattr(import_module("pydeseq2.dds"), "DeseqDataSet")
+    DeseqStats = getattr(import_module("pydeseq2.ds"), "DeseqStats")
+    counts, metadata = _pairwise_counts_for_target(target)
+    frames = _fit_pydeseq2_counts(
+        counts=counts,
+        metadata=metadata,
+        groupby=_PAIRWISE_SETTINGS["groupby"],
+        reference=_PAIRWISE_SETTINGS["reference"],
+        perturbations=[target],
+        fill_filtered=bool(_PAIRWISE_SETTINGS["fill_filtered"]),
+        dds_kwargs=_PAIRWISE_SETTINGS["dds_kwargs"],
+        stats_kwargs=_PAIRWISE_SETTINGS["stats_kwargs"],
+        DeseqDataSet=DeseqDataSet,
+        DeseqStats=DeseqStats,
+    )
+    frame = frames[0]
+    if _PAIRWISE_SETTINGS["result_mode"] == "target_only":
+        frame = frame.filter(pl.col("feature").cast(pl.Utf8) == target)
+    return target, frame
+
+
+def _spawned_pairwise_pydeseq2_worker(
+    payload: tuple[
+        str,
+        pd.DataFrame,
+        pd.DataFrame,
+        str,
+        str,
+        bool,
+        dict[str, Any],
+        dict[str, Any],
+        str,
+    ],
+) -> tuple[str, pl.DataFrame | None, str | None]:
+    """Fit one self-contained contrast in a clean spawned process.
+
+    Passing only the already-pseudobulked pair avoids pickling the full
+    AnnData and avoids inheriting BLAS/Numba locks from a forked parent.
+    """
+    (
+        target,
+        counts,
+        metadata,
+        groupby,
+        reference,
+        fill_filtered,
+        dds_kwargs,
+        stats_kwargs,
+        result_mode,
+    ) = payload
+    try:
+        DeseqDataSet = getattr(import_module("pydeseq2.dds"), "DeseqDataSet")
+        DeseqStats = getattr(import_module("pydeseq2.ds"), "DeseqStats")
+        frame = _fit_pydeseq2_counts(
+            counts=counts,
+            metadata=metadata,
+            groupby=groupby,
+            reference=reference,
+            perturbations=[target],
+            fill_filtered=fill_filtered,
+            dds_kwargs=dds_kwargs,
+            stats_kwargs=stats_kwargs,
+            DeseqDataSet=DeseqDataSet,
+            DeseqStats=DeseqStats,
+        )[0]
+        if result_mode == "target_only":
+            frame = frame.filter(pl.col("feature").cast(pl.Utf8) == target)
+        return target, frame, None
+    except Exception as error:  # noqa: BLE001
+        return target, None, f"{type(error).__name__}: {error}"
+
+
+def _spawned_pairwise_payloads(
+    targets: list[str],
+) -> Any:
+    if _PAIRWISE_SETTINGS is None:
+        raise RuntimeError("Pairwise PyDESeq2 worker state is not initialized")
+    settings = _PAIRWISE_SETTINGS
+    for target in targets:
+        counts, metadata = _pairwise_counts_for_target(target)
+        yield (
+            target,
+            counts,
+            metadata,
+            settings["groupby"],
+            settings["reference"],
+            bool(settings["fill_filtered"]),
+            dict(settings["dds_kwargs"]),
+            dict(settings["stats_kwargs"]),
+            str(settings["result_mode"]),
+        )
+
+
+def _available_memory_bytes() -> int | None:
+    try:
+        fields: dict[str, int] = {}
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                key, value = line.split(":", 1)
+                fields[key] = int(value.strip().split()[0]) * 1024
+        return fields.get("MemAvailable")
+    except (OSError, ValueError):
+        return None
+
+
+def hardware_worker_limit(
+    *,
+    requested: int,
+    threads_per_worker: int,
+    worker_memory_bytes: int,
+    max_auto_workers: int = 16,
+    memory_fraction: float = 0.60,
+) -> int:
+    """Resolve a CPU- and RAM-safe process count.
+
+    ``requested=0`` enables automatic selection. Explicit requests are still
+    capped so a portable skill command cannot oversubscribe a smaller host.
+    """
+    if requested < 0:
+        raise ValueError("requested workers must be at least 0")
+    if threads_per_worker < 1:
+        raise ValueError("threads_per_worker must be at least 1")
+    if worker_memory_bytes < 1:
+        raise ValueError("worker_memory_bytes must be positive")
+    cpus = (
+        len(os.sched_getaffinity(0))
+        if hasattr(os, "sched_getaffinity")
+        else (os.cpu_count() or 1)
+    )
+    cpu_cap = max(1, cpus // threads_per_worker)
+    available = _available_memory_bytes()
+    memory_cap = (
+        max(1, int(available * memory_fraction) // worker_memory_bytes)
+        if available is not None
+        else 1
+    )
+    desired = min(max_auto_workers, cpu_cap) if requested == 0 else requested
+    selected = max(1, min(desired, cpu_cap, memory_cap))
+    logger.info(
+        "Hardware worker plan: requested=%d, selected=%d, cpu_cap=%d, "
+        "memory_cap=%d, threads/worker=%d, memory/worker=%.2f GiB",
+        requested,
+        selected,
+        cpu_cap,
+        memory_cap,
+        threads_per_worker,
+        worker_memory_bytes / 1024**3,
+    )
+    return selected
+
+
+def _safe_pairwise_workers(
+    *,
+    requested: int,
+    threads: int,
+    adata: ad.AnnData,
+    groupby: str,
+    reference: str,
+) -> int:
+    labels = _obs_str_values(adata, groupby)
+    control_cells = int(np.count_nonzero(labels == reference))
+    largest_target = max(
+        (int(np.count_nonzero(labels == value)) for value in set(labels) - {reference}),
+        default=0,
+    )
+    itemsize = np.dtype(getattr(adata.X, "dtype", np.float64)).itemsize
+    pair_bytes = max(
+        512 * 1024**2,
+        int((control_cells + largest_target) * adata.n_vars * itemsize * 2.5),
+    )
+    workers = hardware_worker_limit(
+        requested=requested,
+        threads_per_worker=threads,
+        worker_memory_bytes=pair_bytes,
+        max_auto_workers=16,
+        memory_fraction=0.60,
+    )
+    return workers
+
+
+def _checkpoint_path(checkpoint_dir: Path, target: str) -> Path:
+    digest = hashlib.sha256(target.encode("utf-8")).hexdigest()[:20]
+    return checkpoint_dir / f"contrast_{digest}.parquet"
+
+
+def _prepare_checkpoint_dir(
+    *,
+    checkpoint_dir: str | None,
+    adata: ad.AnnData,
+    groupby: str,
+    reference: str,
+    replicate_col: str,
+    counts_layer: str | None,
+    options: PyDESeq2Options,
+) -> Path | None:
+    if not checkpoint_dir:
+        return None
+    path = Path(checkpoint_dir).expanduser().resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    source = str(getattr(adata, "filename", "") or "")
+    source_stat: dict[str, int] = {}
+    if source and os.path.exists(source):
+        stat = os.stat(source)
+        source_stat = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    obs_identity = pd.DataFrame(
+        {
+            "group": _obs_str_values(adata, groupby),
+            "replicate": _obs_str_values(adata, replicate_col),
+        },
+        index=adata.obs_names.astype(str),
+    )
+    obs_hash = hashlib.sha256(
+        pd.util.hash_pandas_object(
+            obs_identity,
+            index=True,
+            categorize=True,
+        ).to_numpy(dtype=np.uint64).tobytes()
+    ).hexdigest()
+    signature = {
+        "format_version": 2,
+        "source": source,
+        "source_stat": source_stat,
+        "n_obs": int(adata.n_obs),
+        "n_vars": int(adata.n_vars),
+        "obs_group_replicate_hash": obs_hash,
+        "var_hash": hashlib.sha256(
+            "\0".join(map(str, adata.var_names)).encode("utf-8")
+        ).hexdigest(),
+        "groupby": groupby,
+        "reference": reference,
+        "replicate_col": replicate_col,
+        "counts_layer": counts_layer,
+        "min_total_count": options.min_total_count,
+        "fill_filtered": options.fill_filtered,
+        "result_mode": options.result_mode,
+        "dds_kwargs": _yaml_safe(options.dds_kwargs),
+        "stats_kwargs": _yaml_safe(options.stats_kwargs),
+    }
+    metadata_path = path / "metadata.yaml"
+    if metadata_path.exists():
+        with metadata_path.open(encoding="utf-8") as handle:
+            cached = yaml.safe_load(handle) or {}
+        if cached != signature:
+            raise ValueError(
+                f"Stale PyDESeq2 checkpoint metadata in {metadata_path}; "
+                "choose a new checkpoint directory or remove the stale cache"
+            )
+    else:
+        temporary = path / f".metadata.{os.getpid()}.tmp"
+        with temporary.open("w", encoding="utf-8") as handle:
+            yaml.safe_dump(signature, handle, sort_keys=True)
+        os.replace(temporary, metadata_path)
+    return path
+
+
+def _write_contrast_checkpoint(
+    checkpoint_dir: Path,
+    *,
+    target: str,
+    frame: pl.DataFrame,
+) -> None:
+    path = _checkpoint_path(checkpoint_dir, target)
+    temporary = path.with_suffix(f".{os.getpid()}.tmp")
+    frame.write_parquet(temporary)
+    os.replace(temporary, path)
+
+
+def _read_contrast_checkpoint(
+    checkpoint_dir: Path,
+    *,
+    target: str,
+) -> pl.DataFrame | None:
+    path = _checkpoint_path(checkpoint_dir, target)
+    if not path.exists():
+        return None
+    frame = pl.read_parquet(path)
+    if (
+        frame.height > 0
+        and set(frame["target"].cast(pl.Utf8).unique().to_list()) != {target}
+    ):
+        raise ValueError(f"Invalid PyDESeq2 contrast checkpoint: {path}")
+    return frame
+
+
+def _compute_pydeseq2_pairwise(
+    *,
+    adata: ad.AnnData,
+    reference: str,
+    groupby: str,
+    threads: int,
+    counts_layer: str | None,
+    replicate_col: str,
+    perturbations: list[str],
+    options: PyDESeq2Options,
+    dds_kwargs: Mapping[str, Any],
+    stats_kwargs: Mapping[str, Any],
+) -> pl.DataFrame:
+    global _PAIRWISE_ADATA
+    global _PAIRWISE_SETTINGS
+    global _PAIRWISE_CONTROL_COUNTS
+    global _PAIRWISE_CONTROL_METADATA
+
+    _PAIRWISE_ADATA = adata
+    _PAIRWISE_CONTROL_COUNTS, _PAIRWISE_CONTROL_METADATA = (
+        _condition_pseudobulks(
+            adata=adata,
+            condition=reference,
+            groupby=groupby,
+            replicate_col=replicate_col,
+            counts_layer=counts_layer,
+        )
+    )
+    _PAIRWISE_SETTINGS = {
+        "groupby": groupby,
+        "reference": reference,
+        "replicate_col": replicate_col,
+        "counts_layer": counts_layer,
+        "min_total_count": options.min_total_count,
+        "fill_filtered": options.fill_filtered,
+        "dds_kwargs": dict(dds_kwargs),
+        "stats_kwargs": dict(stats_kwargs),
+        "result_mode": options.result_mode,
+    }
+    checkpoint_dir = _prepare_checkpoint_dir(
+        checkpoint_dir=options.checkpoint_dir,
+        adata=adata,
+        groupby=groupby,
+        reference=reference,
+        replicate_col=replicate_col,
+        counts_layer=counts_layer,
+        options=options,
+    )
+    completed: dict[str, pl.DataFrame] = {}
+    pending: list[str] = []
+    for target in perturbations:
+        cached = (
+            _read_contrast_checkpoint(checkpoint_dir, target=target)
+            if checkpoint_dir is not None and options.resume
+            else None
+        )
+        if cached is None:
+            pending.append(target)
+        else:
+            completed[target] = cached
+    if completed:
+        logger.info(
+            "Resumed %d/%d PyDESeq2 contrasts from %s",
+            len(completed),
+            len(perturbations),
+            checkpoint_dir,
+        )
+
+    workers = _safe_pairwise_workers(
+        requested=options.workers,
+        threads=threads,
+        adata=adata,
+        groupby=groupby,
+        reference=reference,
+    )
+    failures: dict[str, str] = {}
+
+    def record(target: str, frame: pl.DataFrame) -> None:
+        completed[target] = frame
+        if checkpoint_dir is not None:
+            _write_contrast_checkpoint(
+                checkpoint_dir,
+                target=target,
+                frame=frame,
+            )
+        logger.info(
+            "Completed pairwise PyDESeq2 contrast %d/%d: %s",
+            len(completed),
+            len(perturbations),
+            target,
+        )
+
+    if workers > 1 and pending:
+        # Forking an imported NumPy/SciPy process can inherit locked native
+        # mutexes and leave every worker sleeping forever. Spawn clean
+        # interpreters and send only bounded pseudobulk pairs instead.
+        context = multiprocessing.get_context("spawn")
+        with context.Pool(
+            processes=min(workers, len(pending)),
+            maxtasksperchild=16,
+        ) as pool:
+            fitted = pool.imap_unordered(
+                _spawned_pairwise_pydeseq2_worker,
+                _spawned_pairwise_payloads(pending),
+                chunksize=1,
+            )
+            for target, frame, error in fitted:
+                if error is None and frame is not None:
+                    record(target, frame)
+                    continue
+                failures[target] = error or "unknown worker failure"
+                logger.error(
+                    "Pairwise PyDESeq2 contrast failed for %s: %s",
+                    target,
+                    failures[target],
+                )
+                if not options.continue_on_error:
+                    pool.terminate()
+                    raise RuntimeError(
+                        f"Pairwise PyDESeq2 contrast failed for {target}: "
+                        f"{failures[target]}"
+                    )
+    else:
+        for target in pending:
+            try:
+                completed_target, frame = _pairwise_pydeseq2_worker(target)
+                record(completed_target, frame)
+            except Exception as error:
+                failures[target] = repr(error)
+                logger.exception(
+                    "Pairwise PyDESeq2 contrast failed for %s",
+                    target,
+                )
+                if not options.continue_on_error:
+                    raise
+
+    if checkpoint_dir is not None and failures:
+        failure_path = checkpoint_dir / "failures.yaml"
+        temporary = failure_path.with_suffix(f".{os.getpid()}.tmp")
+        with temporary.open("w", encoding="utf-8") as handle:
+            yaml.safe_dump(failures, handle, sort_keys=True)
+        os.replace(temporary, failure_path)
+    if failures:
+        logger.warning(
+            "PyDESeq2 completed %d/%d contrasts; %d failed%s",
+            len(completed),
+            len(perturbations),
+            len(failures),
+            f" (see {checkpoint_dir / 'failures.yaml'})"
+            if checkpoint_dir is not None
+            else "",
+        )
+    if not completed:
+        raise RuntimeError(
+            f"All {len(perturbations)} pairwise PyDESeq2 contrasts failed"
+        )
+    return pl.concat([completed[target] for target in perturbations if target in completed])
 
 
 def _parse_pydeseq2_kwargs(
@@ -398,11 +1062,36 @@ def _parse_pydeseq2_kwargs(
             "Pass constructor options under 'dds_kwargs' and "
             "DeseqStats options under 'stats_kwargs'."
         )
+    fit_strategy = str(raw_kwargs.get("fit_strategy", "auto"))
+    if fit_strategy not in {"auto", "joint", "pairwise"}:
+        raise ValueError(
+            "pydeseq2 fit_strategy must be 'auto', 'joint', or 'pairwise'"
+        )
+    max_joint_samples = int(raw_kwargs.get("max_joint_samples", 4096))
+    workers = int(raw_kwargs.get("workers", 1))
+    if max_joint_samples < 2:
+        raise ValueError("pydeseq2 max_joint_samples must be at least 2")
+    if workers < 0:
+        raise ValueError("pydeseq2 workers must be at least 0")
+    result_mode = str(raw_kwargs.get("result_mode", "all"))
+    if result_mode not in {"all", "target_only"}:
+        raise ValueError("pydeseq2 result_mode must be 'all' or 'target_only'")
     return PyDESeq2Options(
         min_total_count=int(raw_kwargs.get("min_total_count", 0)),
         fill_filtered=bool(raw_kwargs.get("fill_filtered", True)),
         dds_kwargs=_mapping_option(raw_kwargs, "dds_kwargs"),
         stats_kwargs=_mapping_option(raw_kwargs, "stats_kwargs"),
+        fit_strategy=fit_strategy,
+        max_joint_samples=max_joint_samples,
+        workers=workers,
+        checkpoint_dir=(
+            str(raw_kwargs["checkpoint_dir"])
+            if raw_kwargs.get("checkpoint_dir")
+            else None
+        ),
+        resume=bool(raw_kwargs.get("resume", True)),
+        continue_on_error=bool(raw_kwargs.get("continue_on_error", True)),
+        result_mode=result_mode,
     )
 
 

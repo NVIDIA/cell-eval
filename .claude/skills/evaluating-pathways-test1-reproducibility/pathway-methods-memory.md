@@ -79,6 +79,12 @@ Final visualization decisions:
   method uses the same cell-specific feature set; require at least three finite, nonconstant values
   and leave underpowered cells missing. Average the resulting Spearman and Pearson matrices cell by
   cell.
+- For paired reproducibility Tests 1 and 4, the combined FDR-union family also emits distribution
+  diagnostics. Plot every finite repeat-averaged diagonal and ordered off-diagonal Spearman/Pearson
+  cell with IQR boxes, 5th–95th percentile whiskers, and unsampled jittered scatter. For each method,
+  also compute `J(sig_A(unit i), sig_B(unit j))` within every repeat, retain the existing convention
+  that two empty significant sets have Jaccard 1, average corresponding cells across repeats, and
+  emit separate diagonal and off-diagonal Jaccard boxplots with every finite value shown.
 - Emit one combined mean correlation map and explicit separate OLS and pdex Mann–Whitney maps.
 - Fix pdex rank-biserial heatmap colors to `[-1, 1]`. Scale OLS symmetrically to the observed maximum absolute mean effect in that arm.
 - Fix all correlation-map colors to `[-1, 1]`. Retain every analytically eligible perturbation or guide; never subset units merely for display. Annotate diagonal cells with total unit-cell counts only when at most 40 units are shown, and omit that white text—not units or matrix values—above the threshold.
@@ -97,6 +103,9 @@ pathways_test1_corr_matrix_mean_pdex_mwu__<dataset>.png
 pathways_test1_corr_matrix_mean_fdr05__<dataset>.png
 pathways_test1_corr_matrix_mean_ols_fdr05__<dataset>.png
 pathways_test1_corr_matrix_mean_pdex_mwu_fdr05__<dataset>.png
+pathways_test1_corr_matrix_mean_fdr05_correlation_boxplots__<dataset>.png
+pathways_test1_corr_matrix_mean_fdr05_jaccard_diagonal_boxplot__<dataset>.png
+pathways_test1_corr_matrix_mean_fdr05_jaccard_off_diagonal_boxplot__<dataset>.png
 ```
 
 Validated `cell_eval2` run:
@@ -118,7 +127,7 @@ Shared OLS pathway-stripe interpretation from `cell_eval2`:
 
 - Test 2 compares genuine control cells against a pseudo-perturbed control half on the fixed score matrix. Its five repeat-level diagnostics are lambda GC, nominal-p fraction, FDR-call fraction, median p-value, and mean absolute descriptive score difference.
 - Test 3 uses exactly five global and five within-block label permutations when both modes are requested. Keep permutation-level calls intact and average counts, Jaccard, and target-correlation matrices only after each permutation has been analyzed independently. Do not restore the removed count/separation boxplot.
-- Test 4 measures the reliability ceiling of one guide against itself using disjoint cell halves and five repeats. Select each guide independently by its own cell power; do not require multiple guides per target gene. Label guides consistently as `GENE | gN`, keep same-gene guides adjacent, and draw gene boundaries. A diagonal cell is split-A versus split-B correlation, not a mathematical self-correlation and therefore need not equal one.
+- Test 4 measures the reliability ceiling of one guide against itself using disjoint cell halves and five repeats. Select each guide independently by its own cell power; do not require multiple guides per target gene. Label guides consistently as `GENE | gN`, keep same-gene guides adjacent, and draw gene boundaries. A diagonal cell is split-A versus split-B correlation, not a mathematical self-correlation and therefore need not equal one. Emit both the all-pathway and pair-specific shared FDR-union correlation families, with the same correlation/Jaccard distribution diagnostics required for Test 1.
 - Test 5 compares distinct guides targeting the same gene with guides targeting different genes using each guide's full-cell effect vector. Reuse one unrelated-pair sample across methods and reuse guide-map labels in every plot. Test 4 and Test 5 share scoring and inference, but Test 4 measures sampling reliability whereas Test 5 measures cross-guide agreement. Because Test 5 pairs share guides, its pairwise Mann-Whitney p-value is descriptive rather than a confirmatory gene-level test.
 - Test 7 measures common scoring separately from method inference. Its process RSS value is a process-lifetime high-water delta and may be zero after an earlier stage set the high-water mark; never interpret it as an exact isolated method peak.
 

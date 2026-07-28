@@ -1,6 +1,6 @@
 ---
 name: evaluating-pathways-test4-guide-reproducibility
-description: Run or reproduce pathway Test 4 comparing same-guide split-half pathway reproducibility for unchanged bioconcord OLS and pdex Mann-Whitney. Use when an sgRNA column is available to measure guide-level effect-vector Spearman, significant-pathway Jaccard, direction agreement, per-arm cross-method agreement, repeat-averaged arm effects, and guide maps reporting diagonal/off-diagonal Spearman and Pearson correlations.
+description: Run or reproduce pathway Test 4 comparing same-guide split-half pathway reproducibility for unchanged bioconcord OLS and pdex Mann-Whitney. Use when an sgRNA column is available to measure guide-level effect-vector Spearman, significant-pathway Jaccard, direction agreement, per-arm cross-method agreement, repeat-averaged arm effects, and all-pathway plus pair-specific FDR-union guide maps with diagonal/off-diagonal Spearman, Pearson, and Jaccard distributions.
 ---
 
 # Pathway Test 4 — Same-Guide Split-Half Reproducibility
@@ -12,7 +12,7 @@ Read the bundled `pathway-methods-memory.md` before running, reimplementing, or 
 Do not start the executable until the user has explicitly confirmed one fully resolved run configuration.
 
 1. Gather the input `.h5ad`, ask whether `adata.X` contains raw counts or log1p-normalized expression, pathway-definition CSV, official Bioconcord checkout, results output directory, separate run root, methods to compare (`ols`, `pdex_mwu`, or both), perturbation/guide/control/block fields, score layer and optional gene-symbol field, thresholds, scoring settings, guide scope, repeats, seeds, and threads. Inspect the input read-only to resolve unknown columns, labels, layers, feature identifiers, and powered guide counts. Pass the confirmed state as `--expression-state`.
-2. Expand paths and resolve every default. Show one concise preflight summary containing inputs, results directory, run root, methods, data fields/layers, thresholds, selected guide scope, workload/concurrency, exact command, log path, and resolved-config destination.
+2. Expand paths and resolve every default. Show one concise preflight summary containing inputs, results directory, run root, methods, data fields/layers, thresholds, selected guide scope, workload/concurrency, exact command, log path, and resolved-config destination. Before asking for confirmation, estimate wall time separately for every selected method, shared scoring/preparation/rendering, and the complete run; state the hardware tier, cache assumptions, evidence or throughput basis, uncertainty range, and how watchdog de-escalation could extend it.
 3. Ask for explicit confirmation and stop. Do not launch subsetting, scoring, inference, or plotting before confirmation.
 4. After confirmation, create `<run-root>/logs` and `<run-root>/configs`, pass `--run-root <run-root>`, and capture the complete terminal stream with `2>&1 | tee <run-root>/logs/<workflow>__<dataset>__<UTC-timestamp>.log`.
 5. Every invocation writes an immutable timestamped YAML snapshot under `<run-root>/configs`. Report the result, log, and YAML paths on completion.
@@ -63,7 +63,18 @@ required user-supplied CSV because pathway definitions are not committed with th
 12. If both methods run, calculate the bundled cross-method comparison within every arm and repeat.
 13. Preserve every repeat's split results. Average native effects by `method, arm, guide, program` across repeats and produce one overview-style effect heatmap per arm, with guides grouped by gene and black horizontal gene boundaries.
 14. Establish one guide order and complete-case pathway basis across every method, arm, and repeat, reporting any dropped guides/pathways. For each method and repeat, compute full split-A guide by split-B guide Spearman and Pearson matrices on that identical basis. Average both matrices cell by cell across repeats. Render Spearman colors and report mean diagonal/off-diagonal values for both metrics in every panel title. Order both axes by target gene and within-gene guide number and draw black boundaries between genes. Annotate diagonal cells with mean total guide-cell count only at 40 guides or fewer; above that threshold suppress only the white count text. Emit combined and separate method maps with fixed correlation limits `[-1, 1]`.
-15. Preserve raw guide constructs in native result tables. For plots, map guides within each modal target gene to compact deterministic labels `GENE | g1`, `GENE | g2`, and so on. Same-gene guides must be adjacent in heatmaps and correlation maps, share an obvious gene prefix, and be separated from the next gene group by a visible boundary. Store the mapping in metadata and a dedicated guide-map table.
+15. Also build the pair-specific FDR-union family. Within each repeat and guide-pair cell `(i,j)`,
+    correlate arm-A guide `i` with arm-B guide `j` over the union of pathways called at
+    `fdr <= --fdr` in either compared profile by any requested method. Use that identical
+    cell-specific feature set for every method, require at least three finite nonconstant values,
+    and average corresponding Spearman and Pearson cells across repeats. In parallel, compute each
+    method's `J(sig_A(guide i), sig_B(guide j))`, using Jaccard 1 when both sets are empty, and
+    average corresponding cells across repeats.
+16. For the combined FDR-union family, emit a correlation boxplot figure comparing every finite
+    diagonal with every finite ordered off-diagonal Spearman/Pearson cell, plus separate diagonal
+    and off-diagonal Jaccard boxplots. Use IQR boxes, 5th–95th percentile whiskers, and jittered
+    scatter containing every finite repeat-averaged matrix cell without sampling.
+17. Preserve raw guide constructs in native result tables. For plots, map guides within each modal target gene to compact deterministic labels `GENE | g1`, `GENE | g2`, and so on. Same-gene guides must be adjacent in heatmaps and correlation maps, share an obvious gene prefix, and be separated from the next gene group by a visible boundary. Store the mapping in metadata and a dedicated guide-map table.
 
 ## Output contract
 
@@ -75,6 +86,16 @@ required user-supplied CSV because pathway definitions are not committed with th
 - `plots/pathways_test4_mean_arma__<dataset>.png` and `..._armb__<dataset>.png`: guide-pathway native effects averaged across all repeats for each arm.
 - `plots/pathways_test4_corr_matrix_mean__<dataset>.png`: combined repeat-averaged guide correlation maps; colors encode Spearman and titles report diagonal/off-diagonal Spearman and Pearson means.
 - `plots/pathways_test4_corr_matrix_mean_ols__<dataset>.png` and `..._pdex_mwu__<dataset>.png`: explicit single-method maps with the same four title statistics.
+- `plots/pathways_test4_corr_matrix_mean_fdr05__<dataset>.png`,
+  `..._ols_fdr05__<dataset>.png`, and `..._pdex_mwu_fdr05__<dataset>.png`: combined and
+  single-method pair-specific FDR-union guide correlation maps.
+- `plots/pathways_test4_corr_matrix_mean_fdr05_correlation_boxplots__<dataset>.png`: combined-method
+  Spearman/Pearson diagonal-versus-off-diagonal distributions for the FDR-union matrices, with a
+  same-stem summary CSV.
+- `plots/pathways_test4_corr_matrix_mean_fdr05_jaccard_diagonal_boxplot__<dataset>.png` and
+  `..._jaccard_off_diagonal_boxplot__<dataset>.png`: same-guide and cross-guide significant-pathway
+  Jaccard distributions, each with a same-stem summary CSV and every finite repeat-averaged matrix
+  cell rendered as jittered scatter.
 - `pathways_test4_metadata__<dataset>.json`: shared score and argument metadata.
 
 ## Final visualization decisions
@@ -90,5 +111,8 @@ Follow finalized pathway Test 1 at guide resolution: do not emit the obsolete re
 - Require each retained non-control guide to meet the per-arm threshold; `split_groups` drops guides that fail it.
 - Reuse fixed pathway scores and disjoint guide-specific halves.
 - Require correlation maps to intersect guides and finite programs across every method, arm, and repeat; reuse that shared basis and order for combined and single-method panels, then average repeat-specific correlations rather than correlating already averaged effects.
+- Require every FDR-union cell to use one feature mask shared across methods, constructed from the
+  requested methods' calls in the two compared profiles. Keep Jaccard method-specific because it
+  compares each method's own significant-pathway sets.
 - Keep pdex mean-effect heatmaps fixed to `[-1, 1]`, OLS heatmaps symmetric to their observed arm-specific range, and every correlation map fixed to `[-1, 1]`.
 - Interpret low guide reproducibility alongside `n_cells_total`; it is the empirical ceiling for guide-level conclusions.

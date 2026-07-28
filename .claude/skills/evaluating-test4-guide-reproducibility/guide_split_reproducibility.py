@@ -33,7 +33,7 @@ import pandas as pd
 import polars as pl
 from scipy import stats
 
-from de_backends import write_resolved_config
+from de_backends import hardware_worker_limit, write_resolved_config
 
 _T1 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                    "evaluating-test1-reproducibility", "reproducibility_heatmap.py")
@@ -336,8 +336,8 @@ def main():
     ap.add_argument("--max-control", type=int, default=None, help="subsample control cells (speed)")
     ap.add_argument("--threads", type=int, default=8,
                     help="worker threads supplied to each DE backend fit")
-    ap.add_argument("--guide-workers", type=int, default=1,
-                    help="parallel guide fits for PyDESeq2; use --threads 1 with this")
+    ap.add_argument("--guide-workers", type=int, default=0,
+                    help="parallel PyDESeq2 guide fits; 0 = hardware-adaptive")
     ap.add_argument("--pairwise-workers", type=int, default=8,
                     help="fork workers for pair-specific DE-union correlation rows")
     ap.add_argument("--non-parametric-engine", choices=("pdex", "rsc"), default="pdex",
@@ -355,6 +355,8 @@ def main():
         help="confirmed run root for configs/ and logs/ (defaults to --outdir)",
     )
     a = ap.parse_args()
+    if a.threads < 1 or a.guide_workers < 0:
+        ap.error("--threads must be at least 1 and --guide-workers at least 0")
     if a.pairwise_workers < 1:
         ap.error("--pairwise-workers must be at least 1")
     available_cpus = (
@@ -373,13 +375,20 @@ def main():
     counts_layer = a.counts_layer
 
     adata = ad.read_h5ad(a.adata)
+    requested_guide_workers = a.guide_workers
+    a.guide_workers = hardware_worker_limit(
+        requested=requested_guide_workers,
+        threads_per_worker=a.threads,
+        worker_memory_bytes=max(os.path.getsize(a.adata) // 3, 768 * 1024**2),
+        max_auto_workers=16,
+        memory_fraction=0.55,
+    )
+    print(
+        f"[resources] guide workers={a.guide_workers} "
+        f"(requested={requested_guide_workers}; threads/worker={a.threads})"
+    )
     if counts_layer is None and "counts" in adata.layers:
         counts_layer = "counts"
-    elif (counts_layer is None and "pdex" in methods and a.non_parametric_engine != "rsc"
-          and rt._looks_raw_integer(adata)):
-        counts_layer = "_raw_counts_for_de"
-        adata.layers[counts_layer] = adata.X.copy()
-        print(f"preserved raw counts in temporary layer {counts_layer!r} for CPM")
     ds = os.path.splitext(os.path.basename(a.adata))[0]  # dataset tag on every output file
     print(f"loaded {a.adata}: {adata.n_obs} cells × {adata.n_vars} genes  (methods={methods})")
     a.run_root = os.path.abspath(os.path.expanduser(a.run_root or a.outdir))

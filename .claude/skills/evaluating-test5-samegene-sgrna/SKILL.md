@@ -13,12 +13,17 @@ Runs **both pdex and pydeseq2** in one pass via `samegene_guide_heatmap.py`.
 `de_backends.py` is bundled with this skill and calls the upstream `pdex` and
 `pydeseq2` packages directly. Do not import project-private DE backend modules.
 
+Before executing, read and follow
+[`hardware-execution-contract.md`](hardware-execution-contract.md). Use the bundled
+`run_with_watchdog.py` for every inference attempt; worker value `0` means
+hardware-adaptive selection.
+
 ## Mandatory preflight and run capture
 
 Do not start the executable until the user has explicitly confirmed one fully resolved run configuration.
 
 1. Gather the input `.h5ad`, ask whether `adata.X` contains raw counts or log1p-normalized expression, results output directory, separate run root, methods to compare, non-parametric engine (`pdex` or `rsc`) when `pdex` is selected, perturbation/guide/target-gene/control fields, replicate/block columns, count layer, thresholds, seeds, gene/guide limits, and worker/thread settings. Inspect the input read-only to resolve unknown columns, labels, layers, and powered guide groups. Pass the confirmed state as `--expression-state`.
-2. Expand paths and resolve every default. Show one concise preflight summary containing the input, results directory, run root, methods/engine, data fields, thresholds, selected guide/gene scope, workload/concurrency, exact command, log path, and resolved-config destination.
+2. Expand paths and resolve every default. Show one concise preflight summary containing the input, results directory, run root, methods/engine, data fields, thresholds, selected guide/gene scope, workload/concurrency, exact command, log path, and resolved-config destination. Before asking for confirmation, estimate wall time separately for every selected method, shared preparation/rendering, and the complete run; state the hardware/tier, cache assumptions, evidence or throughput basis, uncertainty range, and how watchdog de-escalation could extend it.
 3. Ask for explicit confirmation and stop. Do not launch computation or plotting before confirmation.
 4. After confirmation, create `<run-root>/logs` and `<run-root>/configs`, pass `--run-root <run-root>`, and capture the complete terminal stream with `2>&1 | tee <run-root>/logs/<workflow>__<dataset>__<UTC-timestamp>.log`.
 5. Every invocation writes an immutable timestamped YAML snapshot under `<run-root>/configs`. Report the result, log, and YAML paths on completion.
@@ -114,4 +119,5 @@ Levers: `--max-genes` caps #genes-with-guides (by #guides desc) for readability/
 subsamples control cells for speed, `--methods pdex` alone skips the (slower) pydeseq2 backend, and
 `--non-parametric-engine rsc` runs the pdex-equivalent Wilcoxon/FDR/LFC calculation on a CUDA GPU.
 For CPU PyDESeq2, `--guide-workers N --threads 1` runs independent guide fits in a POSIX fork pool;
-this changes scheduling only and preserves the exact per-guide PyDESeq2 model and outputs.
+this changes scheduling only and preserves the exact per-guide PyDESeq2 model and outputs. The
+default `0` selects a CPU/RAM-safe worker count from the measured machine.

@@ -29,7 +29,11 @@ import anndata as ad
 import numpy as np
 import polars as pl
 
-from de_backends import de_method_label, write_resolved_config
+from de_backends import (
+    de_method_label,
+    hardware_worker_limit,
+    write_resolved_config,
+)
 
 _RT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "de_helpers.py")
 
@@ -340,8 +344,8 @@ def main():
     ap.add_argument("--n-resamples", type=int, default=10)
     ap.add_argument("--threads", type=int, default=8,
                     help="CPU threads supplied to each DE fit")
-    ap.add_argument("--resample-workers", type=int, default=1,
-                    help="parallel control splits for CPU PyDESeq2; use --threads 1")
+    ap.add_argument("--resample-workers", type=int, default=0,
+                    help="parallel control splits; 0 = hardware-adaptive")
     ap.add_argument("--non-parametric-engine", choices=("pdex", "rsc"), default="pdex",
                     help="non-parametric engine; pdex uses Arc pdex and rsc uses RAPIDS GPU Wilcoxon")
     ap.add_argument("--seed", type=int, default=0)
@@ -355,23 +359,26 @@ def main():
         help="confirmed run root for configs/ and logs/ (defaults to --outdir)",
     )
     a = ap.parse_args()
-    if a.threads < 1 or a.resample_workers < 1:
-        ap.error("--threads and --resample-workers must be at least 1")
-    available_cpus = (
-        len(os.sched_getaffinity(0))
-        if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
-    )
-    worker_cap = max(1, available_cpus // a.threads)
-    if a.resample_workers > worker_cap:
-        print(f"[safety] capping --resample-workers from {a.resample_workers} "
-              f"to {worker_cap} ({available_cpus} CPUs, {a.threads} threads/fit)")
-        a.resample_workers = worker_cap
+    if a.threads < 1 or a.resample_workers < 0:
+        ap.error("--threads must be at least 1 and --resample-workers at least 0")
     rt = _load_runner()
     methods = [m for m in a.methods.split(",") if m]
     # run pydeseq2 (needs raw .X) BEFORE pdex (maybe_normalize log-transforms .X in place)
     order = [m for m in methods if m != "pdex"] + (["pdex"] if "pdex" in methods else [])
 
     adata = ad.read_h5ad(a.adata)
+    requested_workers = a.resample_workers
+    a.resample_workers = hardware_worker_limit(
+        requested=requested_workers,
+        threads_per_worker=a.threads,
+        worker_memory_bytes=max(os.path.getsize(a.adata) // 3, 768 * 1024**2),
+        max_auto_workers=16,
+        memory_fraction=0.55,
+    )
+    print(
+        f"[resources] resample workers={a.resample_workers} "
+        f"(requested={requested_workers}; threads/worker={a.threads})"
+    )
     counts_layer = a.counts_layer
     if counts_layer is None and "counts" in adata.layers:
         counts_layer = "counts"

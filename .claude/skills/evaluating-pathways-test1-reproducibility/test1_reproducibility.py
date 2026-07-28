@@ -195,6 +195,7 @@ def main() -> None:
         f"Pathway Test 1 mean across {args.n_repeats} repeats — {dataset} — "
         f"shared FDR <= {args.fdr:g} union",
         fdr_threshold=args.fdr,
+        emit_distribution_boxplots=True,
     )
     for method in methods:
         pu.plot_target_corr_matrix(

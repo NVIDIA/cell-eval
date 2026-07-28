@@ -37,7 +37,7 @@ from de_backends import (  # noqa: E402
 )
 
 log = logging.getLogger("overview")
-OVERVIEW_CACHE_VERSION = 4
+OVERVIEW_CACHE_VERSION = 5
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -61,6 +61,13 @@ def _make_norm_copy(adata: ad.AnnData) -> ad.AnnData:
         sc.pp.normalize_total(a, inplace=True)
         sc.pp.log1p(a)
     return a
+
+
+def _normalize_in_place(adata: ad.AnnData) -> ad.AnnData:
+    if _looks_raw_integer(adata):
+        sc.pp.normalize_total(adata, inplace=True)
+        sc.pp.log1p(adata)
+    return adata
 
 
 def _cpm_filter_multi(de_frame: pl.DataFrame, adata: ad.AnnData,
@@ -89,6 +96,7 @@ def _cpm_filter_multi(de_frame: pl.DataFrame, adata: ad.AnnData,
             X = X.copy()
             X.data = np.expm1(X.data)
     var_names = list(adata.var_names)
+    var_names_array = np.asarray(var_names, dtype=str)
 
     def mean_cpm(idx: np.ndarray) -> np.ndarray:
         group = X[idx, :]
@@ -107,21 +115,28 @@ def _cpm_filter_multi(de_frame: pl.DataFrame, adata: ad.AnnData,
         ctrl_pass = {g for g, mc in zip(var_names, m_ctrl) if mc >= min_cpm}
         return de_frame.filter(pl.col("feature").is_in(ctrl_pass))
 
-    pass_pairs: set[tuple[str, str]] = set()
+    eligible_frames: list[pl.DataFrame] = []
     for tgt in targets:
         tidx = np.where(obs_g == str(tgt))[0]
         if len(tidx) == 0:
             continue
         m_pert = mean_cpm(tidx)
-        for g, mc, mp in zip(var_names, m_ctrl, m_pert):
-            if mc >= min_cpm or mp >= min_cpm:
-                pass_pairs.add((str(tgt), g))
-
-    keep_mask = pl.Series([
-        (str(t), str(f)) in pass_pairs
-        for t, f in zip(de_frame["target"].to_list(), de_frame["feature"].to_list())
-    ])
-    return de_frame.filter(keep_mask)
+        eligible = (m_ctrl >= min_cpm) | (m_pert >= min_cpm)
+        eligible_frames.append(
+            pl.DataFrame(
+                {
+                    "target": np.repeat(str(tgt), int(eligible.sum())),
+                    "feature": var_names_array[eligible],
+                }
+            )
+        )
+    if not eligible_frames:
+        return de_frame.head(0)
+    # A Polars semi-join keeps memory bounded in native columnar buffers.  The
+    # previous Python set of (target, feature) tuples can consume several GiB
+    # for Jurkat-scale 20M-row result tables.
+    eligibility = pl.concat(eligible_frames, how="vertical")
+    return de_frame.join(eligibility, on=["target", "feature"], how="semi")
 
 
 def _run_de(adata: ad.AnnData, cfg: dict, method: str) -> pl.DataFrame:
@@ -131,11 +146,21 @@ def _run_de(adata: ad.AnnData, cfg: dict, method: str) -> pl.DataFrame:
         adata=adata,
         control_pert=cfg["control_pert"],
         pert_col=cfg["pert_col"],
-        num_threads=cfg.get("num_threads", 8),
+        num_threads=(
+            cfg.get("pydeseq2_threads", 1)
+            if method == "pydeseq2"
+            else cfg.get("num_threads", 8)
+        ),
         allow_discrete=(method == "pydeseq2"),
         de_method=method,
-        de_kwargs=({"engine": cfg.get("non_parametric_engine", "pdex")}
-                   if method == "pdex" else None),
+        de_kwargs=(
+            {
+                "engine": cfg.get("non_parametric_engine", "pdex"),
+                "copy": cfg.get("non_parametric_engine", "pdex") != "rsc",
+            }
+            if method == "pdex"
+            else cfg.get("pydeseq2_kwargs")
+        ),
         counts_layer=cfg.get("counts_layer"),
         replicate_col=cfg.get("replicate_col") if method == "pydeseq2" else None,
     )
@@ -531,6 +556,26 @@ def main() -> None:
     ap.add_argument("--threads", type=int, default=None,
                     help="CPU threads for DE; overrides config num_threads")
     ap.add_argument(
+        "--pydeseq-workers",
+        type=int,
+        default=None,
+        help=(
+            "parallel target-vs-control PyDESeq2 fits; 0 selects a bounded "
+            "automatic value (default from config, otherwise 0)"
+        ),
+    )
+    ap.add_argument(
+        "--pydeseq-threads",
+        type=int,
+        default=None,
+        help="CPU threads per PyDESeq2 fit (default from config, otherwise 1)",
+    )
+    ap.add_argument(
+        "--no-resume-pydeseq",
+        action="store_true",
+        help="ignore existing per-target PyDESeq2 checkpoints and recompute them",
+    )
+    ap.add_argument(
         "--non-parametric-engine", choices=("pdex", "rsc"), default=None,
         help="override config non_parametric_engine",
     )
@@ -559,12 +604,34 @@ def main() -> None:
         if args.threads < 1:
             ap.error("--threads must be at least 1")
         cfg["num_threads"] = args.threads
+    if args.pydeseq_workers is not None:
+        cfg["pydeseq2_workers"] = args.pydeseq_workers
+    if args.pydeseq_threads is not None:
+        cfg["pydeseq2_threads"] = args.pydeseq_threads
+    cfg.setdefault("pydeseq2_workers", 0)
+    cfg.setdefault("pydeseq2_threads", 1)
+    if int(cfg["pydeseq2_workers"]) < 0:
+        ap.error("pydeseq2_workers/--pydeseq-workers must be at least 0")
+    if int(cfg["pydeseq2_threads"]) < 1:
+        ap.error("pydeseq2_threads/--pydeseq-threads must be at least 1")
 
     outdir    = cfg.get("outdir", ".")
     tables_dir = os.path.join(outdir, "tables")
     plots_dir  = os.path.join(outdir, "plots")
     os.makedirs(tables_dir, exist_ok=True)
     os.makedirs(plots_dir,  exist_ok=True)
+    pydeseq_checkpoint_dir = os.path.join(
+        tables_dir,
+        "overview_pydeseq2_contrasts",
+    )
+    cfg["pydeseq2_kwargs"] = {
+        **dict(cfg.get("pydeseq2_kwargs") or {}),
+        "fit_strategy": "auto",
+        "workers": int(cfg["pydeseq2_workers"]),
+        "checkpoint_dir": pydeseq_checkpoint_dir,
+        "resume": not args.no_resume_pydeseq,
+        "continue_on_error": True,
+    }
 
     ds = os.path.splitext(os.path.basename(cfg["adata_path"]))[0]  # dataset tag on every output file
     args.run_root = os.path.abspath(os.path.expanduser(args.run_root or outdir))
@@ -592,6 +659,10 @@ def main() -> None:
         "control_pert": cfg["control_pert"],
         "counts_layer": cfg.get("counts_layer"),
         "non_parametric_engine": cfg.get("non_parametric_engine", "pdex"),
+        "pydeseq2_fit_strategy": "auto_pairwise_large",
+        "pydeseq2_max_joint_samples": int(
+            cfg["pydeseq2_kwargs"].get("max_joint_samples", 4096)
+        ),
     }
 
     # ------------------------------------------------------------------ #
@@ -642,9 +713,6 @@ def main() -> None:
                       "n_cells":      list(cell_counts.values())}
                      ).write_csv(cell_counts_path)
 
-        log.info("Building log-normalised copy for pdex …")
-        adata_norm = _make_norm_copy(adata_raw)
-
         log.info("Running pydeseq2 (full data) …")
         de_pyd_raw = _run_de(adata_raw, cfg, "pydeseq2")
         de_pyd_raw.write_csv(pyd_raw_path)
@@ -653,11 +721,23 @@ def main() -> None:
         de_pyd.write_csv(pyd_full_path)
         log.info("  saved → %s  (raw → %s)", pyd_full_path, pyd_raw_path)
 
+        # PyDESeq2 and its raw-count CPM gate are complete, so normalize the
+        # same matrix in place instead of retaining a second ~9 GiB copy.
+        log.info("Log-normalising in place for pdex …")
+        adata_norm = _normalize_in_place(adata_raw)
         log.info("Running pdex (full data) …")
         de_pdx_raw = _run_de(adata_norm, cfg, "pdex")
         de_pdx_raw.write_csv(pdx_raw_path)
         log.info("Applying shared CPM filter to pdex …")
-        de_pdx = _cpm_filter_multi(de_pdx_raw, adata_raw, cfg["pert_col"], cfg["control_pert"], cfg)
+        # Per-cell CPM is invariant to normalize_total scaling; expm1(log1p)
+        # therefore recovers an exactly equivalent eligibility calculation.
+        de_pdx = _cpm_filter_multi(
+            de_pdx_raw,
+            adata_norm,
+            cfg["pert_col"],
+            cfg["control_pert"],
+            cfg,
+        )
         de_pdx.write_csv(pdx_full_path)
         log.info("  saved → %s  (raw → %s)", pdx_full_path, pdx_raw_path)
         with open(cache_meta_path, "w") as fh:
@@ -767,16 +847,16 @@ def main() -> None:
                 ma_pdx = pl.read_csv(pdx_ma_cache)
             else:
                 log.info("MA tables not cached; loading adata to compute mean expression (DE skipped) …")
-                _adata_raw = ad.read_h5ad(cfg["adata_path"])
-                _adata_norm = _make_norm_copy(_adata_raw)
+                _adata_raw = ad.read_h5ad(cfg["adata_path"], backed="r")
                 ma_pyd, ma_pdx = _build_ma_tables(
-                    _adata_raw, _adata_norm, de_pyd, de_pdx,
+                    _adata_raw, _adata_raw, de_pyd, de_pdx,
                     list(picks.values()), cfg, tables_dir, ds,
                     de_pdx_raw=de_pdx_raw,
                 )
         else:
+            _adata_raw = ad.read_h5ad(cfg["adata_path"], backed="r")
             ma_pyd, ma_pdx = _build_ma_tables(
-                adata_raw, adata_norm, de_pyd, de_pdx,
+                _adata_raw, _adata_raw, de_pyd, de_pdx,
                 list(picks.values()), cfg, tables_dir, ds,
                 de_pdx_raw=de_pdx_raw,
             )

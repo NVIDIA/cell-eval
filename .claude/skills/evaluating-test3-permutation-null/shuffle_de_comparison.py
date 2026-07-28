@@ -48,7 +48,12 @@ import matplotlib.pyplot as plt
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 
-from de_backends import build_de_frame, de_method_label, write_resolved_config
+from de_backends import (
+    build_de_frame,
+    de_method_label,
+    hardware_worker_limit,
+    write_resolved_config,
+)
 
 log = logging.getLogger("shuffle_de_cmp")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -286,8 +291,8 @@ def _run_shuffled_null(adata_raw: ad.AnnData, adata_norm: ad.AnnData,
 
     rng = np.random.default_rng(seed)
     shuffled = _shuffle_within_batch(labels.copy(), batch, rng)
-    adata_norm = adata_norm.copy()
-    adata_raw  = adata_raw.copy()
+    # Only obs labels change. Copying both full expression matrices here used
+    # another ~18 GiB on the Jurkat input for no statistical benefit.
     adata_norm.obs["_shuf"] = shuffled
     adata_raw.obs["_shuf"]  = shuffled
 
@@ -309,30 +314,71 @@ def _run_shuffled_null(adata_raw: ad.AnnData, adata_norm: ad.AnnData,
         "shuffled": shuffled, "fdr_thr": fdr_thr, "lfc_thr": lfc_thr,
         "n_threads": n_threads, "counts_layer": counts_layer,
         "replicate_col": replicate_col, "min_cells": min_cells,
-        "gene_names": gene_names, "methods": methods,
+        "gene_names": gene_names,
         "non_parametric_engine": non_parametric_engine,
     }
-    use_pool = comparison_workers > 1 and not (
-        "pdex" in methods and non_parametric_engine == "rsc"
-    )
-    if use_pool:
-        _T3_WORKER_STATE.clear()
-        _T3_WORKER_STATE.update(worker_state)
-        pool = mp.get_context("fork").Pool(processes=comparison_workers)
-        fitted = pool.imap(_run_one_fake_comparison_worker, tasks, chunksize=1)
+
+    # RSC calls must stay in one process because all comparisons share one GPU.
+    # Do not let that constraint serialize the independent CPU PyDESeq2 fits:
+    # schedule the methods as separate passes over the exact same shuffled labels
+    # and target/reference pairs, then merge their method-specific fields.
+    if non_parametric_engine == "rsc" and "pdex" in methods:
+        method_batches: list[tuple[list[str], int]] = []
+        if "pydeseq2" in methods:
+            method_batches.append((["pydeseq2"], comparison_workers))
+        method_batches.append((["pdex"], 1))
     else:
-        pool = None
-        fitted = (
-            _run_one_fake_comparison(task, **worker_state) for task in tasks
+        method_batches = [(methods, comparison_workers)]
+
+    method_fields = {
+        "pdex": ("n_pdex", "genes_pdex", "lfc_pdex"),
+        "pydeseq2": ("n_pydx", "genes_pydx", "lfc_pydx"),
+    }
+    for batch_methods, batch_workers in method_batches:
+        batch_state = {**worker_state, "methods": batch_methods}
+        use_pool = batch_workers > 1
+        log.info(
+            "Scheduling methods=%s with %d comparison worker(s)",
+            batch_methods, batch_workers,
         )
-    try:
-        for p, result in fitted:
-            if result is not None:
-                results[p] = result
-    finally:
-        if pool is not None:
-            pool.close()
-            pool.join()
+        if use_pool:
+            _T3_WORKER_STATE.clear()
+            _T3_WORKER_STATE.update(batch_state)
+            pool = mp.get_context("fork").Pool(
+                processes=batch_workers,
+                maxtasksperchild=16,
+            )
+            fitted = pool.imap(
+                _run_one_fake_comparison_worker, tasks, chunksize=1,
+            )
+        else:
+            pool = None
+            fitted = (
+                _run_one_fake_comparison(task, **batch_state) for task in tasks
+            )
+        try:
+            for p, result in fitted:
+                if result is None:
+                    continue
+                if p not in results:
+                    results[p] = result
+                    continue
+                merged = results[p]
+                if (
+                    merged["reference"] != result["reference"]
+                    or merged["n_cells"] != result["n_cells"]
+                    or merged["n_reference_cells"] != result["n_reference_cells"]
+                ):
+                    raise RuntimeError(
+                        f"Method passes produced inconsistent comparison metadata for {p}"
+                    )
+                for method in batch_methods:
+                    for field in method_fields[method]:
+                        merged[field] = result[field]
+        finally:
+            if pool is not None:
+                pool.close()
+                pool.join()
 
     return results
 
@@ -598,8 +644,8 @@ def main() -> None:
     ap.add_argument("--fdr",           type=float, default=None)
     ap.add_argument("--lfc",           type=float, default=None)
     ap.add_argument("--n-threads",     type=int,   default=None)
-    ap.add_argument("--comparison-workers", type=int, default=1,
-                    help="parallel shuffled comparisons for CPU PyDESeq2; use --n-threads 1")
+    ap.add_argument("--comparison-workers", type=int, default=0,
+                    help="parallel shuffled comparisons; 0 = hardware-adaptive")
     ap.add_argument("--seed",          type=int,   default=None)
     ap.add_argument("--outdir",        default=".")
     ap.add_argument(
@@ -620,8 +666,8 @@ def main() -> None:
                     choices=["global", "within", "both"],
                     help="global: ignore batch; within: shuffle within each batch; both: produce both plots")
     args = ap.parse_args()
-    if args.comparison_workers < 1:
-        ap.error("--comparison-workers must be at least 1")
+    if args.comparison_workers < 0:
+        ap.error("--comparison-workers must be at least 0")
     os.makedirs(args.outdir, exist_ok=True)
 
     cfg: dict = {}
@@ -654,18 +700,6 @@ def main() -> None:
             "config non_parametric_engine must be 'pdex' or 'rsc'"
         )
 
-    available_cpus = (
-        len(os.sched_getaffinity(0))
-        if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
-    )
-    worker_cap = max(1, available_cpus // max(1, int(cfg["num_threads"])))
-    if args.comparison_workers > worker_cap:
-        log.warning(
-            "Capping --comparison-workers from %d to %d (%d CPUs, %d threads/fit)",
-            args.comparison_workers, worker_cap, available_cpus, cfg["num_threads"],
-        )
-        args.comparison_workers = worker_cap
-
     fdr_thr    = cfg["fdr_threshold"]
     lfc_thr    = cfg["lfc_threshold"]
     pc         = cfg["pert_col"]
@@ -676,14 +710,35 @@ def main() -> None:
     log.info("Loading %s", cfg["adata_path"])
     adata = ad.read_h5ad(cfg["adata_path"])
     log.info("Loaded %d cells × %d genes", *adata.shape)
+    requested_workers = args.comparison_workers
+    args.comparison_workers = hardware_worker_limit(
+        requested=requested_workers,
+        threads_per_worker=max(1, int(cfg["num_threads"])),
+        worker_memory_bytes=max(
+            os.path.getsize(cfg["adata_path"]) // 3,
+            768 * 1024**2,
+        ),
+        max_auto_workers=16,
+        memory_fraction=0.50,
+    )
+    log.info(
+        "Hardware plan selected %d comparison workers "
+        "(requested=%d; threads/worker=%d)",
+        args.comparison_workers,
+        requested_workers,
+        cfg["num_threads"],
+    )
 
     perts = [str(p) for p in adata.obs[pc].unique() if str(p) != ctrl]
     # keep only perturbed cells — control is never used in this null
-    pert_only = adata[adata.obs[pc].astype(str).isin(perts)].copy()
-    log.info("%d perturbations, %d perturbed cells (control dropped)", len(perts), pert_only.n_obs)
-
-    adata_raw = pert_only.copy()
-    adata_norm = pert_only.copy()
+    adata_raw = adata[adata.obs[pc].astype(str).isin(perts)].copy()
+    log.info(
+        "%d perturbations, %d perturbed cells (control dropped)",
+        len(perts),
+        adata_raw.n_obs,
+    )
+    del adata
+    adata_norm = adata_raw.copy()
     if _looks_raw(adata_norm.X):
         sc.pp.normalize_total(adata_norm, inplace=True)
         sc.pp.log1p(adata_norm)

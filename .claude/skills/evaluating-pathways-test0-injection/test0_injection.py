@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
 import sys
@@ -15,8 +16,10 @@ import numpy as np
 import pandas as pd
 import pathway_utils as pu
 import scipy.sparse as sp
+from scipy import stats
 
 LOGGER = logging.getLogger("pathway_test0")
+_MWU_EQUIVALENCE_VALIDATED = False
 
 
 def _configure_logging(path: str) -> None:
@@ -60,9 +63,10 @@ def _validated_counts(matrix):
     values = matrix.data if sp.issparse(matrix) else np.asarray(matrix)
     if not np.isfinite(values).all() or (values < 0).any():
         raise ValueError("Raw counts must be finite and nonnegative")
-    if sp.issparse(matrix):
-        return sp.csr_matrix(matrix, dtype=np.float64, copy=True)
-    return np.asarray(matrix, dtype=np.float64).copy()
+    # Keep one compact CSR baseline per repeat.  Dense H5AD inputs otherwise
+    # force every independent injection to copy the full cells-by-genes array
+    # and rebuild the same sparse structure during normalization.
+    return sp.csr_matrix(matrix, dtype=np.float64, copy=True)
 
 
 def _inject_pathway_counts(
@@ -77,15 +81,24 @@ def _inject_pathway_counts(
     if not np.isfinite(multiplier) or multiplier <= 0:
         raise ValueError(f"Invalid log2FC delta: {delta_log2fc}")
     if sp.issparse(base_counts):
-        counts = base_counts.tocsc(copy=True)
-        for gene_index in gene_indices:
-            start, end = counts.indptr[gene_index : gene_index + 2]
-            rows = counts.indices[start:end]
-            injected = rows >= first_injected_row
-            values = counts.data[start:end]
-            values[injected] = np.rint(values[injected] * multiplier)
+        selected = base_counts[first_injected_row:, :][:, gene_indices].tocoo()
+        updated = np.rint(selected.data * multiplier)
+        difference = updated - selected.data
+        changed = difference != 0
+        update = sp.csr_matrix(
+            (
+                difference[changed],
+                (
+                    selected.row[changed] + first_injected_row,
+                    gene_indices[selected.col[changed]],
+                ),
+            ),
+            shape=base_counts.shape,
+            dtype=np.float64,
+        )
+        counts = (base_counts + update).tocsr()
         counts.eliminate_zeros()
-        return counts.tocsr()
+        return counts
     counts = base_counts.copy()
     selected = np.ix_(
         np.arange(first_injected_row, counts.shape[0]),
@@ -107,12 +120,11 @@ def _score_trial_counts(
     validate_against_bioconcord: bool = False,
 ) -> np.ndarray:
     """Normalize/log1p counts and compute exact bioconcord-equivalent scores."""
-    matrix = sp.csr_matrix(counts, dtype=np.float64, copy=True)
+    matrix = sp.csr_matrix(counts, dtype=np.float64, copy=False)
     totals = np.asarray(matrix.sum(axis=1)).ravel()
     if (totals <= 0).any():
         raise ValueError("Cannot normalize cells with zero total UMI count")
-    matrix = sp.diags(normalization_target / totals) @ matrix
-    matrix = matrix.tocsr()
+    matrix = matrix.multiply((normalization_target / totals)[:, None]).tocsr()
     matrix.data = np.log1p(matrix.data)
     scores = _vectorized_bioconcord_scores(matrix, var.index, gene_sets)
     if validate_against_bioconcord:
@@ -134,11 +146,117 @@ def _score_trial_counts(
     return scores
 
 
-def _run_methods_quiet(*args, **kwargs) -> dict[str, pd.DataFrame]:
-    """Suppress pdex's nested per-trial progress bar without hiding our progress."""
-    with open(os.devnull, "w", encoding="utf-8") as sink:
-        with contextlib.redirect_stderr(sink):
-            return pu.run_methods(*args, **kwargs)
+def _vectorized_pdex_mwu(
+    scores: np.ndarray,
+    labels: np.ndarray,
+    reference: str,
+    program_labels: list[str],
+) -> pd.DataFrame:
+    """Compute pdex's two-sided asymptotic MWU result without setup overhead."""
+    values = np.asarray(scores, dtype=np.float64)
+    groups = np.asarray(labels).astype(str)
+    reference_values = values[groups == reference]
+    rows: list[pd.DataFrame] = []
+    for target in sorted(set(groups) - {reference}):
+        target_values = values[groups == target]
+        statistic, p_value = stats.mannwhitneyu(
+            target_values,
+            reference_values,
+            axis=0,
+            alternative="two-sided",
+            method="asymptotic",
+            use_continuity=True,
+        )
+        denominator = float(len(target_values) * len(reference_values))
+        frame = pd.DataFrame(
+            {
+                "method": "pdex_mwu",
+                "target": target,
+                "program": program_labels,
+                "effect": 2.0 * np.asarray(statistic, float) / denominator - 1.0,
+                "mean_difference": (
+                    target_values.mean(axis=0) - reference_values.mean(axis=0)
+                ),
+                "statistic": np.asarray(statistic, float),
+                "standard_error": np.nan,
+                "p_value": np.asarray(p_value, float),
+                "n_target": len(target_values),
+                "n_reference": len(reference_values),
+            }
+        )
+        frame["fdr"] = stats.false_discovery_control(
+            frame["p_value"].to_numpy(float),
+            method="bh",
+        )
+        rows.append(frame)
+    return pd.concat(rows, ignore_index=True)
+
+
+def _run_methods_quiet(
+    scores: np.ndarray,
+    labels: np.ndarray,
+    reference: str,
+    program_labels: list[str],
+    *,
+    methods: list[str] | tuple[str, ...],
+    threads: int,
+) -> dict[str, pd.DataFrame]:
+    """Run exact pathway methods while avoiding repeated pdex setup per trial.
+
+    Test 0 evaluates thousands of two-group trials with the same 97 columns.
+    Arc pdex's process/progress setup dominates each tiny fit, so after one
+    strict equivalence check we use SciPy's vectorized implementation of the
+    same two-sided asymptotic Mann–Whitney calculation.
+    """
+    global _MWU_EQUIVALENCE_VALIDATED
+    output: dict[str, pd.DataFrame] = {}
+    if "ols" in methods:
+        output["ols"] = pu.run_ols(scores, labels, reference, program_labels)
+    if "pdex_mwu" in methods:
+        fast = _vectorized_pdex_mwu(scores, labels, reference, program_labels)
+        if not _MWU_EQUIVALENCE_VALIDATED:
+            with open(os.devnull, "w", encoding="utf-8") as sink:
+                with contextlib.redirect_stderr(sink):
+                    upstream = pu.run_pdex_mwu(
+                        scores,
+                        labels,
+                        reference,
+                        program_labels,
+                        threads=threads,
+                    )
+            columns = [
+                "effect",
+                "mean_difference",
+                "statistic",
+                "p_value",
+                "fdr",
+            ]
+            left = fast.sort_values(["target", "program"]).reset_index(drop=True)
+            right = upstream.sort_values(["target", "program"]).reset_index(drop=True)
+            maximum_difference = max(
+                float(
+                    np.nanmax(
+                        np.abs(
+                            left[column].to_numpy(float)
+                            - right[column].to_numpy(float)
+                        )
+                    )
+                )
+                for column in columns
+            )
+            if maximum_difference > 1e-10:
+                raise RuntimeError(
+                    "Vectorized MWU disagrees with Arc pdex: "
+                    f"max_abs_difference={maximum_difference:g}"
+                )
+            LOGGER.info(
+                "validated vectorized MWU against Arc pdex: "
+                "max_abs_difference=%g",
+                maximum_difference,
+            )
+            _MWU_EQUIVALENCE_VALIDATED = True
+        output["pdex_mwu"] = fast
+    return output
 
 
 def _vectorized_bioconcord_scores(
@@ -155,15 +273,21 @@ def _vectorized_bioconcord_scores(
         gene_means = np.asarray(expression).mean(axis=0)
     bins = pd.qcut(gene_means, 25, labels=False, duplicates="drop")
 
-    weight_rows: list[int] = []
-    weight_columns: list[int] = []
-    weight_values: list[float] = []
+    bin_members = {
+        value: np.flatnonzero(bins == value)
+        for value in np.unique(bins)
+        if not pd.isna(value)
+    }
+    weights = np.zeros((len(var_names), len(gene_sets)), dtype=np.float64)
     for program_index, genes in enumerate(gene_sets.values()):
         target_indices = np.asarray([positions[gene] for gene in genes], dtype=int)
         rng = np.random.default_rng(42)
         control_indices: list[int] = []
         for target_index in target_indices:
-            same_bin = np.flatnonzero(bins == bins[target_index])
+            same_bin = bin_members.get(
+                bins[target_index],
+                np.empty(0, dtype=int),
+            )
             same_bin = same_bin[same_bin != target_index]
             if same_bin.size:
                 selected = rng.choice(
@@ -173,19 +297,17 @@ def _vectorized_bioconcord_scores(
                 )
                 control_indices.extend(selected.tolist())
         controls = np.unique(control_indices)
-        weight_rows.extend(target_indices.tolist())
-        weight_columns.extend([program_index] * len(target_indices))
-        weight_values.extend([1.0 / len(target_indices)] * len(target_indices))
+        np.add.at(
+            weights[:, program_index],
+            target_indices,
+            1.0 / len(target_indices),
+        )
         if controls.size:
-            weight_rows.extend(controls.tolist())
-            weight_columns.extend([program_index] * len(controls))
-            weight_values.extend([-1.0 / len(controls)] * len(controls))
-
-    weights = sp.csc_matrix(
-        (weight_values, (weight_rows, weight_columns)),
-        shape=(len(var_names), len(gene_sets)),
-        dtype=np.float64,
-    )
+            np.add.at(
+                weights[:, program_index],
+                controls,
+                -1.0 / len(controls),
+            )
     scores = expression @ weights
     return scores.toarray() if sp.issparse(scores) else np.asarray(scores)
 
@@ -359,6 +481,7 @@ def main() -> None:
     pu.validate_positive_int(args.min_genes, "--min-genes")
     pu.validate_positive_int(args.min_cells_per_arm, "--min-cells-per-arm")
     pu.validate_positive_int(args.n_repeats, "--n-repeats")
+    pu.validate_positive_int(args.score_jobs, "--score-jobs")
     if not np.isfinite(args.normalization_target) or args.normalization_target <= 0:
         raise ValueError("--normalization-target must be finite and positive")
 
@@ -510,50 +633,86 @@ def main() -> None:
             args.n_repeats,
             len(pathway_indices),
         )
-        for pathway_number, pathway_index in enumerate(
-            rng.permutation(pathway_indices), start=1
-        ):
+        pathway_order = rng.permutation(pathway_indices)
+        pathway_umi_before = {
+            program_labels[pathway_index]: float(
+                base_counts[
+                    left.size :,
+                    pathway_gene_indices[program_labels[pathway_index]],
+                ].sum()
+            )
+            for pathway_index in pathway_order
+        }
+        trial_specs = [
+            (pathway_number, int(pathway_index), float(delta))
+            for pathway_number, pathway_index in enumerate(pathway_order, start=1)
+            for delta in deltas
+        ]
+
+        def run_trial(spec):
+            pathway_number, pathway_index, delta = spec
             injected_program = program_labels[pathway_index]
-            if pathway_number == 1 or pathway_number % 10 == 0:
-                LOGGER.info(
-                    "pathway %d/%d in repeat %d/%d: %s",
-                    pathway_number,
-                    len(pathway_indices),
-                    repeat + 1,
-                    args.n_repeats,
-                    injected_program,
-                )
-            for delta in deltas:
-                if delta == 0:
-                    injected_counts = base_counts
-                    results = baseline_results
-                else:
-                    injected_counts = _inject_pathway_counts(
-                        base_counts,
-                        first_injected_row=left.size,
-                        gene_indices=pathway_gene_indices[injected_program],
-                        delta_log2fc=delta,
-                    )
-                    injected_scores = _score_trial_counts(
-                        injected_counts,
-                        obs=trial_obs,
-                        var=adata.var,
-                        gene_sets=gene_sets,
-                        program_labels=program_labels,
-                        normalization_target=args.normalization_target,
-                        score_jobs=args.score_jobs,
-                    )
-                    results = _run_methods_quiet(
-                        injected_scores,
-                        test_labels,
-                        args.control,
-                        program_labels,
-                        methods=methods,
-                        threads=args.threads,
-                    )
+            umi_before = pathway_umi_before[injected_program]
+            if delta == 0:
+                results = baseline_results
+                umi_after = umi_before
+            else:
                 gene_indices = pathway_gene_indices[injected_program]
-                umi_before = float(base_counts[left.size :, gene_indices].sum())
-                umi_after = float(injected_counts[left.size :, gene_indices].sum())
+                injected_counts = _inject_pathway_counts(
+                    base_counts,
+                    first_injected_row=left.size,
+                    gene_indices=gene_indices,
+                    delta_log2fc=delta,
+                )
+                injected_scores = _score_trial_counts(
+                    injected_counts,
+                    obs=trial_obs,
+                    var=adata.var,
+                    gene_sets=gene_sets,
+                    program_labels=program_labels,
+                    normalization_target=args.normalization_target,
+                    score_jobs=1,
+                )
+                results = _run_methods_quiet(
+                    injected_scores,
+                    test_labels,
+                    args.control,
+                    program_labels,
+                    methods=methods,
+                    threads=args.threads,
+                )
+                umi_after = float(
+                    injected_counts[left.size :, gene_indices].sum()
+                )
+            return (
+                pathway_number,
+                injected_program,
+                delta,
+                umi_before,
+                umi_after,
+                results,
+            )
+
+        with ThreadPoolExecutor(max_workers=args.score_jobs) as executor:
+            for (
+                pathway_number,
+                injected_program,
+                delta,
+                umi_before,
+                umi_after,
+                results,
+            ) in executor.map(run_trial, trial_specs):
+                if delta == deltas[0] and (
+                    pathway_number == 1 or pathway_number % 10 == 0
+                ):
+                    LOGGER.info(
+                        "pathway %d/%d in repeat %d/%d: %s",
+                        pathway_number,
+                        len(pathway_indices),
+                        repeat + 1,
+                        args.n_repeats,
+                        injected_program,
+                    )
                 observed_multiplier = (
                     umi_after / umi_before if umi_before > 0 else np.nan
                 )

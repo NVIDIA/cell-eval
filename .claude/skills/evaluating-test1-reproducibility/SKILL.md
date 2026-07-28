@@ -13,12 +13,17 @@ Runs **both pdex and pydeseq2** on the same splits in one pass via `reproducibil
 `de_backends.py` is bundled with this skill and calls the upstream `pdex` and
 `pydeseq2` packages directly. Do not import project-private DE backend modules.
 
+Before executing, read and follow
+[`hardware-execution-contract.md`](hardware-execution-contract.md). Use the bundled
+`run_with_watchdog.py` for every inference attempt; worker value `0` means
+hardware-adaptive selection.
+
 ## Mandatory preflight and run capture
 
 Do not start the executable until the user has explicitly confirmed one fully resolved run configuration.
 
 1. Gather the input `.h5ad`, ask whether `adata.X` contains raw counts or log1p-normalized expression, results output directory, separate run root, methods to compare, non-parametric engine (`pdex` or `rsc`) when `pdex` is selected, required observation columns and control label, replicate/block columns, count or score layers, thresholds, seeds, repeats, and worker/thread settings. Inspect the input read-only to resolve unknown columns, labels, and layers. Pass the confirmed state as `--expression-state`.
-2. Expand paths and resolve every default. Show one concise preflight summary containing the input, results directory, run root, methods/engine, data fields, thresholds, workload/concurrency, exact command, log path, cache behavior, and resolved-config destination.
+2. Expand paths and resolve every default. Show one concise preflight summary containing the input, results directory, run root, methods/engine, data fields, thresholds, workload/concurrency, exact command, log path, cache behavior, and resolved-config destination. Before asking for confirmation, estimate wall time separately for every selected method, shared preparation/rendering, and the complete run; state the hardware/tier, cache assumptions, evidence or throughput basis, uncertainty range, and how watchdog de-escalation could extend it.
 3. Ask for explicit confirmation and stop. Do not launch computation, plotting, resume mode, or cache reuse before confirmation.
 4. After confirmation, create `<run-root>/logs` and `<run-root>/configs`, pass `--run-root <run-root>`, and capture the complete terminal stream with `2>&1 | tee <run-root>/logs/<workflow>__<dataset>__<UTC-timestamp>.log`.
 5. Every invocation writes an immutable timestamped YAML snapshot under `<run-root>/configs`. Report the result, log, and YAML paths on completion.
@@ -59,7 +64,7 @@ python .claude/skills/evaluating-test1-reproducibility/reproducibility_heatmap.p
 | `--threads` | worker threads supplied to each DE backend fit; affects speed, not estimates | 8 |
 | `--non-parametric-engine` | `pdex` or numerically matched RAPIDS GPU Wilcoxon (`rsc`) | pdex |
 | `--parallel-repeats` | POSIX fork workers for independent repeats; increase only when RAM/CPU permit | 1 |
-| `--perturbation-workers` | within-repeat CPU PyDESeq2 workers; use with `--threads 1` and `--parallel-repeats 1` | 1 |
+| `--perturbation-workers` | within-repeat CPU PyDESeq2 workers; `0` selects a CPU/RAM-safe value | 0 |
 | `--pairwise-workers` | POSIX fork workers used after DE to build pair-specific DE-union correlation rows | 8 |
 | `--signature-cache-dir` | optional directory for atomic partial-repeat checkpoints | none |
 | `--resume-signatures` | load strictly matching local checkpoints and compute only missing repeats/methods | off |
@@ -161,6 +166,17 @@ the operating system, plotting, and the interactive session and avoids an OOM-pr
   whiskers use the 5th–95th percentiles, and the rasterized scatter layer contains **every finite
   matrix value**, never a sample. The CSV records n, mean, standard deviation, minimum, 5th/25th/
   50th/75th/95th percentiles, and maximum for every method × metric × group.
+- Whenever those primary correlation boxplots are rendered, also emit
+  `test1_corr_matrix_de_jaccard_diagonal_boxplot__<dataset>.png` and
+  `test1_corr_matrix_de_jaccard_off_diagonal_boxplot__<dataset>.png`, each with a same-stem
+  summary CSV. For every method and repeat, define matrix cell `(i,j)` as
+  `J(DE_A(perturbation i), DE_B(perturbation j))`, with both DE sets requiring the configured
+  FDR/absolute-LFC thresholds and that perturbation's CPM eligibility. Average corresponding
+  Jaccard cells across repeats before plotting. The diagonal plot shows within-perturbation
+  split reproducibility; the off-diagonal plot shows cross-perturbation DE-set similarity.
+  Treat an empty union as undefined—not Jaccard 1—and exclude it from the distribution. Use
+  IQR boxes, 5th–95th percentile whiskers, and jittered scatter containing **every finite
+  averaged matrix cell**, never a sample.
 - A one-method cache-building run writes method-suffixed matrices such as
   `test1_corr_matrix_pydeseq2__<dataset>.png`; it must not overwrite the canonical unsuffixed
   two-method plot because its union-DE gene set is method-specific. Only a run loading both method

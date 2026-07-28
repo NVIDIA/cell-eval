@@ -13,12 +13,17 @@ Runs **both pdex and pydeseq2** in one pass via `control_null_diagnostics.py`.
 `de_backends.py` is bundled with this skill and calls the upstream `pdex` and
 `pydeseq2` packages directly. Do not import project-private DE backend modules.
 
+Before executing, read and follow
+[`hardware-execution-contract.md`](hardware-execution-contract.md). Use the bundled
+`run_with_watchdog.py` for every inference attempt; worker value `0` means
+hardware-adaptive selection.
+
 ## Mandatory preflight and run capture
 
 Do not start the executable until the user has explicitly confirmed one fully resolved run configuration.
 
 1. Gather the input `.h5ad`, ask whether `adata.X` contains raw counts or log1p-normalized expression, results output directory, separate run root, methods to compare, non-parametric engine (`pdex` or `rsc`) when `pdex` is selected, required observation columns and control label, replicate/block columns, count or score layers, thresholds, seeds, repeats, and worker/thread settings. Inspect the input read-only to resolve unknown columns, labels, and layers. Pass the confirmed state as `--expression-state`.
-2. Expand paths and resolve every default. Show one concise preflight summary containing the input, results directory, run root, methods/engine, data fields, thresholds, workload/concurrency, exact command, log path, and resolved-config destination.
+2. Expand paths and resolve every default. Show one concise preflight summary containing the input, results directory, run root, methods/engine, data fields, thresholds, workload/concurrency, exact command, log path, and resolved-config destination. Before asking for confirmation, estimate wall time separately for every selected method, shared preparation/rendering, and the complete run; state the hardware/tier, cache assumptions, evidence or throughput basis, uncertainty range, and how watchdog de-escalation could extend it.
 3. Ask for explicit confirmation and stop. Do not launch computation or plotting before confirmation.
 4. After confirmation, create `<run-root>/logs` and `<run-root>/configs`, pass `--run-root <run-root>`, and capture the complete terminal stream with `2>&1 | tee <run-root>/logs/<workflow>__<dataset>__<UTC-timestamp>.log`.
 5. Every invocation writes an immutable timestamped YAML snapshot under `<run-root>/configs`. Report the result, log, and YAML paths on completion.
@@ -57,6 +62,7 @@ splits concurrently. This changes scheduling only; each split still uses the sam
 | `--seed` | RNG seed for every split | 0 |
 | `--methods` | comma-sep backends (run both for comparison) | pdex,pydeseq2 |
 | `--non-parametric-engine` | `pdex` or numerically matched RAPIDS GPU Wilcoxon (`rsc`) | pdex |
+| `--resample-workers` | independent null-split workers; `0` selects a CPU/RAM-safe value | 0 |
 
 ## Outputs (in `--outdir`)
 - `plots/test_2_pvalue_diagnostics__<dataset>.png` — 3-panel: QQ per method | p-value histogram | λ_GC boxplot
