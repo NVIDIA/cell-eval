@@ -149,8 +149,8 @@ class PerturbationAnndataPair:
     def get_perts(self, include_control: bool = False) -> NDArray[np.str_]:
         """Get all perturbations."""
         if include_control:
-            return self.perts
-        return self.perts[self.perts != self.control_pert]
+            return np.union1d(self.perts, [self.control_pert])
+        return self.perts
 
     def _initialize_bulk_arrays(self, embed_key: str | None = None):
         """Initialize bulk arrays if necessary (memoized)"""
